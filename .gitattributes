@@ -1,0 +1,10 @@
+# Store everything with LF in the repo; let Git pick the working-copy ending.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF.
+*.bat text eol=crlf
+
+# Binary products and the Gradle wrapper jar.
+*.jar binary
+*.bin binary
+*.elf binary

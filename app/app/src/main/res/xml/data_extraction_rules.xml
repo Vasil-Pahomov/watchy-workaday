@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The other half of the manifest's allowBackup="false".
+
+  From Android 12, allowBackup only governs *cloud* backup; device-to-device
+  transfer is configured here and here alone. minSdk is 31, so on every device
+  this app can be installed on, leaving this file out would mean the decision
+  recorded in AndroidManifest.xml only half applies.
+
+  The reasoning is the same for both channels and is written out in full there:
+  restored health counters would put a fresh install straight into a backoff and
+  make the diagnostic screen report a sync this device never had, and a restored
+  watch address would leave a phone that looks paired while the
+  CompanionDeviceManager association it needs did not come with it.
+
+  Every domain is excluded rather than the two keys we happen to use today, so
+  the next thing this app persists is excluded by default rather than by someone
+  remembering to come back here.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
+    </device-transfer>
+</data-extraction-rules>

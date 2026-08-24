@@ -1,0 +1,40 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Test (host)",
+      "detail": "pio test -e native — the merge gate",
+      "type": "shell",
+      "command": "pio test -e native",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build firmware",
+      "type": "shell",
+      "command": "pio run -e watchy_v20",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Upload firmware",
+      "type": "shell",
+      "command": "pio run -e watchy_v20 -t upload",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Size report",
+      "detail": "Flash and RAM budget",
+      "type": "shell",
+      "command": "pio run -e watchy_v20 -t size",
+      "problemMatcher": []
+    },
+    {
+      "label": "Monitor",
+      "detail": "Serial monitor with the ESP32 exception decoder",
+      "type": "shell",
+      "command": "pio device monitor",
+      "problemMatcher": []
+    }
+  ]
+}

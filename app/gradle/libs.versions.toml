@@ -1,0 +1,42 @@
+## Every version this build resolves is pinned here. Nothing floats.
+##
+## Why these exact versions — see docs/toolchain.md:
+##  - agp 8.13.1 is the version the installed Android Studio (AI-252.27397.103)
+##    names as its own last stable AGP.
+##  - kotlin 2.1.21 is the Kotlin compiler that same Studio build bundles, so the
+##    IDE analyser and the Gradle build agree.
+##  - Gradle itself is pinned in gradle/wrapper/gradle-wrapper.properties (8.14.5,
+##    with a distribution checksum), not here.
+
+[versions]
+agp = "8.13.1"
+kotlin = "2.1.21"
+junitJupiter = "5.14.4"
+junitPlatform = "1.14.4"
+# 2.10.0 is the WorkManager line built against compileSdk 35, which is what this
+# machine has (docs/toolchain.md). Pinned, like everything else here.
+androidxWork = "2.10.0"
+
+[libraries]
+# Kotlin's assertion API. Resolves to the kotlin-test-junit5 variant because
+# core/ configures useJUnitPlatform(); version tracks the Kotlin plugin.
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+# JUnit 5 engine — the thing that actually runs @Test methods. Runtime only.
+junit-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine", version.ref = "junitJupiter" }
+# Declared explicitly so the launcher version is pinned by us rather than
+# inherited from whatever Gradle happens to bundle.
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version.ref = "junitPlatform" }
+
+# The only runtime dependency in the app, and Law 1 names it directly: "a periodic
+# WorkManager job re-starts the service if it is not running", because
+# START_STICKY is not honoured by every OEM (docs/background-execution.md §2).
+# The alternative — a self-rescheduling AlarmManager loop — would have to survive
+# reboot, Doze and process death on its own, which is the job WorkManager already
+# does and the reason it exists. `work-runtime`, not `-ktx`: the watchdog is a
+# plain Worker on a background thread and needs no coroutine extensions.
+androidx-work-runtime = { module = "androidx.work:work-runtime", version.ref = "androidxWork" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

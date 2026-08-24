@@ -1,0 +1,297 @@
+# Power budget
+
+Battery: **200 mAh** LiPo. Target: **≥ 21 days** on a charge in normal mode.
+
+That gives a daily allowance of **≤ 9.5 mAh/day**. Every feature is measured
+against that allowance. This document is the shared ledger — a change that adds a
+wake source or a peripheral must update it, and the reviewer checks for drift
+between this file and the code.
+
+## Where the allowance goes
+
+The numbers below are **engineering estimates, not measurements.** They are the
+right order of magnitude and good enough to design against; they must be replaced
+with meter readings (see `docs/hardware-v2.0.md`). Marked ⚠ until measured.
+
+### Sleep floor ⚠
+
+| Contributor | Estimate |
+|---|---|
+| ESP32 deep sleep, RTC + RTC RAM retained | ~10 µA |
+| PCF8563 RTC | ~0.3 µA |
+| BMA423 counting steps, low-power mode | ~14 µA |
+| LDO quiescent + leakage | ~40 µA |
+| **Total sleep** | **~65 µA → ~1.6 mAh/day** |
+
+The LDO quiescent current dominates and **no amount of firmware work reduces
+it.** This is the floor. Roughly 15 % of the daily allowance is spent before we
+execute a single instruction.
+
+### Minute tick ⚠
+
+One wake per minute = **1440 wakes/day**. Per wake:
+
+| Phase | Estimate |
+|---|---|
+| Boot from deep sleep to `setup()` | ~40 ms |
+| Read RTC over I2C | ~3 ms |
+| Render into the framebuffer | ~10 ms |
+| E-paper **partial** refresh | ~300 ms @ ~15 mA |
+| Quiesce + enter sleep | ~5 ms |
+| **≈ per wake** | **~360 ms, ~0.0030 mAh** |
+
+**1440 × 0.0030 ≈ 4.3 mAh/day.** Together with sleep: ~5.7 mAh/day → **~35 days**
+theoretical. Real-world lands lower; the 21-day target carries the margin.
+
+### Full refresh ⚠
+
+~2 s at ~20 mA ≈ 0.011 mAh — about **3.7 minute-ticks each**. Cheap individually,
+so ghosting cleanup is affordable; ruinous if triggered per minute. Budget: at
+most one every 60 partials or 12 hours, whichever comes first.
+
+### Radio — the thing that breaks the budget
+
+A single WiFi association plus an NTP exchange is ~3 s at ~120 mA ≈ **0.1 mAh** —
+roughly **33 minute-ticks**, from one sync. Hence Law 1: the radio is never
+enabled on a routine wake. A daily NTP sync costs ~1 % of the allowance and is
+affordable; a *five-minute* poll is 28 mAh/day and empties the battery in a week.
+
+WiFi is not what the watch actually uses. The clock is set over **BLE from the
+phone** (`PROTOCOL.md`), which is an order of magnitude cheaper — and the numbers
+below are the reason the design is shaped the way it is.
+
+#### The BLE sync window ⚠
+
+One window an hour, **24/day**. It **extends a minute tick the watch was already
+taking**; it does not add a wake of its own. Per window (`PROTOCOL.md` §5.3):
+
+| Phase | Estimate |
+|---|---|
+| Stack init + teardown | ~0.25 s @ ~40 mA ≈ 0.003 mAh |
+| No phone in range: 6 s advertising | ~11 mA ≈ 0.018 mAh |
+| Phone present: ~1 s connect + ~1.5 s exchange | ~40 mA ≈ 0.028 mAh |
+| **Worst ordinary case per window** | **~0.031 mAh** |
+
+**These figures were aspirational until the §4 completion rule landed, and are now
+real.** Measured on hardware with a paired phone: a *successful* exchange did not
+end the window. `runSyncWindow()` looped on any `TimeWritten`, but §4 licenses a
+second push in the same connection **only if the first one failed**, so a phone
+that kept pushing after `result=0` held the radio open to the 12 s cap — twelve
+writes, ~780 ms apart, every one succeeding, twelve RTC commits and twelve I2C
+sessions where §4 asked for one. That window cost roughly **0.13 mAh**, about 4×
+the row above, and the row was not conservative, it was wrong.
+
+`core::SyncWindow::noteWriteResult()` now ends the window at the first thing that
+happens after a successful write. On the trace above that is the phone's next push
+at ~4.1 s of window time instead of 12.0 s — **~7.9 s of radio saved on a window
+that worked**, and one RTC write instead of twelve. The row is conservative again:
+a successful window now usually ends sooner than the 6 s no-phone case, because
+the phone hanging up (§6.1's normal ending) arrives well inside it.
+
+The ceiling below is unchanged in value but no longer reachable the same way. A
+peer can still hold the window to the cap, but only by **failing** repeatedly —
+which is the retry §4 licenses and the loop exists to serve. Repeated *successes*
+can no longer do it.
+
+The exchange figure includes the ~100–300 ms the watch spends letting the phone
+hang up after the Status notification (`PROTOCOL.md` §6.1). That wait is not
+optional — a notification is fire-and-forget, so tearing the radio down straight
+after sending one loses it, and §4 makes that notification the only thing that
+resets the phone's backoff. It is inside the 1.5 s already budgeted.
+
+The row above is the worst *ordinary* case, and it is what the ledger carries.
+The ceiling is higher: a peer that connects and then keeps the watch busy until
+§5.1's absolute session cap expires costs **~0.14 mAh**, a bounded **~4.5×** on one
+window an hour. The 12 s cap is not the whole of that figure — §5.1 measures it
+"from session open to teardown", and `board::ble` stamps `opened_ms_` *after*
+`startAdvertising()` returns, so the ~0.2 s of NimBLE init sits before the cap
+starts. 12 s + ~0.2 s at ~40 mA is ~0.14 mAh.
+
+**The teardown tail is gone, and with it the 2.05 s that used to sit after the
+cap.** `~Session()` no longer calls `NimBLEDevice::deinit()`: that call panics core
+0 on every window (`ble_hs_stop()` disables the host, after which
+`ble_hs_timer_reset()` frees the host timer while GAP is still scheduling it, and
+the FreeRTOS timer daemon then services a queued command against the freed block).
+The destructor stops advertising, which is what actually ends the transmitting, and
+`esp_deep_sleep_start()` drops the RF domain. The old ~2.05 s NimBLE host-stop wait
+no longer happens, so both the energy ceiling above and §5.1's un-fed watchdog
+interval improve — `PROTOCOL.md` §5.1's teardown-tail row is now conservative
+rather than wrong, and should be re-derived the next time that document is opened.
+
+**What it costs, and it belongs here as much as in `board/ble.h`: the BLE
+controller stays enabled between the destructor returning and `deepSleep()` being
+reached.** Today that is microseconds and the cost is nil. It is only nil because
+Law 1 makes `deepSleep()` the terminus of every path — a change that opens a window
+and then does anything before sleeping (a confirmation screen, a retry, a second
+window) holds the controller up for that whole stretch at tens of milliamps against
+a ~20 uA floor. Neither the compiler nor a host test can hold that ordering; the
+`deepSleepIsATerminus()` probe in `main.cpp` holds the half that keeps `deepSleep()`
+a terminus, and the interval between `ble: teardown 4/4` and `sleep:` in a
+`WORKADAY_DIAG` log is what shows the other half.
+
+That ceiling cannot compound, for the same reason the ordinary case is
+affordable: the hourly timer is spent when a window **opens**, so a pathological
+window costs its hour and nothing more. It is deliberately **not** budgeted.
+Doing so would assume an adversarial peer in range every hour of every day, and
+24 of them would put this row at ~3.8 mAh/day and the daily total at ~9.8 — past
+the 9.5 mAh/day allowance outright, for a case no wearer has. The common case,
+with nobody in range, is *cheaper* than the row above.
+
+**24 × 0.031 ≈ 0.75 mAh/day**, carried in the ledger as **~0.9 mAh/day** with
+margin — about **9 %** of the allowance, and roughly **10 minute-ticks per
+window**. It is the single most expensive feature in the firmware and it is still
+affordable, because of three limits that are each load-bearing:
+
+1. **The hourly timer is spent when a window OPENS, not when one succeeds.**
+   Reset-on-success sounds helpful and is the defect: a watch whose phone is out
+   of range never succeeds, so it would advertise on every wake — 1440 windows a
+   day, **~26 mAh/day**, a flat cell in about a week, with no upper bound
+   anywhere. `core::sync_policy` owns this and `main.cpp` calls
+   `noteSyncWindowOpened()` *before* the radio comes up, so a window that dies to
+   a watchdog reset still costs the full hour.
+2. **The window is bounded in hard time, not by a peer.** 6 s advertising with
+   nobody there, 4 s connected but idle, 12 s absolute cap — `PROTOCOL.md` §5.1.
+   A phone that connects and then stops talking costs 4 s, not a wake.
+3. **It never opens in a degraded mode or on a low battery**, and never on an
+   accelerometer or unclassified wake. The gates are in `core::sync_policy`, where
+   a host test can reach them.
+
+For scale: continuous advertising is ~20 mAh/day and empties the cell in about
+ten days. That is what the window exists to avoid.
+
+The user-initiated window (the Sync menu item) costs exactly the same ~0.031 mAh
+and **spends the same hour**, so pressing Sync repeatedly cannot outrun the
+schedule — the second press inside an hour is refused.
+
+## Design consequences
+
+These follow from the numbers, and are why the code looks the way it does:
+
+1. **Wake duration is the lever, not wake count** — at minute resolution the wake
+   count is fixed by the product. Shaving 100 ms off a wake saves ~1.2 mAh/day,
+   which is more than the entire sleep floor.
+2. **The panel refresh is ~85 % of an average wake.** Optimising CPU-side
+   rendering is close to pointless; avoiding a refresh entirely is what pays.
+3. **Skip the refresh when content is unchanged.** No gain for a plain HH:MM face
+   (it changes every minute) but a large one for any screen that does not, and it
+   makes button wakes nearly free. `core::refresh_policy` owns this decision.
+4. **Low-battery mode drops to 5-minute resolution** — 288 wakes/day instead of
+   1440, cutting tick cost to ~0.9 mAh/day and roughly tripling the remaining
+   runtime. Owned by `core::battery_model` + `core::wake_router`.
+5. **The battery ADC is sampled on a schedule, not per wake.** The reading is
+   slow-moving; sampling it every minute buys nothing.
+6. **Step counting adds sensor current, not wakes.** The BMA423 accumulates steps
+   in its own feature engine, so the total is collected during the minute tick we
+   already take, on the I2C session we already open. That is the difference
+   between +0.34 mAh/day and a feature that would have been unaffordable: waking
+   the CPU to sample acceleration at 25–50 Hz is ~36 000 wakes an hour and is not
+   remotely within budget.
+
+   The corollary is that the **accelerometer interrupt stays disarmed**
+   (`kAccelWakeEnabled` in `main.cpp`). It is needed only for genuinely
+   motion-triggered features — wake-on-wrist-turn, tap — and each of those must
+   justify both the wake rate and its share of the sleep floor on its own.
+
+7. **The config blob is uploaded once, not per wake — and the "once" is
+   enforced, not assumed.** Bosch's ~6 KB feature-engine stream is 192 chunks over
+   I2C at 100 kHz plus a 150 ms delay inside the vendor driver and a 20 ms one
+   after its soft reset: **~0.85 s**, against a wake budgeted at ~360 ms.
+   `board::accel::probe()` costs three register reads and reports what it sees;
+   `core::accel_policy` decides whether the expensive path is worth taking.
+
+   The arithmetic that makes this a hard limit rather than an expectation: a
+   sensor stuck in "needs configuring" would upload on every tick, and
+   1440 × 0.85 s ≈ 20 minutes a day at ~30 mA ≈ **+10 mAh/day** — more than the
+   entire 9.5 mAh/day allowance, taking the watch from 21+ days to about a week.
+   If the upload instead wedges the bus, each transaction costs the 50 ms I2C
+   timeout, the wake overruns the 10 s task watchdog and never reaches sleep, and
+   the cost is ~10 s at full current per reset.
+
+   So `core::kMaxAccelConfigAttempts` caps it at **3 attempts per power cycle**,
+   counted in RTC-backed state *before* each attempt runs — a counter incremented
+   afterwards would be lost to exactly the watchdog reset it needs to survive.
+
+   That only became true when `AccelState` moved with the rest of `PersistedState`
+   into `RTC_NOINIT_ATTR`. Under `RTC_DATA_ATTR` the block sat in `.rtc.data`,
+   which the bootloader reloads from flash on any boot that is not a deep-sleep
+   wake — so the counter *was* lost to the watchdog reset it was written to
+   survive, and a sensor wedging the bus would have retried three uploads, reset,
+   and started again from zero for ever. Counting before the attempt is necessary
+   but was not sufficient; the storage had to hold as well. See
+   `docs/architecture.md`, "State across sleep".
+   After that the sensor is left alone and the face shows "no step data", which is
+   the correct trade: a dead step counter costs a feature, an unbounded retry
+   costs the battery. Recovery needs the RTC block cleared, which on v2.0 means
+   opening the case — see `docs/backlog.md` item 13 for the bounded daily retry
+   that would avoid that, at 0.007 mAh/day.
+
+   Giving up also **suspends the sensor** (`board::accel::suspend()` clears
+   `acc_en`). A BMA423 that is running but not counting would otherwise keep its
+   ~14 µA — ~0.34 mAh/day, a fifth of the sleep floor — for a feature that has
+   been switched off. One read-modify-write, and because that write can NACK its
+   result is checked: a park that did not happen is retried on a later wake, up to
+   `core::kMaxAccelSuspendAttempts` (3). Bounded for the same reason as everything
+   else here — two transactions per wake for ever is ~1 mAh/day on a wedged bus,
+   which is 10 % of the allowance.
+
+8. **The radio's cost is set by how often the window opens, not by whether anyone
+   answers.** A window that reaches nobody is ~0.018 mAh and a successful one is
+   ~0.028 mAh — within a factor of two. So there is nothing to gain by trying
+   harder when a sync fails, and everything to lose: the whole spread between
+   0.9 mAh/day and 26 mAh/day is the *number of windows*, which is why the hourly
+   timer is spent on opening and never refunded. This is the same shape as the
+   BMA423 config cap in item 7 — a cheap operation made ruinous by repetition.
+
+## Ledger
+
+Update this table in the same change that adds or alters a wake source.
+
+| Wake source | Frequency | Cost/event ⚠ | mAh/day ⚠ | Notes |
+|---|---|---|---|---|
+| Sleep floor (excl. BMA423) | continuous | — | ~1.2 | irreducible |
+| BMA423 counting steps | continuous | — | ~0.34 | sensor quiescent only, no wakes |
+| RTC minute alarm | 1440/day | 0.0030 | ~4.3 | 288/day in low-battery mode |
+| Step read on the tick | 1440/day | ~0 | ~0.02 | 4 probe/read bytes on an open bus; also on timer and unknown wakes |
+| Full refresh | ≤ 2/day | 0.011 | ~0.02 | ghosting cleanup; see the fault-path note below |
+| Button press | ~50/day | 0.0015 | ~0.08 | no refresh if content unchanged |
+| Accelerometer INT | disarmed | — | 0 | not needed for step counting |
+| BMA423 config upload | ≤ 3 per power cycle | ~0.007 | ~0 | ~0.02 mAh once, then never; capped by `core::kMaxAccelConfigAttempts` |
+| BMA423 park after give-up | ≤ 3 per power cycle | ~0 | 0 | 2 register transactions; reclaims the sensor's ~0.34 mAh/day |
+| BLE sync window | 24/day | 0.031 | ~0.9 | extends an existing tick, adds no wake; hourly gate in `core::sync_policy`, hard 6/4/12 s timeouts |
+| Radio — WiFi/NTP | none | 0.1 | 0 | not built; the clock comes from the phone over BLE |
+| **Total** | | | **~6.9** | allowance 9.5 → **~27 % headroom** |
+
+**A fault path can spend the full-refresh budget, and one did.** `core::wake_router`
+sets `force_full_refresh` on any non-deep-sleep reset (`wake_router.cpp:94-98`), so
+anything that reboots the watch on a schedule also drives a full refresh on that
+schedule. The core-0 panic in `NimBLEDevice::deinit()` did exactly that: a panic per
+sync window, roughly **24 forced full refreshes a day against the ≤ 2 budgeted
+above** — about 0.26 mAh/day, small against the 9.5 mAh/day allowance, but 12× a
+line item whose whole purpose is to ration ghosting cleanup.
+
+**Resolved by removing the `deinit()` call**, not by anything in this table; the
+reboots stopped and the drift went with them. The observation stays because the
+next fault path to cause hourly reboots will spend the same budget the same way,
+and the ledger is where that should be noticed.
+
+## How to measure
+
+Replace the ⚠ estimates with real numbers:
+
+- **Sleep current** needs a µA-capable meter in series with the battery — a
+  multimeter's mA range cannot resolve 60 µA. A current-sense amp or a
+  purpose-built meter (PPK2, Joulescope) is the practical route.
+- **Wake duration** does not need special equipment: toggle a spare GPIO high at
+  the top of `setup()` and low immediately before `esp_deep_sleep_start()`, then
+  scope it. Cheap, and it directly measures the number that matters most.
+- **Charge per wake** is the integral of current over that window; a
+  current-sensing tool that reports charge gives it directly.
+- **The BLE window** needs both cases measured separately, because they are
+  budgeted separately: a window with no phone in range (the common one — it is
+  what every hour costs when the wearer is away from their phone) and a window
+  with a phone that connects and writes. Both are visible on the same trace as
+  the tick they extend, so the figure to record is the *difference* between a
+  tick with a window and one without. `WORKADAY_DIAG=1` prints when a window
+  opens and what it achieved, which is enough to line the trace up.
+
+Record the date and firmware revision alongside any measurement added here.

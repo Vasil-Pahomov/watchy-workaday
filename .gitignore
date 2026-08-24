@@ -1,0 +1,7 @@
+# Per-machine Claude Code state (permissions granted on this box only).
+# The sub-projects ignore their own copies; this covers a root-level one.
+.claude/settings.local.json
+
+# OS litter.
+.DS_Store
+Thumbs.db

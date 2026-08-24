@@ -1,0 +1,13 @@
+Sync off at night
+Month calendar
+Weather
+Time since last sync indication
+Battery stats (sync with phone and cloud)
+Steps stats (sync with phone and cloud)
+Android app tray icon
+Watch screen last connection time indication
+Remove leading zero
+Multilanguage dates
+Battery watch horizontal icon
+Adjustable watch sync period
+Alarm clock

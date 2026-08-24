@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Workaday</string>
+
+    <!-- The foreground-service notification channel. Law 1: the service is the
+         app's resting state, so this notification is visible for months. -->
+    <string name="channel_name">Watch link</string>
+    <string name="channel_description">Keeps the connection to your Workaday watch ready. Turning this off stops the watch\'s clock being set.</string>
+
+    <!-- One per ServiceNotice. The decision about which one is shown lives in
+         core/ServiceNotice.kt; this file only holds the words. -->
+    <string name="notice_starting">Starting…</string>
+    <string name="notice_waiting">Ready for your watch</string>
+    <string name="notice_exchanging">Syncing…</string>
+    <string name="notice_retrying">Retrying shortly</string>
+    <string name="notice_bluetooth_off">Bluetooth is off</string>
+    <string name="notice_permission_missing">Nearby devices permission needed</string>
+
+    <!-- ============================================================
+         The diagnostic screen. Every enum below is decided in core/;
+         DiagnosticsText.kt maps it to one of these strings and this
+         file holds nothing but the words.
+         ============================================================ -->
+
+    <!-- SetupVerdict. -->
+    <string name="verdict_not_paired">No watch paired yet</string>
+    <string name="verdict_blocked">Not working right now</string>
+    <string name="verdict_at_risk">Working, but this phone may stop it</string>
+    <string name="verdict_ready">Set up and ready</string>
+
+    <!-- SetupTask, in the order assessSetup returns them. -->
+    <string name="task_associate_watch">Pair your Workaday watch</string>
+    <string name="task_bluetooth_permission">Allow the Nearby devices permission</string>
+    <string name="task_bluetooth_on">Turn Bluetooth on</string>
+    <string name="task_battery_exemption">Allow unrestricted battery use</string>
+    <string name="task_notifications">Allow notifications, so you can see this working</string>
+    <string name="todo_none">Nothing to do. Leave the app alone — it does not need to be open.</string>
+
+    <string name="section_status">What has been happening</string>
+    <string name="section_battery_managers">Battery managers</string>
+
+    <!-- Pairing. -->
+    <string name="button_pair">Pair watch</string>
+    <string name="button_pair_again">Pair a different watch</string>
+    <string name="pairing_instructions">Before tapping Pair: on the watch, open its menu and choose Sync. The watch only turns its radio on for a few seconds at a time, so it has to be listening while the phone looks.</string>
+    <string name="pairing_scanning">Looking for your watch…</string>
+    <string name="pairing_timed_out">No watch found. Choose Sync on the watch and try again.</string>
+    <string name="pairing_cancelled">Pairing cancelled.</string>
+    <string name="pairing_failed">Pairing failed.</string>
+    <string name="pairing_failed_because">Pairing failed: %1$s</string>
+    <!-- The fact and nothing more. This line sits *below* the verdict and the task
+         list, and at a first pairing neither the battery exemption nor
+         POST_NOTIFICATIONS has been granted yet — so anything reassuring here
+         contradicts the two things directly above it, and it is the newer line the
+         user believes. Whether anything remains is the verdict's job. -->
+    <string name="pairing_done">Paired with %1$s.</string>
+
+    <!-- Buttons for the outstanding setup tasks. -->
+    <string name="button_permission">Grant the Nearby devices permission</string>
+    <string name="button_bluetooth">Open Bluetooth settings</string>
+    <string name="button_battery">Allow unrestricted battery use</string>
+    <string name="button_notifications">Allow notifications</string>
+    <string name="button_start_service">Start the background service</string>
+    <string name="button_app_settings">Open this app\'s settings</string>
+    <string name="button_refresh">Refresh</string>
+    <string name="settings_unavailable">This phone has no settings screen for that.</string>
+
+    <!-- Observed facts. -->
+    <string name="status_watch_paired">Watch: %1$s</string>
+    <string name="status_watch_none">Watch: none paired</string>
+    <string name="status_service_running">Background service: running</string>
+    <string name="status_service_stopped">Background service: not running</string>
+    <string name="status_last_sync_never">Last sync: never</string>
+    <string name="status_last_sync">Last sync: %1$s</string>
+    <string name="status_last_attempt_none">Last attempt: none recorded yet</string>
+    <string name="status_last_attempt">Last attempt: %1$s — %2$s</string>
+    <string name="status_watch_said">The watch said: %1$s</string>
+    <string name="status_watch_silent">The watch did not get as far as answering.</string>
+    <string name="status_watch_battery">Watch battery: %1$d%%</string>
+    <string name="status_firmware">Watch firmware build: %1$d</string>
+    <!-- HealthLevel.NothingRecorded. Distinct from "succeeded" because zero
+         consecutive failures is true of a fresh install too, and this line sits
+         between "Last sync: never" and "Last attempt: none recorded yet". -->
+    <string name="status_health_nothing_recorded">Health: no exchange recorded yet</string>
+    <string name="status_health_healthy">Health: the last exchange succeeded</string>
+    <!-- Plurals rather than "%d attempt(s)": the degraded case starts at one. -->
+    <plurals name="status_health_degraded">
+        <item quantity="one">Health: %1$d failed attempt in a row</item>
+        <item quantity="other">Health: %1$d failed attempts in a row</item>
+    </plurals>
+    <plurals name="status_health_failing">
+        <item quantity="one">Health: %1$d failed attempt in a row, and retries are now as far apart as they get</item>
+        <item quantity="other">Health: %1$d failed attempts in a row, and retries are now as far apart as they get</item>
+    </plurals>
+
+    <!-- SyncRecency. Elapsed time that has already happened — none of these
+         promises when the next attempt will be, because the recovery bound is one
+         watchdog period and Doze stretches that by an amount nobody can name. -->
+    <string name="recency_never">The watch has never synced with this phone.</string>
+    <string name="recency_recent">Syncing normally.</string>
+    <string name="recency_overdue">A few of the watch\'s hourly windows have gone by without a sync. That is normal if the watch has been away from the phone or switched off.</string>
+    <string name="recency_stalled">No sync for many hours. If the watch has been with you and charged, this phone is probably stopping the app in the background — see Battery managers below.</string>
+
+    <!-- ExchangeOutcome. -->
+    <string name="outcome_succeeded">the watch\'s clock was set</string>
+    <string name="outcome_watch_refused">the watch refused the time</string>
+    <string name="outcome_malformed">the watch\'s reply could not be read</string>
+    <string name="outcome_timed_out">it timed out</string>
+    <string name="outcome_disconnected">the watch disconnected part-way through</string>
+    <string name="outcome_gatt_failed">this phone\'s Bluetooth refused an operation</string>
+    <string name="outcome_never_connected">the connection never came up</string>
+    <string name="outcome_local_clock">this phone\'s own clock is unusable</string>
+
+    <!-- SyncResult, in the wearer's terms rather than the firmware's. -->
+    <string name="result_ok">it set its clock</string>
+    <string name="result_bad_length">the message was the wrong size</string>
+    <string name="result_bad_version">its firmware and this app do not speak the same version</string>
+    <string name="result_out_of_range">the time it was sent was outside what it accepts</string>
+    <string name="result_rtc_write_failed">it could not write to its clock chip</string>
+    <string name="result_bad_type">it did not recognise the message</string>
+    <string name="result_busy">it was already closing its radio window</string>
+    <string name="result_unknown_code">code %1$d, which this app does not recognise — the watch may have newer firmware</string>
+    <string name="result_retry_wont_help">Waiting will not fix this. Update the watch firmware or this app so the two match.</string>
+
+    <!-- OemBatteryAdvice. Advice, not detection: no API reports whether one of
+         these managers is holding the app down, which is why the evidence above
+         is behavioural. Menu names vary between versions of each skin. -->
+    <string name="oem_intro">Android lets phone makers add their own app-killing on top of the settings above, and there is no way for this app to check whether yours has. The only evidence is whether it keeps syncing — the lines above.</string>
+    <string name="oem_generic">Look through this phone\'s battery and app settings for anything called autostart, auto-launch, background restriction, or app sleeping, and allow Workaday in each. dontkillmyapp.com lists the steps for most phones.</string>
+    <string name="oem_xiaomi">On Xiaomi/Redmi/POCO: Settings → Apps → Manage apps → Workaday, turn Autostart on and set Battery saver to No restrictions. Then open Recents, press and hold Workaday and lock it.</string>
+    <string name="oem_huawei">On Huawei: Settings → Battery → App launch → Workaday, switch it to Manage manually and turn on all three of Auto-launch, Secondary launch and Run in background.</string>
+    <string name="oem_samsung">On Samsung: Settings → Battery → Background usage limits, and make sure Workaday is in neither Sleeping apps nor Deep sleeping apps. Then Settings → Apps → Workaday → Battery → Unrestricted.</string>
+    <string name="oem_bbk">On OnePlus, OPPO and vivo: Settings → Battery → Battery optimisation → Workaday → Don\'t optimise, and turn on Allow auto-launch (sometimes under Startup manager or App auto-launch).</string>
+    <string name="oem_footer">Nothing here can be verified from inside the app. If the sync line above stays healthy for a few days, it worked.</string>
+</resources>

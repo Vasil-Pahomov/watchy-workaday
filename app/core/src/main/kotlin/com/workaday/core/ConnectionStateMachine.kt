@@ -1,0 +1,785 @@
+package com.workaday.core
+
+import com.workaday.core.protocol.StatusDecode
+import com.workaday.core.protocol.WatchProtocol
+import com.workaday.core.protocol.WatchStatus
+
+/**
+ * `BluetoothGatt.GATT_SUCCESS`. Every other status is a failure, and they are
+ * all handled the same way — including the notorious 133 that PROTOCOL.md §6.2
+ * calls out by name. Treating "not zero" as one case is not laziness: §6.2 gives
+ * 133 and every other GATT error the identical remedy (`close()`, one backoff
+ * step, re-arm), and a table of Android error codes in `core/` would be a second
+ * place for the platform's numbering to be got wrong.
+ */
+const val GATT_SUCCESS: Int = 0
+
+/**
+ * Not a status from the peer: the local stack never got the operation onto the
+ * air.
+ *
+ * Android's GATT calls can fail *synchronously* — `discoverServices()` returns
+ * false, the characteristic is absent from the discovered profile, the write API
+ * refuses the request. No callback will ever arrive for such an operation, so the
+ * Android layer reports the failure with this status rather than leaving a dead
+ * operation to burn PROTOCOL.md §5.2's five-second timeout first. The machine
+ * treats it exactly like any other non-zero status, which is the point.
+ *
+ * Negative so it cannot collide with a real GATT status or a `BluetoothStatusCodes`
+ * value, both of which are non-negative and both of which the Android layer
+ * forwards verbatim when it has one.
+ */
+const val GATT_LOCAL_FAILURE: Int = -1
+
+/**
+ * Which of the two timers is pending. They are separate objects in the Android
+ * layer — [Action.ArmOperationTimeout] posts one, [Action.ScheduleRetry] the
+ * other — so a firing of the wrong kind is never the one being waited on.
+ */
+private enum class TimerKind { None, Operation, Retry }
+
+/**
+ * Where the app is. Exactly one of these is true at any moment, and — Law 2 —
+ * **none of them is a terminal error state.**
+ *
+ * Every value here is either "connected and working, with a timer armed" or
+ * "waiting, with a defined event that resumes". `ConnectionStateMachineTest`
+ * walks every reachable sequence of events and asserts precisely that.
+ */
+sealed interface ConnectionState {
+
+    /** Before [TransportEvent.Started]. The only state that is not yet armed. */
+    data object Idle : ConnectionState
+
+    /**
+     * The resting state: `connectGatt(autoConnect = true)` is pending and the
+     * Bluetooth controller is holding the wait. Costs the app nothing, survives
+     * Doze, and fires when the watch opens its window.
+     */
+    data object Armed : ConnectionState
+
+    /** A §5.2 backoff delay is running; [TransportEvent.RetryTimerFired] re-arms. */
+    data class WaitingForRetry(val delayMillis: Long) : ConnectionState
+
+    /**
+     * The exchange succeeded, the link is closed, and the app is deliberately
+     * **not acting on the watch** until the window that produced it is over.
+     *
+     * The rule it enforces, in one line: **a successful exchange spends its
+     * window, and no new exchange may begin inside a window that has already been
+     * spent.** PROTOCOL.md §1 is the ground truth for the shape - the watch appears
+     * in short windows and one exchange per window is the intent - and §4 says the
+     * phone pushes the time once per connection, on every connection.
+     *
+     * **What went wrong without it, from the phone and the watch logs of the same
+     * window.** The exchange completed at 41.499 and the machine went to [Armed],
+     * which is correct and is Law 1's resting state. But `autoConnect` does not
+     * mean "wait for the next window"; it means "connect as soon as the peer is
+     * connectable", and the watch's window ran to 42.257. A fresh connection
+     * arrived **16 ms** after the success was reported, the machine correctly
+     * began a second exchange - a peripheral had appeared - and the watch shut its
+     * window half way through it. The phone then sat in [AwaitingStatus] until the
+     * link dropped at 47.422 and recorded `DisconnectedMidExchange`: a 36-second
+     * backoff step and a health increment, **after a sync that had just
+     * succeeded.** Every successful sync was followed by a spurious failed one.
+     *
+     * Note where the fault was not. The machine's logic was right at every step,
+     * `CloseConnection` did what it promised, and nothing was stale. What was wrong
+     * was that "armed" and "ready to start an exchange" had been treated as the
+     * same thing, and against a peer that is still advertising they are not.
+     *
+     * **Why a bounded wait rather than waiting for the link to go away.** After
+     * `close()` there is no GATT client, so there are no callbacks - there is no
+     * "the peer went away and stayed away" event to wait for, and a state that
+     * waited for one would wait forever. So the machine waits out the window by
+     * the clock instead.
+     *
+     * [delayMillis] is what is left of §5.2's 15 s whole-exchange budget, measured
+     * from connect. That number is already chosen against exactly this boundary,
+     * though it took hardware to notice: §5.2 gives it as "longer than the watch's
+     * 12 s cap, so the watch's own teardown is the normal ending". The watch's
+     * window opened at or before our connect, so connect plus 15 s is always past
+     * its §5.1 absolute cap. No new constant is invented and no contract changes;
+     * `WatchProtocolTest` pins the relationship so the two numbers cannot cross
+     * silently.
+     *
+     * The failure path never needed this: it goes through a §5.2 backoff of at
+     * least 30 s, which already outlasts the watch's 12 s cap. Success was the only
+     * path that re-armed with no delay at all - which is why the defect appeared
+     * only after a sync that worked.
+     *
+     * A waiting state with a defined event that resumes it, so Law 2 holds: the
+     * timer fires and the machine arms. The app still ends up armed, always -
+     * that is Law 1 and it is not negotiable. The only question this state answers
+     * is whether to *act* on a peripheral it has just finished with.
+     */
+    data class Settling(val delayMillis: Long) : ConnectionState
+
+    /**
+     * The radio cannot be used: adapter off (or airplane mode, which looks the
+     * same), or the runtime Bluetooth permission was revoked.
+     *
+     * Still "waiting", not "failed" — §6.2's last two rows. Both flags are
+     * tracked separately so that turning the adapter back on while the
+     * permission is still missing does not arm into a guaranteed failure.
+     */
+    data class Blocked(val adapterOff: Boolean, val permissionMissing: Boolean) : ConnectionState
+
+    /** Connected; service discovery outstanding. §4 op 1. */
+    data object Discovering : ConnectionState
+
+    /** Connected; the CCCD write on Status is outstanding. §4 op 2. */
+    data object EnablingNotifications : ConnectionState
+
+    /** Connected; the Time write is outstanding. §4 op 3. */
+    data object WritingTime : ConnectionState
+
+    /** Connected; waiting for the Status notify that ends the exchange. */
+    data object AwaitingStatus : ConnectionState
+}
+
+/**
+ * What the Android layer observed. These mirror the GATT callbacks and the
+ * system broadcasts one for one, deliberately carrying the raw status codes:
+ * the Android layer forwards, it does not decide (Law 3).
+ */
+sealed interface TransportEvent {
+
+    /** The foreground service came up. Idempotent. */
+    data object Started : TransportEvent
+
+    /** `onConnectionStateChange` → `STATE_CONNECTED`. */
+    data class Connected(val gattStatus: Int) : TransportEvent
+
+    /**
+     * `onConnectionStateChange` → `STATE_DISCONNECTED`.
+     *
+     * [gattStatus] is carried so APP-3 can log it, but nothing in here branches
+     * on it. §6.2's three disconnect rows differ by *when* the disconnect
+     * happened — after a successful notify, mid-exchange, or while merely armed
+     * — which is the state machine's own state, not the peer's error code.
+     */
+    data class Disconnected(val gattStatus: Int) : TransportEvent
+
+    /** `onServicesDiscovered`. */
+    data class ServicesDiscovered(val gattStatus: Int) : TransportEvent
+
+    /** `onDescriptorWrite` for the CCCD on Status. */
+    data class DescriptorWritten(val gattStatus: Int) : TransportEvent
+
+    /** `onCharacteristicWrite` for Time. */
+    data class CharacteristicWritten(val gattStatus: Int) : TransportEvent
+
+    /**
+     * `onCharacteristicChanged` for Status. Nullable payload because Android's
+     * value getter is platform-typed; a null payload is a wrong length, not a
+     * crash.
+     *
+     * A plain class, not a `data class`: `ByteArray` has identity equality, so a
+     * generated `equals` would be quietly wrong for anyone who tried to use it.
+     */
+    class NotificationReceived(val payload: ByteArray?) : TransportEvent {
+        override fun toString(): String =
+            "NotificationReceived(${payload?.size ?: "null"} bytes)"
+    }
+
+    /**
+     * The timer armed by [Action.ArmOperationTimeout] expired. [token] is
+     * checked against the machine's current one, so a firing that raced a
+     * cancellation is discarded instead of tearing down a healthy connection.
+     */
+    data class OperationTimedOut(val token: Long) : TransportEvent
+
+    /** The timer armed by [Action.ScheduleRetry] expired. [token] as above. */
+    data class RetryTimerFired(val token: Long) : TransportEvent
+
+    /** Adapter turned off, or airplane mode engaged — they are indistinguishable. */
+    data object AdapterOff : TransportEvent
+
+    /** Adapter available again. */
+    data object AdapterOn : TransportEvent
+
+    /** `BLUETOOTH_CONNECT` revoked at runtime. */
+    data object PermissionRevoked : TransportEvent
+
+    /** `BLUETOOTH_CONNECT` granted again. */
+    data object PermissionGranted : TransportEvent
+}
+
+/**
+ * What the Android layer must do, in the order given. It performs these; it
+ * decides nothing (Law 3).
+ */
+sealed interface Action {
+
+    /**
+     * `device.connectGatt(context, autoConnect = true, callback)`.
+     *
+     * Never issued while a GATT client is already open — the machine closes
+     * first — so this can never leak one of the process's limited client slots.
+     */
+    data object ArmAutoConnect : Action
+
+    /**
+     * `gatt.disconnect()` **then** `gatt.close()`, release the reference, and
+     * deliver no further callbacks from that client to the machine.
+     *
+     * All three parts are load-bearing. `disconnect()` without `close()` leaks a
+     * client slot (Law 2). And the machine reads a `Disconnected` arriving while
+     * [ConnectionState.Armed] as "the pending autoConnect failed" and backs off
+     * — which is right for a 133, and wrong if it is really the echo of a link
+     * this action already closed. `close()` unregisters the client, so the
+     * platform stops delivering; APP-3's job is not to route a stale `gatt`
+     * object's callbacks back in after that.
+     */
+    data object CloseConnection : Action
+
+    /** `gatt.discoverServices()`. */
+    data object DiscoverServices : Action
+
+    /**
+     * `setCharacteristicNotification` on Status plus a CCCD write of
+     * [WatchProtocol.cccdEnableNotificationValue].
+     *
+     * §4: this happens **before** the Time write. Writing first races the
+     * notification and loses it.
+     */
+    data object EnableStatusNotifications : Action
+
+    /**
+     * Write [payload] to [WatchProtocol.TIME_CHARACTERISTIC_UUID], **with
+     * response**. The bytes are already encoded — the Android layer does not
+     * touch the wire format.
+     */
+    class WriteTime(val payload: ByteArray) : Action {
+        override fun toString(): String = "WriteTime(${payload.size} bytes)"
+    }
+
+    /**
+     * Post a single delayed callback that will deliver
+     * [TransportEvent.OperationTimedOut] with this [token], replacing any timer
+     * already pending. Exactly one timer is ever outstanding.
+     */
+    data class ArmOperationTimeout(val timeoutMillis: Long, val token: Long) : Action
+
+    /**
+     * As [ArmOperationTimeout], but delivering [TransportEvent.RetryTimerFired].
+     * The delay already includes §5.2's jitter.
+     *
+     * This has to survive Doze — an `AlarmManager` alarm or a `WorkManager`
+     * one-shot, not a `Handler.postDelayed` that a dozing phone will stretch
+     * past the watch's next window.
+     */
+    data class ScheduleRetry(val delayMillis: Long, val token: Long) : Action
+
+    /** Cancel whatever timer is pending. Idempotent. */
+    data object CancelTimers : Action
+
+    /** Write [snapshot] somewhere that survives process death. Law 2. */
+    data class PersistHealth(val snapshot: HealthSnapshot) : Action
+
+    /**
+     * Surface a finished exchange in the diagnostic UI. [status] is present only
+     * when the watch actually answered — §6.2 requires the `result` code to be
+     * visible, `BadVersion` most of all.
+     *
+     * [atUtcEpochSeconds] rides along rather than being read by the Android layer
+     * when it performs this, so that the timestamp on the persisted
+     * [ExchangeReport] is the same clock read that went into [HealthSnapshot] —
+     * one read, one instant, no chance of the screen and the counters disagreeing
+     * about when the same exchange happened.
+     */
+    data class ReportExchange(
+        val outcome: ExchangeOutcome,
+        val status: WatchStatus?,
+        val atUtcEpochSeconds: Long,
+    ) : Action
+}
+
+/**
+ * Every decision the app makes about the link, in one place a JVM test can drive.
+ *
+ * It consumes [TransportEvent]s and returns the [Action]s the Android layer must
+ * perform, in order. There is no `Context`, no `BluetoothGatt`, no thread and no
+ * wall-clock read in here — time arrives through [Clock] (Law 3).
+ *
+ * The two rules it exists to enforce:
+ *
+ * - **§4's ordering.** Discover, then enable notifications, then write Time,
+ *   then wait for the notify. One outstanding GATT operation at a time, each
+ *   with its own timeout, because Android silently drops a write issued before
+ *   the previous callback returns.
+ * - **Law 2's invariant.** Every path ends armed and waiting. After any event
+ *   the machine is connected with a timer armed, resting on a pending
+ *   autoConnect, counting down a backoff, or blocked on a condition with a
+ *   defined event that clears it. There is no fifth option and no terminal
+ *   error state.
+ *
+ * Not thread-safe, deliberately: the Android layer owns it from a single
+ * serialising context, which is also what makes "one outstanding operation"
+ * true rather than hoped for.
+ */
+class ConnectionStateMachine(
+    private val clock: Clock,
+    private val backoff: Backoff,
+    initialHealth: HealthSnapshot = HealthSnapshot(),
+) {
+    private val healthCounter = Health(initialHealth)
+
+    private var started = false
+    private var adapterOn = true
+    private var permissionGranted = true
+
+    /** True between an emitted [Action.ArmAutoConnect] and its [Action.CloseConnection]. */
+    private var linkOpen = false
+
+    /**
+     * Which timer is pending, if any — never more than one.
+     *
+     * The kind is checked alongside the token, and it is **defence in depth, not
+     * the load-bearing guard**: in the shape this file settled into, each
+     * handler already refuses to act outside the states its timer can exist in
+     * ([onRetryTimerFired] returns unless [ConnectionState.WaitingForRetry],
+     * [onOperationTimedOut] routes every other state to a no-op), and those
+     * guards subsume it. Deleting the kind check today changes no observable
+     * behaviour, and the tests say so.
+     *
+     * It is kept because the guards it duplicates are easy to relax by accident.
+     * The two timers really are different objects in the Android layer — a
+     * posted callback and a Doze-proof alarm — so a firing of the wrong kind is
+     * never the one being waited on, and saying that once here is cheaper than
+     * re-deriving it at each handler the next time one is edited.
+     */
+    private var armedTimer = TimerKind.None
+    private var timerToken = 0L
+
+    /** [Clock.monotonicMillis] at the moment the link came up. §5.2's 15 s runs from here. */
+    private var connectedAtMillis = 0L
+
+    var state: ConnectionState = ConnectionState.Idle
+        private set
+
+    /** The last well-formed Status frame the watch sent, for the diagnostic screen. */
+    var lastStatus: WatchStatus? = null
+        private set
+
+    val health: HealthSnapshot get() = healthCounter.snapshot
+
+    /**
+     * [health] read as a traffic light. Failing means the backoff is at its cap.
+     *
+     * The snapshot overload, not the two-number one: a machine that has never
+     * completed an exchange has zero consecutive failures, and answering
+     * [HealthLevel.Healthy] to that would be the same "the last exchange
+     * succeeded" claim that a fresh install has no business making.
+     */
+    val healthLevel: HealthLevel
+        get() = healthLevelFor(health, backoff.attemptsToReachCap + 1)
+
+    /**
+     * Feed one observation, get back the work to do.
+     *
+     * Returns an empty list for anything that does not apply in the current
+     * state — a callback from a link that has already been closed, a timer
+     * firing that lost a race with its own cancellation, a duplicate `Started`.
+     * Ignoring those is not sloppiness: the alternative is acting on a stale
+     * link, which is how a GATT client gets leaked.
+     */
+    fun onEvent(event: TransportEvent): List<Action> {
+        val actions = mutableListOf<Action>()
+        when (event) {
+            TransportEvent.Started -> onStarted(actions)
+
+            TransportEvent.AdapterOff -> {
+                adapterOn = false
+                enterBlockedIfNeeded(actions)
+            }
+
+            TransportEvent.AdapterOn -> {
+                adapterOn = true
+                leaveBlockedIfPossible(actions)
+            }
+
+            TransportEvent.PermissionRevoked -> {
+                permissionGranted = false
+                enterBlockedIfNeeded(actions)
+            }
+
+            TransportEvent.PermissionGranted -> {
+                permissionGranted = true
+                leaveBlockedIfPossible(actions)
+            }
+
+            is TransportEvent.Connected -> onConnected(event.gattStatus, actions)
+            is TransportEvent.Disconnected -> onDisconnected(actions)
+            is TransportEvent.ServicesDiscovered -> onServicesDiscovered(event.gattStatus, actions)
+            is TransportEvent.DescriptorWritten -> onDescriptorWritten(event.gattStatus, actions)
+            is TransportEvent.CharacteristicWritten -> onCharacteristicWritten(event.gattStatus, actions)
+            is TransportEvent.NotificationReceived -> onNotification(event.payload, actions)
+            is TransportEvent.OperationTimedOut -> onOperationTimedOut(event.token, actions)
+            is TransportEvent.RetryTimerFired -> onRetryTimerFired(event.token, actions)
+        }
+        return actions
+    }
+
+    // ── Lifecycle and gating ─────────────────────────────────────────────────
+
+    private fun onStarted(actions: MutableList<Action>) {
+        if (started) return
+        started = true
+        if (isBlocked()) {
+            state = blockedState()
+        } else {
+            arm(actions)
+        }
+    }
+
+    private fun isBlocked(): Boolean = !adapterOn || !permissionGranted
+
+    private fun blockedState(): ConnectionState.Blocked =
+        ConnectionState.Blocked(adapterOff = !adapterOn, permissionMissing = !permissionGranted)
+
+    /**
+     * The radio became unusable. Tear down whatever was in flight and wait.
+     *
+     * Deliberately **no** backoff step and no health increment: §6.2 lists these
+     * as handled transitions, separate from the failure rows. The adapter being
+     * off is not the watch failing to answer, and penalising it would delay the
+     * first attempt after the user leaves airplane mode — exactly when the app
+     * should be quickest.
+     */
+    private fun enterBlockedIfNeeded(actions: MutableList<Action>) {
+        if (!started || !isBlocked()) return
+        cancelTimer(actions)
+        closeLink(actions)
+        state = blockedState()
+    }
+
+    private fun leaveBlockedIfPossible(actions: MutableList<Action>) {
+        if (!started) return
+        if (state !is ConnectionState.Blocked) return
+        if (isBlocked()) {
+            // One condition cleared, the other has not. Refresh the reasons so
+            // the diagnostic screen stops naming the one that is fixed.
+            state = blockedState()
+            return
+        }
+        // Straight back to armed, skipping any backoff that was running when the
+        // radio went away: the outage already supplied the delay, and the watch's
+        // next window is what we are trying not to miss. The failure count is
+        // untouched, so a link that fails again resumes where it left off.
+        arm(actions)
+    }
+
+    // ── The exchange, in §4's order ──────────────────────────────────────────
+
+    private fun onConnected(gattStatus: Int, actions: MutableList<Action>) {
+        if (state != ConnectionState.Armed) return
+        if (gattStatus != GATT_SUCCESS) {
+            failExchange(ExchangeOutcome.ConnectionAttemptFailed, actions)
+            return
+        }
+        connectedAtMillis = clock.monotonicMillis()
+        state = ConnectionState.Discovering
+        // Timer first, then the operation: there is then no instant in which a
+        // GATT call is outstanding without something watching it.
+        armOperationTimeout(actions)
+        actions += Action.DiscoverServices
+    }
+
+    private fun onServicesDiscovered(gattStatus: Int, actions: MutableList<Action>) {
+        if (state != ConnectionState.Discovering) return
+        if (gattStatus != GATT_SUCCESS) {
+            failExchange(ExchangeOutcome.GattOperationFailed, actions)
+            return
+        }
+        state = ConnectionState.EnablingNotifications
+        armOperationTimeout(actions)
+        actions += Action.EnableStatusNotifications
+    }
+
+    private fun onDescriptorWritten(gattStatus: Int, actions: MutableList<Action>) {
+        if (state != ConnectionState.EnablingNotifications) return
+        if (gattStatus != GATT_SUCCESS) {
+            failExchange(ExchangeOutcome.GattOperationFailed, actions)
+            return
+        }
+        // The clock is read here, as late as possible: this is the last moment
+        // before the bytes go on the wire, so the watch gets the freshest time
+        // the phone has.
+        val epochSeconds = clock.utcEpochSeconds()
+        val offsetMinutes = clock.utcOffsetMinutes()
+        if (!WatchProtocol.isEncodableTime(epochSeconds, offsetMinutes)) {
+            // The phone's own clock is outside what §3.1 can carry. Sending a
+            // truncated epoch would set the watch to a wrong time and report
+            // success, which is worse than not syncing.
+            failExchange(ExchangeOutcome.LocalClockUnusable, actions)
+            return
+        }
+        state = ConnectionState.WritingTime
+        armOperationTimeout(actions)
+        actions += Action.WriteTime(WatchProtocol.encodeTime(epochSeconds, offsetMinutes))
+    }
+
+    private fun onCharacteristicWritten(gattStatus: Int, actions: MutableList<Action>) {
+        if (state != ConnectionState.WritingTime) return
+        if (gattStatus != GATT_SUCCESS) {
+            failExchange(ExchangeOutcome.GattOperationFailed, actions)
+            return
+        }
+        state = ConnectionState.AwaitingStatus
+        // Waiting for the notify is not one of §5.2's per-operation timeouts, so
+        // it gets whatever is left of the 15 s whole-exchange budget.
+        armTimer(remainingExchangeBudgetMillis(), actions)
+    }
+
+    private fun onNotification(payload: ByteArray?, actions: MutableList<Action>) {
+        // Accepted in WritingTime as well as AwaitingStatus. Android's write
+        // callback and an incoming notification are separate deliveries and can
+        // arrive in either order; if the notify wins the race, consuming it here
+        // is the difference between a successful sync and a 15 s timeout
+        // followed by a backoff step.
+        //
+        // Deliberately *not* accepted in Discovering or EnablingNotifications.
+        // §3.2 says a Status read before this connection's write reports the
+        // *previous* sync — so a notify that early could carry a stale `Ok` from
+        // an hour ago, and treating it as this exchange's result would reset the
+        // backoff for a sync that never happened.
+        if (state != ConnectionState.WritingTime && state != ConnectionState.AwaitingStatus) return
+
+        when (val decoded = WatchProtocol.decodeStatus(payload)) {
+            is StatusDecode.Rejected -> failExchange(ExchangeOutcome.MalformedStatus, actions)
+
+            is StatusDecode.Valid -> {
+                val status = decoded.status
+                lastStatus = status
+                if (status.isSuccess) {
+                    succeed(status, actions)
+                } else {
+                    // §6.2: a non-zero result is a **failed** exchange. Backoff
+                    // is not reset, and there is no second push in this
+                    // connection — §4 permits one only if the first failed, and
+                    // §6.2 says a drifted `BadVersion` must not hot-loop. The
+                    // watch's next window is the right place to try again.
+                    failExchange(
+                        ExchangeOutcome.WatchReportedFailure,
+                        actions,
+                        status = status,
+                        statusResultCode = status.resultCode,
+                    )
+                }
+            }
+        }
+    }
+
+    // ── Failure paths ────────────────────────────────────────────────────────
+
+    private fun onDisconnected(actions: MutableList<Action>) {
+        when (state) {
+            // §6.2 row "status 133": the pending autoConnect never came up, or
+            // dropped before the exchange began. Close (the client may be stale
+            // or leaked, which is what 133 usually means), back off one step,
+            // re-arm with a fresh client.
+            ConnectionState.Armed -> failExchange(ExchangeOutcome.ConnectionAttemptFailed, actions)
+
+            // §6.2 row "disconnect mid-exchange".
+            ConnectionState.Discovering,
+            ConnectionState.EnablingNotifications,
+            ConnectionState.WritingTime,
+            ConnectionState.AwaitingStatus,
+            -> failExchange(ExchangeOutcome.DisconnectedMidExchange, actions)
+
+            // §6.2 row "disconnect after a successful notify" lands here: the
+            // exchange already ended, the link is already closed and re-armed,
+            // and this is at most an echo. Normal, not a fault — no backoff, no
+            // health increment, nothing logged as an error.
+            ConnectionState.Idle,
+            is ConnectionState.WaitingForRetry,
+            is ConnectionState.Blocked,
+            // Settling lands here too, and it is the same row: the exchange ended,
+            // the link is already closed, and this is at most the echo of our own
+            // hang-up. No backoff, no health increment, nothing logged as a fault.
+            is ConnectionState.Settling,
+            -> Unit
+        }
+    }
+
+    private fun onOperationTimedOut(token: Long, actions: MutableList<Action>) {
+        if (!isCurrentTimer(TimerKind.Operation, token)) return
+        when (state) {
+            ConnectionState.Discovering,
+            ConnectionState.EnablingNotifications,
+            ConnectionState.WritingTime,
+            ConnectionState.AwaitingStatus,
+            -> {
+                // It fired, so there is nothing left to cancel.
+                armedTimer = TimerKind.None
+                // §6.2: close() — never just disconnect() — one backoff step, re-arm.
+                failExchange(ExchangeOutcome.OperationTimedOut, actions)
+            }
+
+            // The settle after a successful exchange is over, so the watch's
+            // window has closed and arming can no longer land back inside it.
+            is ConnectionState.Settling -> {
+                armedTimer = TimerKind.None
+                arm(actions)
+            }
+
+            ConnectionState.Idle,
+            ConnectionState.Armed,
+            is ConnectionState.WaitingForRetry,
+            is ConnectionState.Blocked,
+            // An operation timer only exists in the four states above, so this
+            // is unreachable. Deliberately leaving the timer armed rather than
+            // clearing it: disarming a timer we are not going to act on is
+            // precisely how a state ends up waiting for nothing.
+            -> Unit
+        }
+    }
+
+    private fun onRetryTimerFired(token: Long, actions: MutableList<Action>) {
+        if (!isCurrentTimer(TimerKind.Retry, token)) return
+        // Same reasoning as above: check first, disarm only once we are certain
+        // we are going to replace what we disarmed.
+        if (state !is ConnectionState.WaitingForRetry) return
+        armedTimer = TimerKind.None
+        if (isBlocked()) {
+            state = blockedState()
+            return
+        }
+        arm(actions)
+    }
+
+    /**
+     * Close, count it, and schedule the retry. The single exit for every failure
+     * in the file — which is what makes "always `close()`, always end waiting"
+     * a property of the code rather than a promise about it.
+     */
+    private fun failExchange(
+        outcome: ExchangeOutcome,
+        actions: MutableList<Action>,
+        status: WatchStatus? = null,
+        statusResultCode: Int = HealthSnapshot.NO_RESULT_CODE,
+    ) {
+        cancelTimer(actions)
+        closeLink(actions)
+        // One read, used by both the counters and the report: two reads could
+        // straddle an NTP correction and date the same exchange twice.
+        val now = clock.utcEpochSeconds()
+        healthCounter.recordFailure(now, outcome, statusResultCode)
+        actions += Action.PersistHealth(health)
+        actions += Action.ReportExchange(outcome, status, now)
+        scheduleRetry(actions)
+    }
+
+    private fun succeed(status: WatchStatus, actions: MutableList<Action>) {
+        cancelTimer(actions)
+        // §4: the phone hangs up after the notify. The watch tears its radio down
+        // and sleeps either way.
+        closeLink(actions)
+        val now = clock.utcEpochSeconds()
+        healthCounter.recordSuccess(now, status.resultCode)
+        actions += Action.PersistHealth(health)
+        actions += Action.ReportExchange(ExchangeOutcome.Succeeded, status, now)
+        settle(actions)
+    }
+
+    /**
+     * Wait out the rest of the watch's window, then re-arm.
+     *
+     * Not a backoff, and it must not be mistaken for one: nothing is counted,
+     * health is untouched, and §6.2's "a disconnect after a successful notify is
+     * normal" still holds. It is a bounded pause with exactly one purpose -
+     * making sure the next `autoConnect` cannot land back inside the window the
+     * app has just finished using. See [ConnectionState.Settling] for what
+     * happened on hardware without it.
+     */
+    private fun settle(actions: MutableList<Action>) {
+        if (isBlocked()) {
+            // The radio went away in the same breath as the success. Blocked is
+            // also a waiting state, and AdapterOn / PermissionGranted arms from it.
+            state = blockedState()
+            return
+        }
+        val delayMillis = remainingExchangeBudgetMillis()
+        if (delayMillis <= 0L) {
+            // The exchange used its whole budget, so the watch is already past its
+            // §5.1 cap and its window is shut. Nothing left to wait out.
+            arm(actions)
+            return
+        }
+        armTimer(delayMillis, actions)
+        state = ConnectionState.Settling(delayMillis)
+    }
+
+    private fun scheduleRetry(actions: MutableList<Action>) {
+        if (isBlocked()) {
+            // The radio went away while we were failing. Blocked is also a
+            // waiting state, and AdapterOn / PermissionGranted arms from there.
+            state = blockedState()
+            return
+        }
+        val delayMillis = backoff.delayMillisFor(health.retryAttemptIndex)
+        actions += Action.ScheduleRetry(delayMillis, nextTimerToken(TimerKind.Retry))
+        state = ConnectionState.WaitingForRetry(delayMillis)
+    }
+
+    // ── Link and timer bookkeeping ───────────────────────────────────────────
+
+    private fun arm(actions: MutableList<Action>) {
+        cancelTimer(actions)
+        // Belt and braces: arming while a client is still open would leak one of
+        // the process's limited GATT client slots. Unreachable by construction —
+        // every caller has already closed — and cheap enough to keep that way.
+        closeLink(actions)
+        actions += Action.ArmAutoConnect
+        linkOpen = true
+        state = ConnectionState.Armed
+    }
+
+    private fun closeLink(actions: MutableList<Action>) {
+        if (!linkOpen) return
+        actions += Action.CloseConnection
+        linkOpen = false
+    }
+
+    private fun cancelTimer(actions: MutableList<Action>) {
+        if (armedTimer == TimerKind.None) return
+        actions += Action.CancelTimers
+        armedTimer = TimerKind.None
+        // Bump the token so a firing already in flight is recognised as stale.
+        timerToken++
+    }
+
+    private fun armOperationTimeout(actions: MutableList<Action>) {
+        armTimer(minOf(WatchProtocol.OPERATION_TIMEOUT_MS, remainingExchangeBudgetMillis()), actions)
+    }
+
+    private fun armTimer(timeoutMillis: Long, actions: MutableList<Action>) {
+        actions += Action.ArmOperationTimeout(timeoutMillis, nextTimerToken(TimerKind.Operation))
+    }
+
+    /** Tokens come from one counter across both kinds, so no two are ever equal. */
+    private fun nextTimerToken(kind: TimerKind): Long {
+        timerToken++
+        armedTimer = kind
+        return timerToken
+    }
+
+    private fun isCurrentTimer(kind: TimerKind, token: Long): Boolean =
+        armedTimer == kind && token == timerToken
+
+    /**
+     * What is left of §5.2's 15 s whole-exchange budget.
+     *
+     * Every per-operation timeout is clamped to this, so exactly one timer is
+     * ever outstanding and the exchange still cannot outlive its budget. The
+     * elapsed time is clamped at zero first: [Clock.monotonicMillis] promises not
+     * to go backwards, but a process that runs for months does not stake "the
+     * budget never expires" on a platform promise.
+     */
+    private fun remainingExchangeBudgetMillis(): Long {
+        val elapsed = (clock.monotonicMillis() - connectedAtMillis).coerceAtLeast(0L)
+        return (WatchProtocol.EXCHANGE_TIMEOUT_MS - elapsed).coerceAtLeast(0L)
+    }
+}

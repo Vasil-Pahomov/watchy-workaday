@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Permissions. Every one of these is load-bearing for Law 1; none is
+      speculative. Sources for the claims are docs/background-execution.md §1.
+    -->
+
+    <!--
+      neverForLocation: we never derive location from a scan result, so this
+      strips the location implication and keeps ACCESS_FINE_LOCATION out of the
+      app entirely. Scanning happens exactly once, at first pairing.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Runtime permission from API 33. Without it the service still runs, but
+         its notification is invisible and the user cannot see the app working. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- The resting state is a foreground service of type connectedDevice.
+         connectedDevice is deliberate: it is NOT on the list of types Android 15
+         forbids starting from BOOT_COMPLETED, and dataSync is. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <!-- Start on boot. Also covers LOCKED_BOOT_COMPLETED and MY_PACKAGE_REPLACED,
+         which BootReceiver filters for. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Held only while a GATT operation timeout is armed - at most the 15 s of
+         PROTOCOL.md §5.2, released on arm, cancel, fire and shutdown, and
+         acquired with a kernel-side timeout as a backstop. It is what makes the
+         §4 exchange run at wall-clock speed against the watch's 12 s session cap
+         (§5.1) on a phone that would otherwise suspend between two GATT
+         callbacks. See OperationTimer. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Granted through the CompanionDeviceManager association. Together these
+         are what let the service be started from the background at all. -->
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
+
+    <!-- Legitimate here only because this app is sideloaded, not distributed
+         through Play, which restricts this permission to a narrow set of
+         categories. Settled 17 Aug 2026 — CLAUDE.md Law 5, docs/toolchain.md. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Required in order to use CompanionDeviceManager at all. required="true"
+         because the association is mandatory (Law 1), not a nicety: a device
+         without companion device setup cannot run this app usefully. -->
+    <uses-feature
+        android:name="android.software.companion_device_setup"
+        android:required="true" />
+
+    <!--
+      required="true", decided here rather than inherited.
+
+      Play filtering is irrelevant — this app is sideloaded (Law 5,
+      docs/toolchain.md) — so this is a judgement about honesty, not
+      distribution. The judgement: BLE is not a feature of this app, it is the
+      whole of it. On a device without it there is nothing to degrade to; the
+      service would come up, hold a permanent notification saying it was ready
+      for the watch, and never connect. That is precisely Law 2's refused failure
+      mode — installed, looks fine, silently does nothing — and required="true"
+      turns it into a refusal at install time instead. It also matches the
+      companion_device_setup declaration directly above, which is required for
+      the same reason.
+    -->
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="true" />
+
+    <!--
+      allowBackup="false", decided here because this is the first change that
+      persists anything.
+
+      The unset default is true, and auto-backup would restore this app's health
+      counters onto a new install or a different phone. Restored counters are
+      wrong in both directions: a restored consecutiveFailures puts a freshly
+      installed app straight into a 15-minute backoff, and a restored "last
+      synced" makes the diagnostic screen report a sync that this device never
+      had. Worse, the CompanionDeviceManager association does NOT survive a
+      restore, so a restored watch address would leave a phone that looks paired
+      and can never connect — the silent stall Law 2 exists to refuse.
+
+      Nothing here is worth carrying between devices: every value is either a
+      counter that should start at zero or an association that has to be made
+      again on the new phone.
+
+      allowBackup on its own is not enough on the versions this app runs on:
+      since Android 12 it governs cloud backup only, and device-to-device
+      transfer is configured by dataExtractionRules. minSdk is 31, so both are
+      required for the decision above to actually hold. See
+      res/xml/data_extraction_rules.xml.
+    -->
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:label="@string/app_name">
+
+        <!--
+          Law 1's resting state.
+
+          foregroundServiceType="connectedDevice": NOT dataSync, which Android 15
+          forbids starting from BOOT_COMPLETED and which would break start-on-boot
+          with a ForegroundServiceStartNotAllowedException that no unit test
+          catches (docs/background-execution.md §1).
+
+          directBootAware="true": BootReceiver has to be direct-boot aware to
+          receive LOCKED_BOOT_COMPLETED at all, so the service it starts must be
+          able to run before the first unlock too. Everything the service reads
+          that early comes out of device-protected storage (WatchStore).
+
+          exported="false": nothing outside this app starts it.
+        -->
+        <service
+            android:name=".WatchLinkService"
+            android:directBootAware="true"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!--
+          All three actions, per Law 1. MY_PACKAGE_REPLACED is the one that is
+          easy to drop and expensive to lose: without it an app update leaves the
+          user unprotected until their next reboot.
+
+          exported="true" is required to receive system broadcasts. All three are
+          protected broadcasts, so only the system can send them.
+        -->
+        <receiver
+            android:name=".BootReceiver"
+            android:directBootAware="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          Law 1: the Activity is a diagnostic window and nothing more — killing
+          it, swiping the app away or never opening it again must change nothing.
+
+          It now hosts the one thing the user must open the app for: the
+          CompanionDeviceManager association. That is a first-run, user-initiated,
+          foreground flow with a hard timeout, and it is the only place in this app
+          where a scan happens at all — the system runs it on our behalf. Once it
+          has written the address down and started the service, nothing in the app
+          reads anything this Activity owns.
+
+          No launchMode and no state saved across configuration changes, because
+          there is no state: every value on the screen is re-read from the store
+          and from the platform on each onResume.
+        -->
+        <activity
+            android:name=".DiagnosticsActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>
