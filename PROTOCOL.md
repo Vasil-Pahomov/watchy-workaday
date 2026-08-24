@@ -5,19 +5,20 @@ Android companion app must agree on: UUIDs, byte layouts, timeouts, and who is
 allowed to do what when.
 
 It exists because both projects forbid inventing this material locally —
-`Firmware/CLAUDE.md` Law 5 and `App/CLAUDE.md` Law 5 both say the contract lives
+`firmware/CLAUDE.md` Law 5 and `app/CLAUDE.md` Law 5 both say the contract lives
 in **one** place and is never retyped from memory into a second one.
 
 ```
 Workaday/
   PROTOCOL.md   ← you are here: the contract, in prose and tables
-  Firmware/     mirrors it in src/core/protocol.h   (pure, host-tested)
-  App/          mirrors it in core/…/WatchProtocol.kt (pure Kotlin, JVM-tested)
+  firmware/     mirrors it in src/core/protocol.h   (pure, host-tested)
+  app/          mirrors it in core/…/WatchProtocol.kt (pure Kotlin, JVM-tested)
 ```
 
 **Rules for changing this file:**
 
-1. A change here is a change to both repos. Land the doc first, then both sides.
+1. A change here is a change to both implementations. Land the doc first,
+   then both sides.
 2. Any change to a byte layout, a UUID, or a semantic meaning **bumps
    `PROTO_VERSION`**. Reserved bytes may be given meaning without a bump only if
    an old receiver ignoring them is still correct.
@@ -49,7 +50,7 @@ writes nothing — the only ending that tears down with a live link), longevity 
 any kind (this has run for hours, and the design is about months), the Android
 14/15 `BOOT_COMPLETED` foreground-service restrictions (the test phone is Android
 13, where they do not apply), and every energy figure in
-`Firmware/docs/power-budget.md`, which remains estimates with no meter reading
+`firmware/docs/power-budget.md`, which remains estimates with no meter reading
 behind them. See `BRINGUP.md`.
 
 ---
@@ -243,7 +244,7 @@ Ordering rules that are not negotiable:
   and health counters. A watch that notifies on subscribe would look correct on
   both benches and fail only when the two halves meet.
 - The phone issues **one GATT operation at a time**, each through a single queue,
-  each with its own timeout (`App/CLAUDE.md` Law 2). Android silently drops a
+  each with its own timeout (`app/CLAUDE.md` Law 2). Android silently drops a
   write issued before the previous callback returns.
 - The **notification with `result == 0` is the definition of a successful
   exchange.** A successful *connect* is not. Backoff and health counters reset on
@@ -393,7 +394,7 @@ taking the ledger total from ~6.0 to **~6.9 mAh/day** and the headroom from
 
 Affordable, and it is the single most expensive thing in the firmware. Every one
 of those numbers is an estimate and must be replaced with a meter reading — see
-`Firmware/docs/power-budget.md`, which owns the ledger and must be updated in the
+`firmware/docs/power-budget.md`, which owns the ledger and must be updated in the
 same change that adds the radio.
 
 For scale: continuous advertising would be ~20 mAh/day and would empty the cell
@@ -424,13 +425,13 @@ in about ten days. That is why the window exists.
 | Operation timeout | `close()` — **never** just `disconnect()` — backoff one step, re-arm |
 | Notify with `result != 0` | this is a **failed** exchange: backoff is not reset. Surface the code in the diagnostic UI. `BadVersion` in particular means the two sides have drifted and retrying will not help — show it, do not hot-loop |
 | Adapter off / airplane mode / permission revoked / unbonded | handled transition with a test. End state is always "armed and waiting" once the condition clears |
-| Any path whatsoever | ends armed and waiting. There is no terminal error state (`App/CLAUDE.md` Law 2) |
+| Any path whatsoever | ends armed and waiting. There is no terminal error state (`app/CLAUDE.md` Law 2) |
 
 ---
 
 ## 7. Golden test vectors
 
-**Both repos must have a unit test that reproduces these byte for byte.** This is
+**Both sides must have a unit test that reproduces these byte for byte.** This is
 the mechanism that keeps the implementations in sync; everything above is prose
 and prose drifts.
 
@@ -475,13 +476,13 @@ Result `Ok`, battery 78 %, applied epoch as above, `fw_build` 1.
 
 ## 8. Where each side mirrors this
 
-Exactly one file per repo. Nothing else in either codebase may contain a UUID
+Exactly one file per side. Nothing else in either codebase may contain a UUID
 literal, a field offset, or a timeout from §5.
 
-| Repo | File | Tested by |
+| Side | File | Tested by |
 |---|---|---|
-| `Firmware` | `src/core/protocol.h` / `.cpp` — pure C++17, no hardware headers | `test/test_protocol/`, `pio test -e native` |
-| `App` | `core/…/protocol/WatchProtocol.kt` — pure Kotlin, no `android.*` | `core/src/test/…/WatchProtocolTest.kt`, `gradlew test` |
+| `firmware/` | `src/core/protocol.h` / `.cpp` — pure C++17, no hardware headers | `test/test_protocol/`, `pio test -e native` |
+| `app/` | `core/…/protocol/WatchProtocol.kt` — pure Kotlin, no `android.*` | `core/src/test/…/WatchProtocolTest.kt`, `gradlew test` |
 
 Both sit in the pure/testable half of their project by construction: parsing and
 validating a byte array is a **decision**, and both projects put decisions where
@@ -496,7 +497,7 @@ Listed so that "it's obviously needed" does not quietly become scope.
 - Bonding / encryption (§2.3) — the first thing to add.
 - Watch → phone data: step counts, battery history, health/fault counters.
 - Phone → watch: notifications, calendar, weather.
-- Any second peripheral, any device registry (`App/CLAUDE.md` Law 5).
+- Any second peripheral, any device registry (`app/CLAUDE.md` Law 5).
 - MTU negotiation, long writes, indications instead of notifications.
-- OTA over BLE. `Firmware/docs/backlog.md` item 9 reserves the slots; the
+- OTA over BLE. `firmware/docs/backlog.md` item 9 reserves the slots; the
   transport for it is undecided and is not this service.

@@ -9,7 +9,7 @@ Development runs as a two-agent loop: a **coder** subagent writes changes, a
 See `docs/workflow.md`. The five project laws are non-negotiable — they outrank
 convenience, brevity, and "it works on my phone".
 
-The firmware lives in the sibling repo `../Firmware` and has its own laws. Read
+The firmware lives alongside it in `../firmware` and has its own laws. Read
 them before designing anything on the wire: the two sides share one protocol and
 one power budget.
 
@@ -154,7 +154,7 @@ BLE toolkit and must not become one.
   duty cycle is defined by the firmware, and there is exactly one bonded unit.
 - **The GATT contract is a single source-of-truth file** mirroring the firmware's
   service and characteristic UUIDs, generated from or checked against
-  `../Firmware`. Never retype a UUID from memory into a second place.
+  `../firmware`. Never retype a UUID from memory into a second place.
 - This app is **not** targeted at Play Store distribution, so
   `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` is a legitimate tool here. If that ever
   changes, Law 5 changes first, deliberately.
@@ -171,7 +171,7 @@ the wire.
 - **Mirror it in exactly one file**: `core/…/protocol/WatchProtocol.kt`. No UUID
   literal, field offset or protocol timeout may appear anywhere else in this app
   (`PROTOCOL.md` §8).
-- **Do not edit the contract locally.** A change there is a change to both repos:
+- **Do not edit the contract locally.** A change there is a change to both sides:
   land the doc first, then both sides. If something in it is wrong or
   impossible, stop and say so — a silent local deviation desynchronises the
   watch, and the two sides are tested separately, so it would surface only on
@@ -192,9 +192,9 @@ absent from the air the rest of the time.
 
 ## Commands
 
-Run from the repo root. Android Studio's bundled JDK is required — the JDK on
-`PATH` is too new for AGP. `docs/toolchain.md` explains and gives the one-time
-setup.
+Run from this directory (`app/`). Android Studio's bundled JDK is required —
+the JDK on `PATH` is too new for AGP. `docs/toolchain.md` explains and gives
+the one-time setup.
 
 ```bash
 ./gradlew test              # JVM unit tests — the merge gate

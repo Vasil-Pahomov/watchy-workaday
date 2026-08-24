@@ -4,8 +4,8 @@ Written 18 Aug 2026, when the time-sync feature was finished and **neither side 
 ever run.** The firmware has never been flashed to a watch; the app has never been
 installed on a phone; no BLE packet has ever been exchanged between them.
 
-Both repos are green on their own gates — 308 host tests in `Firmware`, 219 JVM
-tests in `App` — and that is exactly why this document exists. Every test on both
+Both sides are green on their own gates — 308 host tests in `firmware/`, 219 JVM
+tests in `app/` — and that is exactly why this document exists. Every test on both
 sides runs against a fake. The two implementations were tested separately and
 agree only because they were built against the same `PROTOCOL.md`.
 
@@ -22,7 +22,7 @@ Each stage below adds **one** new thing that has never worked before.
 
 ## Stage 0 — the watch alone, no radio
 
-This is `Firmware/docs/backlog.md` item 2 and it is unchanged by the sync work.
+This is `firmware/docs/backlog.md` item 2 and it is unchanged by the sync work.
 Nothing below matters until this holds.
 
 It boots · the panel draws · the RTC ticks once a minute · buttons wake it · deep
@@ -34,7 +34,7 @@ the ESP32 timer backstop is masking it. `ext0` is not working. Everything about
 the sync window's hourly cadence rides on that tick.
 
 Then fill in the ⚠ estimates in `docs/power-budget.md`. Until one real
-measurement exists, every energy number in both repos is an engineering estimate —
+measurement exists, every energy number on both sides is an engineering estimate —
 including the ~0.9 mAh/day this feature was budgeted at.
 
 ---
@@ -87,7 +87,7 @@ Install, open, grant Nearby devices and notifications, and confirm before pairin
 - the diagnostic screen's task list names what is still outstanding.
 
 Then work the battery-optimisation exemption and whatever the per-vendor advice
-says for this phone. `App/docs/background-execution.md` §2 is blunt about this:
+says for this phone. `app/docs/background-execution.md` §2 is blunt about this:
 OEM battery managers are the real adversary, no API detects them, and the app can
 only tell the user what to do and show whether it looks like it worked.
 
@@ -209,6 +209,6 @@ Stage 0 and stage 1 in one sitting, on the bench, with `WORKADAY_DIAG=1` and a
 serial monitor open. Stage 2 in parallel on the phone — it needs no watch. Stages
 3 and 4 only once both halves are independently boring.
 
-Record what you measure in `Firmware/docs/power-budget.md`, and if anything
+Record what you measure in `firmware/docs/power-budget.md`, and if anything
 contradicts `PROTOCOL.md`, **change the document first** and then both sides. It
 is the only thing keeping the two implementations honest with each other.

@@ -101,7 +101,7 @@ its keep.
 - [ ] No new abstraction whose only justification is a second, hypothetical
       peripheral.
 - [ ] No UUID, MTU or protocol constant retyped into a second place — one
-      source-of-truth file, cross-checked against `../Firmware`.
+      source-of-truth file, cross-checked against `../firmware`.
 - [ ] **No invented protocol constants.** If the change needed a UUID or a
       packet layout that is not yet defined, that is a Blocker and it escalates
       to the user. A plausible placeholder is the worst possible outcome here,
