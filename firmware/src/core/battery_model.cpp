@@ -114,6 +114,21 @@ uint16_t tickIntervalSeconds(BatteryLevel level) {
   return kNormalTickSeconds;
 }
 
+uint16_t gaugeFillPixels(uint8_t percent, uint16_t track_pixels) {
+  if (track_pixels == 0 || percent == 0) {
+    return 0;
+  }
+  if (percent >= 100) {
+    return track_pixels;
+  }
+  const uint32_t filled =
+      (static_cast<uint32_t>(percent) * static_cast<uint32_t>(track_pixels) + 50u) / 100u;
+  // Rounding alone would draw a cell with charge left in it exactly like a flat
+  // one: on a 34 px track everything below 1.5 % rounds to zero. An empty gauge
+  // has to mean empty, so anything above zero keeps at least one pixel of ink.
+  return filled == 0 ? 1 : static_cast<uint16_t>(filled);
+}
+
 bool radioPermitted(BatteryLevel level) {
   return level == BatteryLevel::Normal || level == BatteryLevel::Full;
 }

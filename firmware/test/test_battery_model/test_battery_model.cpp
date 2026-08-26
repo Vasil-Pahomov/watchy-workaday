@@ -180,6 +180,57 @@ void test_radio_blocked_when_low(void) {
   TEST_ASSERT_FALSE(core::radioPermitted(BatteryLevel::Critical));
 }
 
+// ── the gauge ────────────────────────────────────────────────────────────────
+
+void test_gauge_endpoints(void) {
+  TEST_ASSERT_EQUAL_UINT16(0, core::gaugeFillPixels(0, 34));
+  TEST_ASSERT_EQUAL_UINT16(34, core::gaugeFillPixels(100, 34));
+}
+
+void test_gauge_clamps_above_full(void) {
+  // percentFromMillivolts() saturates at 100, but the percentage also arrives
+  // from RTC-backed state that survives a firmware flash. A gauge that painted
+  // past its own track would scribble over the electrode beside it.
+  TEST_ASSERT_EQUAL_UINT16(34, core::gaugeFillPixels(101, 34));
+  TEST_ASSERT_EQUAL_UINT16(34, core::gaugeFillPixels(255, 34));
+}
+
+void test_gauge_is_proportional_and_rounded(void) {
+  TEST_ASSERT_EQUAL_UINT16(17, core::gaugeFillPixels(50, 34));
+  TEST_ASSERT_EQUAL_UINT16(9, core::gaugeFillPixels(25, 34));   // 8.5 rounds up
+  TEST_ASSERT_EQUAL_UINT16(26, core::gaugeFillPixels(75, 34));  // 25.5 rounds up
+  TEST_ASSERT_EQUAL_UINT16(3, core::gaugeFillPixels(10, 34));   // 3.4 rounds down
+}
+
+void test_gauge_keeps_a_pixel_while_there_is_charge_left(void) {
+  // The whole point of the floor: 1 % on a 34 px track rounds to zero, and an
+  // empty gauge has to mean an empty cell rather than nearly one.
+  TEST_ASSERT_EQUAL_UINT16(1, core::gaugeFillPixels(1, 34));
+  TEST_ASSERT_EQUAL_UINT16(0, core::gaugeFillPixels(0, 34));
+  // Critical is 5 % and must still read as "some", not "none".
+  TEST_ASSERT_EQUAL_UINT16(2, core::gaugeFillPixels(core::kCriticalEnterPercent, 34));
+}
+
+void test_gauge_never_exceeds_its_track(void) {
+  for (uint16_t track = 0; track <= 200; track += 7) {
+    for (uint16_t percent = 0; percent <= 255; ++percent) {
+      const uint16_t fill = core::gaugeFillPixels(static_cast<uint8_t>(percent), track);
+      TEST_ASSERT_TRUE(fill <= track);
+      TEST_ASSERT_TRUE(percent == 0 || track == 0 || fill >= 1);
+    }
+  }
+}
+
+void test_gauge_is_monotonic(void) {
+  // A gauge that dipped as the charge rose would be worse than no gauge.
+  uint16_t previous = 0;
+  for (uint16_t percent = 0; percent <= 100; ++percent) {
+    const uint16_t fill = core::gaugeFillPixels(static_cast<uint8_t>(percent), 34);
+    TEST_ASSERT_TRUE(fill >= previous);
+    previous = fill;
+  }
+}
+
 int main(void) {
   UNITY_BEGIN();
 
@@ -204,6 +255,13 @@ int main(void) {
 
   RUN_TEST(test_tick_interval_stretches_when_low);
   RUN_TEST(test_radio_blocked_when_low);
+
+  RUN_TEST(test_gauge_endpoints);
+  RUN_TEST(test_gauge_clamps_above_full);
+  RUN_TEST(test_gauge_is_proportional_and_rounded);
+  RUN_TEST(test_gauge_keeps_a_pixel_while_there_is_charge_left);
+  RUN_TEST(test_gauge_never_exceeds_its_track);
+  RUN_TEST(test_gauge_is_monotonic);
 
   return UNITY_END();
 }

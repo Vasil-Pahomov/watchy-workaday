@@ -587,7 +587,6 @@ void setup() {
     snapshot.time_valid = time_valid;
     snapshot.use_24h = g_persist.use_24h;
     snapshot.battery_percent = g_persist.battery_percent;
-    snapshot.battery_level = g_persist.battery_level.level();
     snapshot.mode = mode;
     snapshot.screen = g_persist.ui.screen;
     snapshot.menu_index = g_persist.ui.menu_index;

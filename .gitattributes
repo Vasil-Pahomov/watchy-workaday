@@ -8,3 +8,8 @@
 *.jar binary
 *.bin binary
 *.elf binary
+
+# Vendored TTFs and the checked-in preview renders are binary; do not let
+# text=auto mangle them.
+*.ttf binary
+*.png binary

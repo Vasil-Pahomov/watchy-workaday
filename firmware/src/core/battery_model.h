@@ -65,6 +65,16 @@ class BatteryLevelTracker {
 
 uint16_t tickIntervalSeconds(BatteryLevel level);
 
+// Width in pixels of the filled part of a battery gauge whose track is
+// `track_pixels` wide, at `percent` charge.
+//
+// Here rather than beside the drawing code because it is the only decision in
+// painting the gauge — where the ink stops — and because it is what the
+// watchface hashes. A 34 px track has 35 distinct pictures and the percentage
+// has 101, so hashing the percentage would repaint the panel for a change no
+// wearer can see, which Law 1 pays for in refreshes.
+uint16_t gaugeFillPixels(uint8_t percent, uint16_t track_pixels);
+
 // True when the radio must stay off regardless of what the user asked for.
 bool radioPermitted(BatteryLevel level);
 

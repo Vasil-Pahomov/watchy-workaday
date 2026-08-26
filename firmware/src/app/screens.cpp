@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "board/display.h"
+#include "core/battery_model.h"
 #include "core/refresh_policy.h"
 
 namespace app {
@@ -13,22 +14,30 @@ namespace {
 struct Composed {
   char time[8];
   char date[16];
-  char status[24];
+  // The mode tag alone now. The percentage that used to sit in front of it is a
+  // gauge in the opposite corner, drawn from `battery_percent` below.
+  char status[8];
   // Sized for the widest value the type allows, not the widest a wrist produces:
   // core::updateSteps saturates `today` at UINT32_MAX, which is 10 digits, plus
   // " steps" and the terminator = 17. snprintf would have truncated safely, but a
   // buffer that disagrees with the tested range is a trap for the next change.
   char steps[17];
+  // The same count with the word taken off, for the watchface corner. Two
+  // buffers rather than one because the two places disagree about what the
+  // number needs beside it: the corner has room for digits, and the Steps screen
+  // has room to say what they are.
+  char steps_face[11];    // 10 digits + NUL
   char steps_detail[24];  // "yesterday " + 10 digits + NUL = 21
   // The Sync screen's second line. drawBanner() starts at x=10 with text wrap
-  // off, so about 17 characters of FreeMonoBold9pt reach the right edge — every
-  // label below is inside that.
+  // off, and WorkadaySmall is sized so that every label below still clears the
+  // right edge — see tools/make_time_font.py, where those strings are the input.
   char sync[24];
   core::Screen screen;
   uint8_t menu_index;
+  uint8_t battery_percent;
 };
 
-Composed g_composed = {"--:--", "", "", "", "", "", core::Screen::Watchface, 0};
+Composed g_composed = {"--:--", "", "", "", "", "", "", core::Screen::Watchface, 0, 0};
 
 constexpr uint8_t kStepsMenuIndex = 0;  // must track kMenuItems below
 
@@ -70,12 +79,15 @@ const char* syncLabel(core::SyncResult result, bool applied) {
   return applied ? "sync unfinished" : "never synced";
 }
 
+// Standalone now that it is not glued to the end of a percentage, so no leading
+// space. Normal returns the empty string and draws nothing at all — the ordinary
+// state of the watch should not spend pixels saying it is ordinary.
 const char* modeTag(core::RunMode mode) {
   switch (mode) {
     case core::RunMode::Safe:
-      return " SAFE";
+      return "SAFE";
     case core::RunMode::Recovery:
-      return " RECOV";
+      return "RECOV";
     case core::RunMode::Normal:
       break;
   }
@@ -97,13 +109,14 @@ uint32_t compose(const Snapshot& snapshot) {
     snprintf(g_composed.date, sizeof(g_composed.date), "set time");
   }
 
-  const char* low = snapshot.battery_level == core::BatteryLevel::Critical ? "!" : "";
-  snprintf(g_composed.status, sizeof(g_composed.status), "%u%%%s%s", snapshot.battery_percent,
-           low, modeTag(snapshot.mode));
+  snprintf(g_composed.status, sizeof(g_composed.status), "%s", modeTag(snapshot.mode));
+  g_composed.battery_percent = snapshot.battery_percent;
 
   switch (snapshot.steps_display) {
     case core::StepsDisplay::Live:
       snprintf(g_composed.steps, sizeof(g_composed.steps), "%lu steps",
+               static_cast<unsigned long>(snapshot.steps_today));
+      snprintf(g_composed.steps_face, sizeof(g_composed.steps_face), "%lu",
                static_cast<unsigned long>(snapshot.steps_today));
       snprintf(g_composed.steps_detail, sizeof(g_composed.steps_detail), "yesterday %lu",
                static_cast<unsigned long>(snapshot.steps_yesterday));
@@ -116,11 +129,16 @@ uint32_t compose(const Snapshot& snapshot) {
       // The count is still in RTC state for diagnostics; what the wearer must not
       // be given is a dead number presented as a live one.
       snprintf(g_composed.steps, sizeof(g_composed.steps), "no step data");
+      // The corner holds a number and nothing else, so it says there what the
+      // clock says when the RTC is unset: dashes. A wrong number and a missing
+      // one have to look different at arm's length.
+      snprintf(g_composed.steps_face, sizeof(g_composed.steps_face), "--");
       snprintf(g_composed.steps_detail, sizeof(g_composed.steps_detail), "sensor stopped");
       break;
 
     case core::StepsDisplay::Hidden:
       g_composed.steps[0] = '\0';
+      g_composed.steps_face[0] = '\0';
       g_composed.steps_detail[0] = '\0';
       break;
   }
@@ -134,13 +152,24 @@ uint32_t compose(const Snapshot& snapshot) {
   uint32_t hash = core::contentHash(g_composed.time);
   hash = core::hashCombine(hash, g_composed.date);
   hash = core::hashCombine(hash, g_composed.status);
-  hash = core::hashCombine(hash, g_composed.steps);
+  // The gauge, not the percentage behind it: 34 pixels of track carry 35
+  // pictures where the percentage carries 101, and a refresh spent on a change
+  // that does not move a pixel is a refresh spent on nothing.
+  const uint16_t battery_fill =
+      core::gaugeFillPixels(g_composed.battery_percent, board::display::kBatteryTrackPixels);
+  hash = core::hashCombine(hash, &battery_fill, sizeof(battery_fill));
+  hash = core::hashCombine(hash, g_composed.steps_face);
   hash = core::hashCombine(hash, &g_composed.screen, sizeof(g_composed.screen));
   if (g_composed.screen == core::Screen::Menu) {
     hash = core::hashCombine(hash, &g_composed.menu_index, sizeof(g_composed.menu_index));
   }
   if (g_composed.screen == core::Screen::App) {
     hash = core::hashCombine(hash, &g_composed.menu_index, sizeof(g_composed.menu_index));
+    // The spelled-out count and its second line, which only this screen shows.
+    // The watchface hashes steps_face above instead: the two always move
+    // together, but each screen hashing the string it actually draws is what
+    // keeps that from being something the next change has to remember.
+    hash = core::hashCombine(hash, g_composed.steps);
     hash = core::hashCombine(hash, g_composed.steps_detail);
     // Only here. A sync result changing must repaint the Sync screen if it is up,
     // and must never repaint the watchface — that would be a ~0.003 mAh refresh
@@ -158,6 +187,7 @@ void draw() {
 
     case core::Screen::App: {
       board::display::drawStatusLine(g_composed.status);
+      board::display::drawBatteryGauge(g_composed.battery_percent);
       const uint8_t index =
           g_composed.menu_index < core::kMenuItemCount ? g_composed.menu_index : 0;
       if (index == kStepsMenuIndex && g_composed.steps[0] != '\0') {
@@ -187,9 +217,10 @@ void draw() {
   }
 
   board::display::drawStatusLine(g_composed.status);
+  board::display::drawBatteryGauge(g_composed.battery_percent);
   board::display::drawTimeLarge(g_composed.time);
   board::display::drawDateLine(g_composed.date);
-  board::display::drawStepsLine(g_composed.steps);
+  board::display::drawStepsLine(g_composed.steps_face);
 }
 
 }  // namespace app

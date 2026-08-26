@@ -36,12 +36,24 @@ using DrawFn = void (*)();
 // that, and a Skip means this function is never entered at all, which is the point.
 void render(core::RefreshKind kind, DrawFn draw);
 
+// Pixels the battery gauge's fill can occupy — the body less both borders.
+// Published because app/screens.cpp hashes core::gaugeFillPixels() against this
+// number rather than the percentage behind it: what the refresh policy has to
+// compare is the picture, and 34 pixels carry fewer states than 101 percentages.
+// display.cpp static_asserts that its own geometry still agrees with this.
+constexpr uint16_t kBatteryTrackPixels = 34;
+
 // Framebuffer drawing helpers, so app code does not reach into GxEPD2 directly.
 void clear();
 void drawTimeLarge(const char* text);
 void drawDateLine(const char* text);
+// The step count, bottom-left. The digits only — the word "steps" is on the
+// Steps screen, where there is room to say it.
 void drawStepsLine(const char* text);
 void drawStatusLine(const char* text);
+// The charge, top-right: a horizontal cell with its electrode on the right,
+// filled from the left in proportion to `percent`.
+void drawBatteryGauge(uint8_t percent);
 void drawMenu(const char* const* items, uint8_t count, uint8_t selected);
 void drawBanner(const char* line1, const char* line2);
 

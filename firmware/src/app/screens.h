@@ -8,7 +8,6 @@
 
 #include <stdint.h>
 
-#include "core/battery_model.h"
 #include "core/health.h"
 #include "core/protocol.h"
 #include "core/step_counter.h"
@@ -21,8 +20,10 @@ struct Snapshot {
   core::DateTime time;
   bool time_valid = false;
   bool use_24h = true;
+  // The gauge in the top-right corner is the whole battery display, so this is
+  // the whole battery input: the level the tracker is in decides the tick rate
+  // and whether the radio may come up, but nothing about the picture.
   uint8_t battery_percent = 0;
-  core::BatteryLevel battery_level = core::BatteryLevel::Normal;
   core::RunMode mode = core::RunMode::Normal;
   core::Screen screen = core::Screen::Watchface;
   uint8_t menu_index = 0;
