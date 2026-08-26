@@ -105,11 +105,14 @@ uint32_t elapsedMinutes(const DateTime& last, const DateTime& now, bool now_vali
 // 24h -> 12h clock face value (1..12), reporting AM/PM through is_pm.
 uint8_t to12Hour(uint8_t hour24, bool& is_pm);
 
-// "HH:MM", zero-padded. Needs cap >= 6. Returns false and writes nothing if the
+// "H:MM" or "HH:MM": the minutes are zero-padded, the hour is not, so nine in the
+// morning reads "9:03" and midnight reads "0:03". Needs cap >= 6, which is still
+// the longest case plus its terminator. Returns false and writes nothing if the
 // buffer is too small.
 bool formatTime(char* out, size_t cap, const DateTime& dt, bool use_24h);
 
-// "Wed 12 Aug". Needs cap >= 11.
+// "Wed 12 Aug", or "Thu 1 Jan" - the day is not padded, matching the hour in
+// formatTime(). Needs cap >= 11, which is the two-digit case plus its terminator.
 bool formatDate(char* out, size_t cap, const DateTime& dt);
 
 // Three-letter names; "???" for out-of-range input rather than reading past the

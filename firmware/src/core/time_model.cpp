@@ -159,12 +159,20 @@ bool formatTime(char* out, size_t cap, const DateTime& dt, bool use_24h) {
     bool is_pm = false;
     hour = to12Hour(dt.hour, is_pm);
   }
-  out[0] = digit(static_cast<unsigned>(hour) / 10u);
-  out[1] = digit(hour);
-  out[2] = ':';
-  out[3] = digit(static_cast<unsigned>(dt.minute) / 10u);
-  out[4] = digit(dt.minute);
-  out[5] = '\0';
+  // The hour loses its pad and the minutes keep theirs, which is not an
+  // inconsistency: an hour is a count and reads fine as "9", a minute is a
+  // position inside that hour and "9:3" is not a time. Midnight therefore reads
+  // "0:03" in 24h mode - the deliberate consequence, not an oversight, and the
+  // only hour where the missing pad is worth a second look.
+  size_t i = 0;
+  if (hour >= 10) {
+    out[i++] = digit(static_cast<unsigned>(hour) / 10u);
+  }
+  out[i++] = digit(hour);
+  out[i++] = ':';
+  out[i++] = digit(static_cast<unsigned>(dt.minute) / 10u);
+  out[i++] = digit(dt.minute);
+  out[i] = '\0';
   return true;
 }
 
@@ -174,17 +182,24 @@ bool formatDate(char* out, size_t cap, const DateTime& dt) {
   }
   const char* weekday = weekdayName(dayOfWeek(dt));
   const char* month = monthName(dt.month);
-  out[0] = weekday[0];
-  out[1] = weekday[1];
-  out[2] = weekday[2];
-  out[3] = ' ';
-  out[4] = digit(static_cast<unsigned>(dt.day) / 10u);
-  out[5] = digit(dt.day);
-  out[6] = ' ';
-  out[7] = month[0];
-  out[8] = month[1];
-  out[9] = month[2];
-  out[10] = '\0';
+  size_t i = 0;
+  out[i++] = weekday[0];
+  out[i++] = weekday[1];
+  out[i++] = weekday[2];
+  out[i++] = ' ';
+  // Unpadded, like the hour: nobody says "the oh-first of January", and the two
+  // numbers on the face should not disagree about whether a leading zero is a
+  // thing. The cap check above stays at the two-digit length, so the buffer
+  // requirement does not depend on the date being formatted.
+  if (dt.day >= 10) {
+    out[i++] = digit(static_cast<unsigned>(dt.day) / 10u);
+  }
+  out[i++] = digit(dt.day);
+  out[i++] = ' ';
+  out[i++] = month[0];
+  out[i++] = month[1];
+  out[i++] = month[2];
+  out[i] = '\0';
   return true;
 }
 

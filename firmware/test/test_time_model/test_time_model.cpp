@@ -312,22 +312,39 @@ void test_to_12_hour(void) {
 void test_format_time_24h(void) {
   char buffer[8] = {};
   TEST_ASSERT_TRUE(core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 9, 5, 0}, true));
-  TEST_ASSERT_EQUAL_STRING("09:05", buffer);
+  TEST_ASSERT_EQUAL_STRING("9:05", buffer);
 
   TEST_ASSERT_TRUE(
       core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 23, 59, 0}, true));
   TEST_ASSERT_EQUAL_STRING("23:59", buffer);
 
+  // Midnight is the hour the missing pad is most visible in, and it is still the
+  // rule rather than an exception to it.
   TEST_ASSERT_TRUE(core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 0, 0, 0}, true));
-  TEST_ASSERT_EQUAL_STRING("00:00", buffer);
+  TEST_ASSERT_EQUAL_STRING("0:00", buffer);
+}
+
+void test_format_time_drops_only_the_hour_pad(void) {
+  // The boundary in both directions: 9 loses its leading zero, 10 keeps both
+  // digits, and no minute ever loses its own pad.
+  char buffer[8] = {};
+  TEST_ASSERT_TRUE(core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 9, 59, 0}, true));
+  TEST_ASSERT_EQUAL_STRING("9:59", buffer);
+
+  TEST_ASSERT_TRUE(core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 10, 0, 0}, true));
+  TEST_ASSERT_EQUAL_STRING("10:00", buffer);
+
+  TEST_ASSERT_TRUE(core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 1, 3, 0}, true));
+  TEST_ASSERT_EQUAL_STRING("1:03", buffer);
 }
 
 void test_format_time_12h(void) {
   char buffer[8] = {};
   TEST_ASSERT_TRUE(
       core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 13, 45, 0}, false));
-  TEST_ASSERT_EQUAL_STRING("01:45", buffer);
+  TEST_ASSERT_EQUAL_STRING("1:45", buffer);
 
+  // 12h has no single-digit midnight to worry about: to12Hour() maps 0 to 12.
   TEST_ASSERT_TRUE(core::formatTime(buffer, sizeof(buffer), DateTime{2026, 8, 12, 0, 7, 0}, false));
   TEST_ASSERT_EQUAL_STRING("12:07", buffer);
 }
@@ -337,9 +354,11 @@ void test_format_time_rejects_small_buffer(void) {
   TEST_ASSERT_FALSE(core::formatTime(buffer, 5, DateTime{2026, 8, 12, 9, 5, 0}, true));
   TEST_ASSERT_EQUAL_CHAR('x', buffer[0]);  // and wrote nothing
 
+  // cap 6 is still the requirement: the check is against the longest case, not
+  // against the one this call happens to write.
   char exact[6] = {};
-  TEST_ASSERT_TRUE(core::formatTime(exact, 6, DateTime{2026, 8, 12, 9, 5, 0}, true));
-  TEST_ASSERT_EQUAL_STRING("09:05", exact);
+  TEST_ASSERT_TRUE(core::formatTime(exact, 6, DateTime{2026, 8, 12, 23, 59, 0}, true));
+  TEST_ASSERT_EQUAL_STRING("23:59", exact);
 
   TEST_ASSERT_FALSE(core::formatTime(nullptr, 32, DateTime{2026, 8, 12, 9, 5, 0}, true));
 }
@@ -350,11 +369,28 @@ void test_format_date(void) {
   TEST_ASSERT_EQUAL_STRING("Wed 12 Aug", buffer);
 
   TEST_ASSERT_TRUE(core::formatDate(buffer, sizeof(buffer), DateTime{2026, 1, 1, 0, 0, 0}));
-  TEST_ASSERT_EQUAL_STRING("Thu 01 Jan", buffer);
+  TEST_ASSERT_EQUAL_STRING("Thu 1 Jan", buffer);
+}
+
+void test_format_date_drops_only_the_day_pad(void) {
+  // The boundary in both directions, and the tail of the string moving with it:
+  // a shortened day must not leave the old month behind it.
+  char buffer[16] = {};
+  TEST_ASSERT_TRUE(core::formatDate(buffer, sizeof(buffer), DateTime{2026, 9, 9, 0, 0, 0}));
+  TEST_ASSERT_EQUAL_STRING("Wed 9 Sep", buffer);
+
+  TEST_ASSERT_TRUE(core::formatDate(buffer, sizeof(buffer), DateTime{2026, 9, 10, 0, 0, 0}));
+  TEST_ASSERT_EQUAL_STRING("Thu 10 Sep", buffer);
+
+  TEST_ASSERT_TRUE(core::formatDate(buffer, sizeof(buffer), DateTime{2026, 12, 31, 0, 0, 0}));
+  TEST_ASSERT_EQUAL_STRING("Thu 31 Dec", buffer);
 }
 
 void test_format_date_rejects_small_buffer(void) {
+  // Ten bytes would in fact hold "Thu 1 Jan", and are still refused: the
+  // contract is a buffer big enough for any date, not for this one.
   char buffer[10] = {};
+  TEST_ASSERT_FALSE(core::formatDate(buffer, 10, DateTime{2026, 1, 1, 0, 0, 0}));
   TEST_ASSERT_FALSE(core::formatDate(buffer, 10, DateTime{2026, 8, 12, 0, 0, 0}));
   TEST_ASSERT_FALSE(core::formatDate(nullptr, 32, DateTime{2026, 8, 12, 0, 0, 0}));
 }
@@ -521,9 +557,11 @@ int main(void) {
   RUN_TEST(test_to_12_hour);
 
   RUN_TEST(test_format_time_24h);
+  RUN_TEST(test_format_time_drops_only_the_hour_pad);
   RUN_TEST(test_format_time_12h);
   RUN_TEST(test_format_time_rejects_small_buffer);
   RUN_TEST(test_format_date);
+  RUN_TEST(test_format_date_drops_only_the_day_pad);
   RUN_TEST(test_format_date_rejects_small_buffer);
   RUN_TEST(test_names_are_bounds_checked);
 
