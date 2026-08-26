@@ -156,7 +156,23 @@ pio run -e watchy_v20         # build firmware
 pio run -e watchy_v20 -t upload
 pio run -e watchy_v20 -t size # check flash/RAM budget
 pio device monitor            # exception decoder is enabled
+
+python tools/make_time_font.py         # regenerate the Gilroy faces after a size change
+python tools/preview_face.py --all      # rebuild the PNGs README.md shows
+python tools/preview_face.py --battery 8 --time 9:05   # one ad-hoc render
 ```
+
+`preview_face.py` reads the generated font header and the layout constants in
+`board/display.cpp`, so it shows the framebuffer the panel would get. Look at a
+layout change there before spending a flash cycle on it.
+
+**A layout change is not finished until `--all` has been re-run in the same
+commit.** `docs/preview/*.png` is checked in and README.md shows it; stale renders
+advertise a watch that no longer exists. Ad-hoc renders go to `preview/`, which is
+git-ignored.
+
+`flash.bat` is the Windows wrapper around the upload line — same `pio`, plus port
+selection and an optional host-gate-first run: `flash.bat test COM7 monitor`.
 
 ## Layout
 
@@ -165,5 +181,7 @@ src/core/     pure logic, host-tested, no hardware headers
 src/board/    Watchy 2.0 hardware access — thin, no policy
 src/app/      screens and rendering
 test/         one directory per core module, Unity
+tools/        font generation and the desktop preview; fonts/ holds the TTF
 docs/         hardware notes, power budget, review checklist, workflow
+docs/preview/ checked-in renders of every screen, rebuilt with --all
 ```

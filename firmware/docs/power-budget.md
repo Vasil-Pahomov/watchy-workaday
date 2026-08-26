@@ -1,6 +1,10 @@
 # Power budget
 
-Battery: **200 mAh** LiPo. Target: **≥ 21 days** on a charge in normal mode.
+Battery: **200 mAh** LiPo — the marked rating, which is not a verified one. Cells
+shipped with AliExpress Watchy 2.0 boards are widely reported to fall short of
+what is printed on them, and this watch's has never been checked. Everything below
+is therefore *at 200 mAh*, not *on this watch*. Target: **≥ 21 days** on a charge
+in normal mode.
 
 That gives a daily allowance of **≤ 9.5 mAh/day**. Every feature is measured
 against that allowance. This document is the shared ledger — a change that adds a
@@ -162,6 +166,26 @@ ten days. That is what the window exists to avoid.
 The user-initiated window (the Sync menu item) costs exactly the same ~0.031 mAh
 and **spends the same hour**, so pressing Sync repeatedly cannot outrun the
 schedule — the second press inside an hour is refused.
+
+## First field run — what it settles, and what it cannot
+
+One watch ran about a week on a charge and came back with roughly a third of the
+gauge showing. That settles one thing, and settles it firmly: **deep sleep is
+being entered.** A watch that stayed awake would be flat inside a working day, so
+a week clears that bar by a margin no measurement error comes near.
+
+It does **not** yield a consumption figure, and the attempt is a trap worth naming
+so nobody walks into it twice. Runtime becomes mAh/day only by dividing into a
+known capacity, and this capacity is not known — see the rating caveat at the top
+of this file. At 200 mAh that week reads as ~19 mAh/day; at half that rating it
+reads as ~9.5, which is exactly the allowance. One observation, two conclusions
+that differ by 3×, and nothing in the observation to choose between them. It
+cannot tell a firmware that overspends from a cell that under-delivers.
+
+That is an argument *for* item 3 rather than a substitute for it: **a meter on the
+rail does not care what the cell holds.** Current is measurable without knowing
+capacity; runtime is not. Detailed consumption analysis waits for that
+measurement, and for a cell whose real capacity has been established.
 
 ## Design consequences
 

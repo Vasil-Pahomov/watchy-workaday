@@ -6,7 +6,11 @@ scoped to be a single `/feature` run.
 Every entry names where its logic belongs, because getting that wrong is the most
 common defect in this project: **decisions in `core/`, effects in `board/`.**
 
-## Blocking — the watch is not usable without these
+## First priority — what the first field run left standing
+
+The watch is usable: it boots, keeps time from the phone, counts steps, answers
+its buttons and sleeps between wakes. These three are what stand between that and
+a watch that meets its own targets.
 
 ### 1. Set the time from the watch, without a phone
 The BLE sync window sets the PCF8563 now (`PROTOCOL.md`), so a fresh board is no
@@ -21,24 +25,41 @@ the menu.
 - Tests: every field's wrap, invalid intermediate states, cancel restores.
 - Fold in the 12/24-hour toggle (`use_24h`), which is persisted with no UI.
 
-### 2. Hardware bring-up pass
-The firmware has never run on a physical watch. Verify, in this order: it boots;
-the panel draws; the RTC ticks once a minute; buttons wake it; deep sleep is
-actually entered. Then fill in the ⚠ estimates in `docs/power-budget.md`.
+### 2. Hardware bring-up pass — mostly done
+The firmware runs on a physical watch. Confirmed in the field: it boots, the
+watchface draws, the clock advances, the buttons wake it, and the BLE window sets
+the PCF8563 from the phone. **Deep sleep is entered** — not watched directly, but
+a watch that skipped it would be flat inside a working day and this one ran about
+a week on one charge.
 
-Expect the timer backstop to mask a broken RTC tick — if the watch updates every
-90 s instead of 60 s, the PCF8563 countdown timer is not firing and `ext0` is not
-working. That is the first thing to check.
+What the week is **not** is a consumption figure: the cell's real capacity is
+unknown, and without it runtime does not divide into mAh/day at all. See "First
+field run" in `docs/power-budget.md`.
 
-The radio adds its own bring-up list, and it is the part most likely to surprise,
-because none of it has met a real controller:
+Two more things the run did not answer, both still worth doing:
+
+- **Is the minute tick coming from the PCF8563 alarm or from the timer backstop?**
+  On the face they are identical; they differ only in cadence — 60 s means `ext0`
+  works, ~90 s means the countdown timer never fires and the backstop is carrying
+  the watch on its own. "The time is right" does not distinguish them, because the
+  backstop keeps the time right. Sit with a reference clock and time one update.
+  This is still the first thing to check.
+- The ⚠ estimates in `docs/power-budget.md` are still estimates. Running is not
+  measuring.
+
+The radio's own list: sync working end to end answers the first-order question —
+the watch advertises, the phone finds it, connects, writes, and the RTC takes the
+epoch. These are the ones it does not answer, because each fails quietly rather
+than visibly:
 
 - Does the watch appear as `Workaday`, with the service UUID in the
   **advertisement** and not the scan response? A scanner app that filters by
   service UUID is the quickest check; if filtering fails but a plain scan finds
-  it, the payload split is wrong and `autoConnect`/CDM will not work.
+  it, the payload split is wrong and `autoConnect`/CDM will not work. A sync that
+  works today does not settle this: the app can find the watch by other means.
 - **Is the advertised MAC the same after a reboot?** `PROTOCOL.md` §2.2 —
-  a changing address breaks reconnection silently and looks like an app bug.
+  a changing address breaks reconnection silently and looks like an app bug. Reboot
+  the watch, then sync again without re-pairing.
 - Does the window really end at ~6 s with no phone, and does the watch reach deep
   sleep afterwards? The failure to look for is a window that never tears down: the
   10 s task watchdog would catch it, so the symptom is a reboot loop that degrades
@@ -54,6 +75,17 @@ Every number in the power budget is an estimate. Until one real measurement
 exists, "energy efficiency" is an aspiration. Needs a µA-capable meter; see the
 measurement notes in `docs/power-budget.md`.
 
+A week on a wrist does not shortcut this, and the reason is worth keeping: it
+divides into mAh/day only against a known capacity, and the cell's is not known.
+A meter on the rail sidesteps that entirely — current does not depend on what the
+cell holds. Two things to establish, in either order:
+
+- the sleep current and the cost of one wake (item 8 puts a GPIO around the wake,
+  which is the cheap half and reaches the lever the budget says matters most:
+  duration, not count);
+- what the cell in this watch actually holds, since every runtime figure in the
+  budget is quoted against a rating nobody has checked.
+
 ## Features
 
 ### 4. ~~Daily step counter (BMA423)~~ — done
@@ -62,17 +94,24 @@ Shipped: `core::step_counter` (36 tests) and `core::accel_policy` (16 tests) plu
 existing minute tick, so the feature costs the BMA423's ~14 µA and **no additional
 wakes**. The interrupt stays disarmed.
 
-Untested on hardware. The first things to check when a watch exists:
-- Does `probe()` report `Unconfigured` once and `Ready` thereafter? If it reports
-  `Unconfigured` on every wake, the config upload is failing — the watch will now
-  give up after `core::kMaxAccelConfigAttempts` (3) rather than pay ~0.85 s of I2C
-  every minute, so the symptom is "steps stop at zero", not a flat battery.
-  `WORKADAY_DIAG=1` prints the attempt count and the give-up.
+Counting on hardware, and plausible: across the first week the daily total
+tracked a commercial watch worn in the same conditions closely enough that a gross
+error would have shown. That is worth what it is worth — it rules out the failure
+modes that read a constant zero or count wildly, so `probe()` is reaching `Ready`,
+the config blob is landing, and `acc_en` is set. It does not rule out a systematic
+scale error, which is exactly the kind that agrees with another watch to within a
+glance.
+
+Still worth doing:
+- **A hand count over 100 paces.** The only check that catches a scale error, and
+  the cheapest thing on this list.
 - Are the low-power settings (`CIC_AVG_MODE`, 50 Hz, `NORMAL_AVG4`) actually
-  yielding ~14 µA, and does the step count track a manual count over 100 paces?
-- Does `probe()` ever return `Idle` (configured but `acc_en` clear)? That means a
-  configuration that stopped half way, and is the case that would otherwise read a
-  constant zero for ever.
+  yielding ~14 µA? That is item 3's meter. It is ~0.34 mAh/day either way, so it
+  is worth checking alongside the sleep floor rather than on its own.
+- Does `probe()` ever return `Idle` (configured but `acc_en` clear)? Not seen so
+  far, but "not seen in one week on one watch" is not the same as "cannot happen";
+  it is the case that would otherwise read a constant zero for ever.
+  `WORKADAY_DIAG=1` prints the attempt count and the give-up.
 
 Still open, split out below: a UI toggle (item 11), step goals/history (item 12)
 and a bounded daily retry after the sensor is given up on (item 13).
@@ -124,10 +163,21 @@ Still open, and deliberately not built (`PROTOCOL.md` §9): bonding and encrypti
 (the first thing to add), step/battery history in the other direction, and
 notifications from the phone.
 
-### 7. Watchface layout worth looking at
-`app/screens.cpp` is deliberately plain. Any richer layout must keep
-`compose()`/`draw()` split so the content hash still governs whether the panel is
-touched at all.
+### 7. ~~Watchface layout worth looking at~~ — done, and the rule held
+The face is now Gilroy Regular throughout (three sizes, `tools/make_time_font.py`),
+the charge is a gauge in the top-right corner instead of a percentage, and the step
+count sits in the bottom-left corner as digits alone. `tools/preview_face.py`
+renders any of it to a PNG from the generated font header and the layout constants
+in `board/display.cpp`, so the next layout change can be looked at without flashing
+it.
+
+The `compose()`/`draw()` split survived, and the hash got *cheaper* rather than
+richer: it keys on `core::gaugeFillPixels()` — 35 distinct pictures on a 34 px
+track — rather than on the 101 percentages behind them, so a percentage that moves
+without moving a pixel no longer costs a refresh.
+
+Still open: a second face to switch between, and anything that needs a glyph
+outside `0x20..0x7A` (the generated faces carry no more than that).
 
 ## Infrastructure
 
@@ -253,8 +303,10 @@ field faults diagnosable.
   fix. **One attempt per 24 h is trivially bounded: 0.85 s/day ≈ 0.007 mAh/day,
   under 0.1 % of the allowance.** It is deferred only because it needs a clock
   input in `core::accel_policy`, which today is a pure state machine with no
-  concept of time, and because nothing has ever run on real hardware to say how
-  often this failure actually occurs. Item 13 below.
+  concept of time, and because there is still nothing to say how often this
+  failure actually occurs: one watch has now run about a week without the sensor
+  being given up on, which is one data point against a failure this is meant to
+  recover from, not evidence that it does not happen. Item 13 below.
 - **BCD conversion in `board/rtc.cpp` is untested** (see above), and
   `board::accel` mirrors six register constants from the vendor headers. Both are
   places where a library version bump could drift without the build noticing.
