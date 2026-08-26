@@ -30,3 +30,8 @@ __pycache__/
 # OS litter.
 .DS_Store
 Thumbs.db
+
+# Ad-hoc preview renders. Anchored with a leading slash on purpose: a bare
+# `preview/` also matches docs/preview/ at any depth, and those two PNGs are
+# checked in - README.md shows them.
+/preview/
