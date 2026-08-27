@@ -23,12 +23,14 @@ import com.workaday.core.Backoff
 import com.workaday.core.ConnectionStateMachine
 import com.workaday.core.ExchangeReport
 import com.workaday.core.JitterSource
+import com.workaday.core.RestingSummary
 import com.workaday.core.ServiceNotice
 import com.workaday.core.StartupPlan
 import com.workaday.core.StartupSkipReason
 import com.workaday.core.StartupTrigger
 import com.workaday.core.TransportEvent
 import com.workaday.core.planStartup
+import com.workaday.core.restingSummaryFor
 import com.workaday.core.serviceNoticeFor
 
 /**
@@ -81,6 +83,19 @@ class WatchLinkService : Service() {
      */
     @Volatile
     private var notice: ServiceNotice = ServiceNotice.Starting
+
+    /**
+     * The two facts the resting caption carries, alongside [notice] and for the
+     * same reasons: written on the serial thread, read on the main thread by
+     * [onStartCommand], and a caption rather than a decision.
+     *
+     * It starts empty because filling it is a [WatchStore] read and the main thread
+     * does not do disk I/O. The cost is that the very first notification of a
+     * process says "nothing synced yet" until [dispatch] runs a few milliseconds
+     * later on the serial thread and replaces it.
+     */
+    @Volatile
+    private var summary: RestingSummary = RestingSummary.NothingYet
 
     /**
      * The adapter's state changes and the backoff alarm.
@@ -355,7 +370,7 @@ class WatchLinkService : Service() {
     private fun enterForeground(): Boolean = try {
         startForeground(
             ServiceNotification.ID,
-            ServiceNotification.build(this, notice),
+            ServiceNotification.build(this, notice, summary),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
         )
         true
@@ -374,13 +389,32 @@ class WatchLinkService : Service() {
         false
     }
 
+    /**
+     * Both halves of the caption, re-posted only when one of them has changed.
+     *
+     * The store read is the last exchange the app wrote down, which
+     * [com.workaday.core.Action.ReportExchange] has already committed by the time
+     * this runs — `dispatch` performs the actions first. It is a
+     * `SharedPreferences` lookup out of an in-memory map, on the serial thread,
+     * and reading it rather than remembering it is what lets the first
+     * notification of a fresh process carry the previous process's numbers.
+     *
+     * Neither value depends on the current time, so this comparison is stable at
+     * rest: a summary that has not changed does not re-post, and the "how long
+     * ago" that does change every minute is SystemUI's chronometer, not ours.
+     */
     private fun updateNotification(runtime: LinkRuntime) {
-        val next = serviceNoticeFor(runtime.machine.state)
-        if (next == notice) return
-        notice = next
+        val nextNotice = serviceNoticeFor(runtime.machine.state)
+        val nextSummary = restingSummaryFor(runtime.machine.health, runtime.store.readLastExchange())
+        if (nextNotice == notice && nextSummary == summary) return
+        notice = nextNotice
+        summary = nextSummary
         // Silently dropped if POST_NOTIFICATIONS was denied. The service keeps
         // running either way (docs/background-execution.md §2).
-        notificationManager.notify(ServiceNotification.ID, ServiceNotification.build(this, next))
+        notificationManager.notify(
+            ServiceNotification.ID,
+            ServiceNotification.build(this, nextNotice, nextSummary),
+        )
     }
 
     // ── Observing the platform ───────────────────────────────────────────────

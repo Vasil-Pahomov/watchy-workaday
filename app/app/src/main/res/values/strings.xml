@@ -10,11 +10,24 @@
     <!-- One per ServiceNotice. The decision about which one is shown lives in
          core/ServiceNotice.kt; this file only holds the words. -->
     <string name="notice_starting">Starting…</string>
-    <string name="notice_waiting">Ready for your watch</string>
     <string name="notice_exchanging">Syncing…</string>
     <string name="notice_retrying">Retrying shortly</string>
     <string name="notice_bluetooth_off">Bluetooth is off</string>
     <string name="notice_permission_missing">Nearby devices permission needed</string>
+
+    <!-- ServiceNotice.Waiting, which is the state the app is in almost all of the
+         time. One per RestingSummary case, decided in core/RestingSummary.kt.
+
+         None of these says how long ago the sync was. That number is the header's
+         chronometer, counted by SystemUI from the instant the summary carries, and
+         labelled by notice_last_sync_label — because this notification is re-posted
+         only when something changes, and words saying "4 minutes ago" would still
+         be here, still saying four, an hour later. -->
+    <string name="notice_last_sync_label">Last sync</string>
+    <string name="notice_waiting_battery">Watch battery %1$d%%</string>
+    <string name="notice_waiting_no_battery">The watch has not reported its battery</string>
+    <string name="notice_waiting_battery_unsynced">Watch battery %1$d%% — no sync yet</string>
+    <string name="notice_waiting_nothing_yet">Ready for your watch — nothing synced yet</string>
 
     <!-- ============================================================
          The diagnostic screen. Every enum below is decided in core/;

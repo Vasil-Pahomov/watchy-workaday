@@ -61,19 +61,36 @@ data class ExchangeHistory(
 }
 
 /**
- * Assemble the block from the two records the app persists.
+ * When the last exchange that succeeded happened, or null if none ever has.
  *
- * They are written one after the other by the same pair of `Action`s, so they
- * normally agree. This resolves the one way they can come apart **once, here**,
- * rather than letting two lines argue on screen: [HealthSnapshot.decode] answers a
- * *zeroed* snapshot for a value it cannot read, while [ExchangeReport.decode]
- * answers null — so a health string that is lost or corrupted while the exchange
- * string survives would otherwise show "Last sync: never" directly above "Last
- * attempt: two minutes ago — the watch's clock was set".
+ * The two records the app persists are written one after the other by the same
+ * pair of `Action`s, so they normally agree. This resolves the one way they can
+ * come apart **once, here**, rather than letting two lines argue on screen:
+ * [HealthSnapshot.decode] answers a *zeroed* snapshot for a value it cannot read,
+ * while [ExchangeReport.decode] answers null — so a health string that is lost or
+ * corrupted while the exchange string survives would otherwise show "Last sync:
+ * never" directly above "Last attempt: two minutes ago — the watch's clock was
+ * set".
  *
  * Where the counters are empty and an attempt survives, the attempt is the record
  * of record: it is the more specific evidence, and it is the half that was not
  * lost.
+ *
+ * A function of its own because two things now ask it — the diagnostic block below
+ * and [restingSummaryFor], which the notification renders. Two copies of a rule
+ * about which of two damaged records to believe is exactly how the screen and the
+ * notification would come to disagree in the one situation either is worth reading.
+ */
+fun lastSuccessfulExchangeAt(health: HealthSnapshot, lastAttempt: ExchangeReport?): Long? = when {
+    health.lastSuccessUtcEpochSeconds != 0L -> health.lastSuccessUtcEpochSeconds
+    health.lastOutcome == null && lastAttempt?.outcome == ExchangeOutcome.Succeeded ->
+        lastAttempt.atUtcEpochSeconds
+
+    else -> null
+}
+
+/**
+ * Assemble the block from the two records the app persists.
  *
  * @param failingThreshold `Backoff.attemptsToReachCap + 1`. See [healthLevelFor].
  */
@@ -86,11 +103,7 @@ fun exchangeHistoryFor(
     val countersAreEmpty = health.lastOutcome == null
     val attemptSucceeded = lastAttempt?.outcome == ExchangeOutcome.Succeeded
 
-    val lastSuccess: Long? = when {
-        health.lastSuccessUtcEpochSeconds != 0L -> health.lastSuccessUtcEpochSeconds
-        countersAreEmpty && attemptSucceeded -> lastAttempt?.atUtcEpochSeconds
-        else -> null
-    }
+    val lastSuccess: Long? = lastSuccessfulExchangeAt(health, lastAttempt)
 
     val level = when {
         !countersAreEmpty -> healthLevelFor(health, failingThreshold)
