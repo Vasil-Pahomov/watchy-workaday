@@ -1,18 +1,45 @@
 #include "core/ui_state.h"
 
 namespace core {
+namespace {
+
+// The one press that toggles the theme instead of opening a screen. Shared by
+// handleButton() and themeAfterButton() so that the item one of them refuses to
+// enter is by construction the item the other one flips: two copies of this
+// condition would eventually disagree, and the failure — a menu item that enters
+// an empty app screen, or one that flips nothing — would only show on a wrist.
+//
+// The index is compared exactly, so a menu_index that came back out of RTC memory
+// as garbage cannot flip the theme by falling into a range.
+bool pressTogglesTheme(const UiState& state, ButtonId button) {
+  return state.screen == Screen::Menu && button == ButtonId::Menu &&
+         state.menu_index == kThemeMenuIndex;
+}
+
+}  // namespace
 
 uint8_t activatedMenuItem(const UiState& state, ButtonId button) {
-  // The one transition that enters an app. Anything else — navigating the menu,
+  // The one press that activates anything. Anything else — navigating the menu,
   // backing out, a press inside an app already open, no press at all — activates
   // nothing, which is what keeps a screen left open from re-asking for a radio
   // window on every subsequent wake.
+  //
+  // "Activates", not "enters": kThemeMenuIndex is activated by this same press
+  // and acts in place. What the caller does with the answer is the caller's, and
+  // main.cpp does two different things with it for two different items.
   if (state.screen != Screen::Menu || button != ButtonId::Menu) {
     return kNoMenuItem;
   }
   // handleButton() keeps menu_index inside the menu, but this value has been
   // through deep sleep and a reflash since it was last written.
   return state.menu_index < kMenuItemCount ? state.menu_index : kNoMenuItem;
+}
+
+ThemeChange themeAfterButton(const UiState& state, ButtonId button, bool inverted) {
+  ThemeChange result;
+  result.changed = pressTogglesTheme(state, button);
+  result.inverted = result.changed ? !inverted : inverted;
+  return result;
 }
 
 bool handleButton(UiState& state, ButtonId button) {
@@ -43,6 +70,13 @@ bool handleButton(UiState& state, ButtonId button) {
           state.menu_index = static_cast<uint8_t>((state.menu_index + 1) % kMenuItemCount);
           return true;
         case ButtonId::Menu:
+          if (pressTogglesTheme(state, button)) {
+            // Acts in place: the wearer stays in the menu with the pointer where
+            // it was, and the label under it now reads the other way round. True
+            // because that label changed, which is the whole visible effect this
+            // function is allowed to report.
+            return true;
+          }
           state.screen = Screen::App;
           state.app_index = state.menu_index;
           return true;

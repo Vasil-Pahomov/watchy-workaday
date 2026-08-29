@@ -27,6 +27,13 @@ struct Snapshot {
   core::RunMode mode = core::RunMode::Normal;
   core::Screen screen = core::Screen::Watchface;
   uint8_t menu_index = 0;
+  // The wearer's choice of ink and paper (core::kThemeMenuIndex), carried from
+  // the caller's persisted block. Two things read it: the theme item's label,
+  // which states the current state rather than the action, and the content hash
+  // — on EVERY screen, because inverting changes every pixel of every one of
+  // them. Leave it out of the hash and a flip composes to an identical screen,
+  // core::decideRefresh() answers Skip, and nothing is ever repainted.
+  bool inverted = true;
   uint32_t steps_today = 0;
   uint32_t steps_yesterday = 0;
   // Runtime state, not a compile-time flag: the sensor can stop answering while

@@ -164,9 +164,9 @@ Still open, and deliberately not built (`PROTOCOL.md` §9): bonding and encrypti
 notifications from the phone.
 
 ### 7. ~~Watchface layout worth looking at~~ — done, and the rule held
-The face is now Gilroy Regular throughout (three sizes, `tools/make_time_font.py`),
-the charge is a gauge in the top-right corner instead of a percentage, and the step
-count sits in the bottom-left corner as digits alone. `tools/preview_face.py`
+The face is now Gilroy ExtraBold throughout (three sizes, `tools/make_time_font.py`),
+the charge is a gauge hard against the top-right corner instead of a percentage, and
+the step count sits hard against the bottom-left corner as digits alone. `tools/preview_face.py`
 renders any of it to a PNG from the generated font header and the layout constants
 in `board/display.cpp`, so the next layout change can be looked at without flashing
 it.

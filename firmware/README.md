@@ -8,9 +8,16 @@ Watchy revisions.
 
 ![The Workaday watchface on a Watchy 2.0](docs/preview/hero.png)
 
-Gilroy Regular throughout, white on black. The charge is a gauge in the top-right
-corner rather than a percentage, the step count is digits alone in the bottom-left,
-and neither the hour nor the day carries a leading zero.
+Gilroy ExtraBold throughout, white on black — or black on white, from the third
+menu item, which states which way round it currently is rather than what pressing
+it would do. The charge is a gauge in the top-right corner rather than a
+percentage, the step count is digits alone in the bottom-left, and neither the
+hour nor the day carries a leading zero.
+
+The two corner readings sit *on* the corners rather than a margin inside them,
+and the clock is sized to the panel rather than to a taste: at its widest minute
+of the day, 20:00, it inks 198 of the 200 columns. That is the largest whole-pixel
+size that does not run off the glass — the next one up overshoots by three columns.
 
 Every state the panel can be put into, including the ones that are awkward to
 reach on a wrist — a flat cell, a clock that has never been set, a step sensor

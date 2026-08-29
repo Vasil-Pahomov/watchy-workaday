@@ -38,10 +38,12 @@ constexpr uint32_t kPersistMagic = 0x57444159u;  // 'WDAY'
 // 2 -> 3 added the accelerometer configuration budget and the step counter's
 // rejection streak; 3 -> 4 added the sensor-park retry state; 4 -> 5 added the
 // step-reading staleness clock; 5 -> 6 added the BLE sync window's hourly timer
-// and the last sync result. An old block is discarded rather than reinterpreted,
-// which is the whole point of carrying a version at all — including for a version
-// that only ever existed on a bench.
-constexpr uint8_t kPersistVersion = 6;
+// and the last sync result; 6 -> 7 added the display theme, and the menu it is
+// chosen from grew a third item, which changes what an already-persisted
+// menu_index of 2 would mean. An old block is discarded rather than
+// reinterpreted, which is the whole point of carrying a version at all —
+// including for a version that only ever existed on a bench.
+constexpr uint8_t kPersistVersion = 7;
 
 // Everything that must survive deep sleep **and every kind of reset**. It lives
 // in `.rtc_noinit` (see the definition of g_persist below for why that is not the
@@ -70,6 +72,14 @@ struct PersistedState {
   uint8_t battery_percent = 0;
   uint32_t minutes_since_battery_sample = core::kBatterySampleIntervalMinutes;
   bool use_24h = true;
+  // Which way round ink and paper go (core::kThemeMenuIndex). Here rather than in
+  // core::UiState because it is a preference and not navigation: UiState's screen
+  // and menu_index are reset by the idle timeout and by Back, and the theme must
+  // survive both of those as well as the sleep. False is white on black, the face
+  // the watch ships with, and it is also what a first boot or a discarded block
+  // lands on — an unreadable default is not something a version check should be
+  // able to produce.
+  bool inverted = false;
 };
 
 // Step counting. Costs the sensor's own ~14 uA of sleep current — about a quarter
@@ -562,6 +572,11 @@ void setup() {
 
   bool ui_changed = false;
   bool sync_requested = false;
+  // Consumed under plan.need_display below, which is safe because every wake that
+  // sets run_ui is a button wake and core::routeWake() sets need_display on all of
+  // them. A router that ever separated the two would drop this flag and repaint
+  // the swap as a partial — the ghosting case it exists to avoid.
+  bool theme_changed = false;
   if (plan.run_ui && wake_button != core::ButtonId::None) {
     // Asked *before* the dispatch: which item a press activates is only knowable
     // from the state as it was when the button went down, and handleButton() is
@@ -570,6 +585,14 @@ void setup() {
     // PROTOCOL.md §5.1 says a user request can arrive on.
     sync_requested =
         core::activatedMenuItem(g_persist.ui, wake_button) == core::kSyncMenuIndex;
+    // Before the dispatch for the same reason, and through the same function
+    // core::handleButton() consults, so the item that does not open an app and
+    // the item whose flag is flipped cannot become two different items. An
+    // assignment rather than a branch: nothing here decides anything.
+    const core::ThemeChange theme =
+        core::themeAfterButton(g_persist.ui, wake_button, g_persist.inverted);
+    g_persist.inverted = theme.inverted;
+    theme_changed = theme.changed;
     ui_changed = core::handleButton(g_persist.ui, wake_button);
   } else {
     // Not a button wake: age the idle timer so a menu left open returns to the
@@ -602,15 +625,26 @@ void setup() {
     // and it costs nothing to show.
     snapshot.sync_result = g_persist.sync.last_result;
     snapshot.sync_applied = g_persist.sync.last_applied_epoch_s != 0;
+    snapshot.inverted = g_persist.inverted;
 
     const uint32_t hash = app::compose(snapshot);
-    const core::RefreshKind kind = core::decideRefresh(g_persist.refresh, hash, elapsed,
-                                                       plan.force_full_refresh);
+    // theme_changed joins plan.force_full_refresh rather than replacing it: both
+    // are the "cases the policy cannot see" core::decideRefresh() documents, and
+    // this one is a frame in which every pixel transitions. A partial refresh of
+    // that is the worst ghosting case the panel has, so the flip costs one full
+    // refresh: 0.011 mAh against the ~0.0030 mAh partial this press would have
+    // paid anyway — app::compose() hashes the theme, so the alternative was a
+    // partial repaint and never a skip. ~+0.008 mAh, on a press the wearer made
+    // deliberately. See core::ThemeChange and docs/power-budget.md.
+    const core::RefreshKind kind =
+        core::decideRefresh(g_persist.refresh, hash, elapsed,
+                            plan.force_full_refresh || theme_changed);
 
     if (kind != core::RefreshKind::Skip) {
       // The panel is initialised and hibernated by this scope. Skip never gets
       // here, so an unchanged screen costs no panel activity at all.
-      board::display::Session panel(source == core::WakeSource::PowerOn);
+      board::display::Session panel(source == core::WakeSource::PowerOn,
+                                    g_persist.inverted);
       board::display::render(kind, &app::draw);
     }
   }

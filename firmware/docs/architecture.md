@@ -46,7 +46,7 @@ The boundary is mechanically enforced: the `native` environment compiles only
 | `refresh_policy` | partial vs full vs **skip** | skipping a refresh removes ~85 % of a wake's cost |
 | `wake_router` | wake reason → what to power up | the module that decides what *not* to do |
 | `health` | boots, faults, run mode across resets | crash-loop escalation to Safe/Recovery |
-| `ui_state` | screen/menu state machine, idle timeout, which item a press activated | keeps UI logic out of the render path; `activatedMenuItem()` is the only way a user sync request reaches the radio |
+| `ui_state` | screen/menu state machine, idle timeout, which item a press activated, whether a press flips the display theme | keeps UI logic out of the render path; `activatedMenuItem()` is the only way a user sync request reaches the radio, and `themeAfterButton()` is what makes a theme flip force a full refresh instead of ghosting a partial one |
 | `step_counter` | daily totals from the sensor's raw counter, and whether they are current enough to show | rejects garbage reads; no wake cost of its own |
 | `accel_policy` | whether to configure the BMA423, and when to stop | caps the ~0.85 s config upload at 3 attempts per power cycle |
 | `sync_policy` | whether a BLE sync window opens on this wake, and the state a window leaves behind | the gate on the most expensive thing the firmware can do; the hourly timer is spent when a window *opens*, so a phone that is never there costs 24 windows a day and not 1440 |

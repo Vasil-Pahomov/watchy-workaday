@@ -35,11 +35,12 @@ struct Composed {
   core::Screen screen;
   uint8_t menu_index;
   uint8_t battery_percent;
+  bool inverted;
 };
 
-Composed g_composed = {"--:--", "", "", "", "", "", "", core::Screen::Watchface, 0, 0};
+Composed g_composed = {"--:--", "", "", "", "", "", "", core::Screen::Watchface, 0, 0, false};
 
-constexpr uint8_t kStepsMenuIndex = 0;  // must track kMenuItems below
+constexpr uint8_t kStepsMenuIndex = 0;  // must track kFixedMenuItems below
 
 // Only items that do something. "Battery", "Set Time" and "About" used to sit
 // here and drew "not implemented" when opened, which is a menu that wastes the
@@ -49,8 +50,36 @@ constexpr uint8_t kStepsMenuIndex = 0;  // must track kMenuItems below
 // The Sync item's index is core::kSyncMenuIndex, not a local constant: main.cpp
 // reads the same number to tell that a press asked for a radio window, and one of
 // the two places would drift.
-const char* const kMenuItems[core::kMenuItemCount] = {"Steps", "Sync"};
-static_assert(core::kMenuItemCount == 2, "kMenuItems and kMenuItemCount must agree");
+//
+// The theme item is deliberately absent: its label is a function of the theme
+// rather than a constant, so menuLabel() below owns it and this array holds only
+// the items whose label never changes.
+const char* const kFixedMenuItems[] = {"Steps", "Sync"};
+constexpr uint8_t kFixedMenuItemCount = sizeof(kFixedMenuItems) / sizeof(kFixedMenuItems[0]);
+static_assert(kFixedMenuItemCount + 1 == core::kMenuItemCount,
+              "every menu item needs a label: the fixed ones here, plus the theme item");
+// Which is only true while the theme item is the last one. It is, because items
+// are appended and never inserted (core/ui_state.h) — and if that ever stopped
+// being true, the labels below would silently shift by one.
+static_assert(core::kThemeMenuIndex == kFixedMenuItemCount,
+              "the theme item is the one appended after the fixed labels");
+
+// The theme item's label states what the watch is doing NOW, not what the press
+// will do. "White on black" is today's default face, and pressing it leaves the
+// pointer where it is with the label reading "Black on white" — so the wearer
+// reads the current state straight off the menu instead of having to work out
+// which way round a verb was meant.
+const char* themeLabel(bool inverted) { return inverted ? "Black on white" : "White on black"; }
+
+// The label for `index`, whatever it depends on. Out-of-range gives the empty
+// string rather than reading past the array: menu_index has been through RTC
+// memory and a reflash, and drawMenu() prints an empty row without complaint.
+const char* menuLabel(uint8_t index, bool inverted) {
+  if (index == core::kThemeMenuIndex) {
+    return themeLabel(inverted);
+  }
+  return index < kFixedMenuItemCount ? kFixedMenuItems[index] : "";
+}
 
 // PROTOCOL.md §3.2's result codes, in the wearer's words rather than the wire's.
 // Presentation, so it lives here beside modeTag() rather than in core/ — nothing
@@ -99,6 +128,7 @@ const char* modeTag(core::RunMode mode) {
 uint32_t compose(const Snapshot& snapshot) {
   g_composed.screen = snapshot.screen;
   g_composed.menu_index = snapshot.menu_index;
+  g_composed.inverted = snapshot.inverted;
 
   if (snapshot.time_valid) {
     core::formatTime(g_composed.time, sizeof(g_composed.time), snapshot.time, snapshot.use_24h);
@@ -159,6 +189,13 @@ uint32_t compose(const Snapshot& snapshot) {
       core::gaugeFillPixels(g_composed.battery_percent, board::display::kBatteryTrackPixels);
   hash = core::hashCombine(hash, &battery_fill, sizeof(battery_fill));
   hash = core::hashCombine(hash, g_composed.steps_face);
+  // Outside every screen-specific branch below, because this one is not specific
+  // to a screen: it swaps all 40 000 pixels of whichever screen is up, and of the
+  // menu it also rewrites a label. Hashing the theme rather than the labels is
+  // what covers that second effect — the only label that varies is the theme
+  // item's, and it varies with exactly this byte.
+  const uint8_t inverted_byte = g_composed.inverted ? 1u : 0u;
+  hash = core::hashCombine(hash, &inverted_byte, sizeof(inverted_byte));
   hash = core::hashCombine(hash, &g_composed.screen, sizeof(g_composed.screen));
   if (g_composed.screen == core::Screen::Menu) {
     hash = core::hashCombine(hash, &g_composed.menu_index, sizeof(g_composed.menu_index));
@@ -181,9 +218,17 @@ uint32_t compose(const Snapshot& snapshot) {
 
 void draw() {
   switch (g_composed.screen) {
-    case core::Screen::Menu:
-      board::display::drawMenu(kMenuItems, core::kMenuItemCount, g_composed.menu_index);
+    case core::Screen::Menu: {
+      // Assembled per draw rather than held in a table, because one of the
+      // labels is a function of the theme. kMenuItemCount pointers of stack, no
+      // allocation, on a path that only a button wake reaches.
+      const char* items[core::kMenuItemCount];
+      for (uint8_t i = 0; i < core::kMenuItemCount; ++i) {
+        items[i] = menuLabel(i, g_composed.inverted);
+      }
+      board::display::drawMenu(items, core::kMenuItemCount, g_composed.menu_index);
       return;
+    }
 
     case core::Screen::App: {
       board::display::drawStatusLine(g_composed.status);
@@ -200,7 +245,7 @@ void draw() {
         // next time it is opened; re-rendering it here would cost a second panel
         // refresh per sync, which is ~0.26 mAh/day at the hourly cadence and is
         // not in the budget.
-        board::display::drawBanner(kMenuItems[index], g_composed.sync);
+        board::display::drawBanner(menuLabel(index, g_composed.inverted), g_composed.sync);
       } else {
         // kStepsMenuIndex, the only other item. An empty string means the counter
         // is not running at all, which is a different thing from "no step data"

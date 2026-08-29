@@ -53,6 +53,30 @@ theoretical. Real-world lands lower; the 21-day target carries the margin.
 so ghosting cleanup is affordable; ruinous if triggered per minute. Budget: at
 most one every 60 partials or 12 hours, whichever comes first.
 
+**Inverting the display costs one of these, on the press that does it.** The
+theme menu item swaps ink and paper, so every one of the 200×200 pixels
+transitions in the same frame — the extreme case of the residue the cadence above
+exists to clear, and the one frame where a partial refresh would leave the whole
+previous screen behind. `core::ThemeChange::changed` is true only on the press
+that flipped it, and `main.cpp` passes it as `force_full`.
+
+**The counterfactual is a partial refresh, not a skipped one**, and getting that
+right is the difference between the marginal cost and the whole cost. `app/screens.cpp`
+folds the theme into the content hash unconditionally, so the flip changes the
+hash on every screen: without `force_full` that press would still have repainted,
+as a **partial** — the ~0.0030 mAh minute-tick above. Forcing it full makes it
+3.7 of those instead of 1, so the marginal cost of the ghosting decision is
+**~+0.008 mAh per toggle**. The ledger row below prices the whole press at
+0.011 mAh, which is right; ~0.0030 of that is a repaint this press was going to
+pay anyway, and only ~0.008 is the choice of full over partial.
+
+It adds no wake, no peripheral and nothing to the sleep floor, and the theme
+itself is free to keep — it is one bit in the persisted block and one pair of
+colour constants at draw time. Ten toggles in a day would be ~0.08 mAh, under 1 %
+of the allowance; the realistic number is a handful in the life of the watch. Not
+carried as a recurring cost for that reason — the ledger row below prices one
+event, and the frequency column says what it is.
+
 ### Radio — the thing that breaks the budget
 
 A single WiFi association plus an NTP exchange is ~3 s at ~120 mA ≈ **0.1 mAh** —
@@ -278,6 +302,7 @@ Update this table in the same change that adds or alters a wake source.
 | Step read on the tick | 1440/day | ~0 | ~0.02 | 4 probe/read bytes on an open bus; also on timer and unknown wakes |
 | Full refresh | ≤ 2/day | 0.011 | ~0.02 | ghosting cleanup; see the fault-path note below |
 | Button press | ~50/day | 0.0015 | ~0.08 | no refresh if content unchanged |
+| Display invert | rare, user-initiated | 0.011 | ~0 | a button press that forces a full refresh; no wake of its own |
 | Accelerometer INT | disarmed | — | 0 | not needed for step counting |
 | BMA423 config upload | ≤ 3 per power cycle | ~0.007 | ~0 | ~0.02 mAh once, then never; capped by `core::kMaxAccelConfigAttempts` |
 | BMA423 park after give-up | ≤ 3 per power cycle | ~0 | 0 | 2 register transactions; reclaims the sensor's ~0.34 mAh/day |

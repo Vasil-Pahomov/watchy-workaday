@@ -46,7 +46,7 @@ SCRATCH = "preview"        # git-ignored; ad-hoc renders
 kSheetScale = 2
 # The same face the watch wears, for the captions around it. Vendored beside the
 # generator, so this works from a clean checkout like everything else here.
-GILROY = "tools/fonts/Gilroy-Regular.ttf"
+GILROY = "tools/fonts/Gilroy-ExtraBold.ttf"
 
 FONT_HEADER = "src/board/font_time.h"
 DISPLAY_CPP = "src/board/display.cpp"
@@ -59,8 +59,9 @@ NEEDED = {
     BOARD_H: ["kDisplayWidth", "kDisplayHeight"],
     DISPLAY_H: ["kBatteryTrackPixels"],
     DISPLAY_CPP: ["kMargin", "kStatusBaseline", "kDateBaseline", "kTimeBaseline",
-                  "kStepsBaseline", "kGaugeHeight", "kGaugeBorder", "kGaugeBodyWidth",
-                  "kGaugeCapWidth", "kGaugeCapHeight", "kGaugeTop", "kGaugeLeft"],
+                  "kStepsLeft", "kStepsBottom", "kGaugeHeight", "kGaugeBorder",
+                  "kGaugeBodyWidth", "kGaugeCapWidth", "kGaugeCapHeight", "kGaugeTop",
+                  "kGaugeLeft"],
 }
 
 INK, PAPER = 1, 0
@@ -162,6 +163,20 @@ def draw_text(fb, font, text, x, y, colour=INK, label=""):
     return x
 
 
+def draw_steps(fb, k, font, text):
+    """drawStepsLine(): the ink box driven into the bottom-left corner.
+
+    Both offsets come out of the glyphs rather than a constant, exactly as they
+    do on the device - the string's own left bearing for the column, and a
+    digit's for the row, so "--" hangs where a dash hangs instead of being
+    dragged down onto row 199 with the digits.
+    """
+    x1, _, _, _ = text_bounds(font, text)
+    _, y1, _, h = text_bounds(font, "0")
+    draw_text(fb, font, text, k["kStepsLeft"] - x1,
+              k["kStepsBottom"] - (y1 + h - 1), label="steps")
+
+
 def draw_centred(fb, font, text, baseline, width, label=""):
     x1, _, w, _ = text_bounds(font, text)
     # Truncating division, like C++.
@@ -227,11 +242,11 @@ def face(k, f, time="14:32", date="Wed 12 Aug", steps="8432", battery=76, mode="
     draw_centred(fb, f["WorkadayTime"], time, k["kTimeBaseline"], k["kDisplayWidth"], "time")
     draw_centred(fb, f["WorkadayLabel"], date, k["kDateBaseline"], k["kDisplayWidth"], "date")
     if steps:
-        draw_text(fb, f["WorkadayLabel"], steps, k["kMargin"], k["kStepsBaseline"], label="steps")
+        draw_steps(fb, k, f["WorkadayLabel"], steps)
     return fb
 
 
-def menu(k, f, items=("Steps", "Sync"), selected=0):
+def menu(k, f, items=("Steps", "Sync", "White on black"), selected=0):
     fb = blank(k)
     for i, item in enumerate(items):
         y = 20 + i * 30
@@ -241,6 +256,17 @@ def menu(k, f, items=("Steps", "Sync"), selected=0):
             colour = PAPER
         draw_text(fb, f["WorkadaySmall"], item, 12, y + 21, colour, label="menu:" + item)
     return fb
+
+
+def inverted(fb):
+    """The third menu item, applied to a finished framebuffer.
+
+    The firmware inverts by swapping the two colour constants in display.cpp, so
+    on a one-bit buffer the result is exactly this: every pixel the other way
+    round, ink and paper both. Doing it here rather than threading a colour
+    through every helper keeps this file's drawing code the same shape as the
+    firmware's, which is the only reason to trust either of them."""
+    return [[PAPER if v else INK for v in row] for row in fb]
 
 
 def banner(k, f, line1, line2, battery=76):
@@ -303,13 +329,18 @@ def sheet(shots, scale):
 
 
 def gauge_crop(k, percent, scale):
-    """Just the corner the gauge lives in, blown up."""
+    """Just the corner the gauge lives in, blown up.
+
+    The padding is clamped to the panel rather than assumed to exist. The gauge
+    is flush with the top-right corner, so on two of its four sides there is no
+    panel to pad with - and the crop showing that is the point, not a defect."""
     fb = blank(k)
     draw_gauge(fb, k, percent)
     pad = 3
-    x0, y0 = k["kGaugeLeft"] - pad, k["kGaugeTop"] - pad
-    x1 = k["kGaugeLeft"] + k["kGaugeBodyWidth"] + k["kGaugeCapWidth"] + pad
-    y1 = k["kGaugeTop"] + k["kGaugeHeight"] + pad
+    x0, y0 = max(0, k["kGaugeLeft"] - pad), max(0, k["kGaugeTop"] - pad)
+    x1 = min(k["kDisplayWidth"],
+             k["kGaugeLeft"] + k["kGaugeBodyWidth"] + k["kGaugeCapWidth"] + pad)
+    y1 = min(k["kDisplayHeight"], k["kGaugeTop"] + k["kGaugeHeight"] + pad)
     return to_image([row[x0:x1] for row in fb[y0:y1]], scale).convert("RGB")
 
 
@@ -364,8 +395,15 @@ def every_screen(k, f):
         ("recovery mode", face(k, f, "8:15", "Sat 8 Nov", "930", 33, "RECOV")),
         ("menu", menu(k, f)),
         ("menu, Sync selected", menu(k, f, selected=1)),
+        ("menu, theme item selected", menu(k, f, selected=2)),
         ("Steps screen", banner(k, f, "8432 steps", "yesterday 11207")),
         ("Sync screen", banner(k, f, "Sync", "last sync ok")),
+        # The same two screens the other way round. The label states what the
+        # watch is doing now rather than what the press will do, so it reads
+        # "Black on white" here and "White on black" above.
+        ("black on white", inverted(face(k, f, "14:32", "Wed 12 Aug", "8432", 76))),
+        ("black on white, menu",
+         inverted(menu(k, f, items=("Steps", "Sync", "Black on white"), selected=2))),
     ]
 
 

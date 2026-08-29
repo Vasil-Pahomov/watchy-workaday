@@ -13,7 +13,7 @@ enum class Screen : uint8_t { Watchface, Menu, App };
 
 enum class ButtonId : uint8_t { None, Menu, Back, Up, Down };
 
-constexpr uint8_t kMenuItemCount = 2;
+constexpr uint8_t kMenuItemCount = 3;
 
 // The Sync item (PROTOCOL.md §5.1: "the Sync menu item opens a window immediately
 // and resets the hourly timer").
@@ -31,6 +31,21 @@ constexpr uint8_t kMenuItemCount = 2;
 // index meaning exactly what it did.
 constexpr uint8_t kSyncMenuIndex = 1;
 static_assert(kSyncMenuIndex < kMenuItemCount, "the Sync item must be in the menu");
+
+// The display-theme item. Appended, for the reason given directly above: the two
+// indices in UiState come back out of RTC-backed memory meaning whatever they
+// meant when they were written, so a new item goes on the end and nowhere else.
+//
+// It is the one item that does NOT open an app. Pressing Menu on it flips the
+// theme and leaves the pointer where it is, so the label under the cursor changes
+// and a second press changes it back. That rule lives here rather than in main.cpp
+// because two places depend on it and only one of them can be unit tested:
+// handleButton() must not move to Screen::App for this item, and the caller must
+// flip its persisted flag for exactly the same press. themeAfterButton() below is
+// the single implementation both of them go through.
+constexpr uint8_t kThemeMenuIndex = 2;
+static_assert(kThemeMenuIndex < kMenuItemCount, "the theme item must be in the menu");
+static_assert(kThemeMenuIndex != kSyncMenuIndex, "the theme item must not be the Sync item");
 
 // "no item was activated" — outside the menu's range on purpose, so it cannot be
 // confused with item 255 on a corrupt index.
@@ -69,10 +84,44 @@ struct UiState {
 //
 // Returns kNoMenuItem for a menu_index outside the menu, which RTC-backed state
 // can produce even inside a block whose magic and version still check out.
+//
+// kThemeMenuIndex is returned like any other item: that press activates it. What
+// differs is only what activation *means* — the theme item acts in place instead
+// of opening a screen, so the caller sees the item named here and handleButton()
+// leaves the screen on Menu.
 uint8_t activatedMenuItem(const UiState& state, ButtonId button);
+
+// The display theme after this press, and whether this press is what changed it.
+struct ThemeChange {
+  // White ink on black paper is the watch's default, so false is the shipped
+  // face and the flag names the departure from it.
+  bool inverted = false;
+  // Only the press that flipped it. The caller needs this separately from the
+  // value because a flip is not an ordinary content change: it repaints all
+  // 40 000 pixels at once, and every one of them the opposite way round. A
+  // partial refresh of that leaves the whole previous frame as ghosting, which
+  // is the one thing core::refresh_policy's full refresh exists to clear — so
+  // this is the caller's `force_full` for that wake.
+  bool changed = false;
+};
+
+// **Call it with the state as it is BEFORE handleButton() runs**, for the same
+// reason activatedMenuItem() must be: the selected item is only knowable from the
+// pre-press state.
+//
+// `inverted` is the theme as persisted; the return value is what the caller must
+// store back. Returning the new value rather than taking a reference keeps the
+// decision here and leaves the caller a plain assignment with no branch of its
+// own to get wrong.
+ThemeChange themeAfterButton(const UiState& state, ButtonId button, bool inverted);
 
 // Applies a button press. Returns true when the visible content may have changed
 // and the caller should re-render. Any press clears the idle timer.
+//
+// The theme item is the one Menu press that does not enter an app: it returns
+// true (the label under the cursor has changed) with the screen and the pointer
+// untouched. Flipping the flag itself is themeAfterButton()'s job, because the
+// flag outlives this struct — it is a persisted preference, not navigation state.
 bool handleButton(UiState& state, ButtonId button);
 
 // Advances the idle timer. Returns true if this call bounced the UI back to the
