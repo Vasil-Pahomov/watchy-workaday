@@ -68,7 +68,10 @@ void drawStatusLine(const char* text);
 // filled from the left in proportion to `percent`.
 void drawBatteryGauge(uint8_t percent);
 void drawMenu(const char* const* items, uint8_t count, uint8_t selected);
-void drawBanner(const char* line1, const char* line2);
+// Up to three lines of the small face down the left of the panel. A null or
+// empty line draws nothing and leaves its row blank; the Find phone screen is the
+// one caller with a third line, and every other banner passes two.
+void drawBanner(const char* line1, const char* line2, const char* line3 = nullptr);
 
 }  // namespace display
 }  // namespace board

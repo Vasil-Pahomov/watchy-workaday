@@ -13,7 +13,7 @@ enum class Screen : uint8_t { Watchface, Menu, App };
 
 enum class ButtonId : uint8_t { None, Menu, Back, Up, Down };
 
-constexpr uint8_t kMenuItemCount = 3;
+constexpr uint8_t kMenuItemCount = 4;
 
 // The Sync item (PROTOCOL.md §5.1: "the Sync menu item opens a window immediately
 // and resets the hourly timer").
@@ -46,6 +46,22 @@ static_assert(kSyncMenuIndex < kMenuItemCount, "the Sync item must be in the men
 constexpr uint8_t kThemeMenuIndex = 2;
 static_assert(kThemeMenuIndex < kMenuItemCount, "the theme item must be in the menu");
 static_assert(kThemeMenuIndex != kSyncMenuIndex, "the theme item must not be the Sync item");
+
+// The Find phone item (PROTOCOL.md §4.1). Appended after the theme item, for the
+// same reason as everything above it: an item goes on the end and nowhere else.
+//
+// Like Sync it opens an app screen AND asks main.cpp for the radio — a find
+// session rather than a sync window, which is why main.cpp compares the activated
+// item against both indices and does two different things. Unlike Sync, what the
+// screen shows afterwards depends on how the session ended, and that outcome
+// lives in the caller's persisted block (core::FindOutcome) rather than here, for
+// the reason the theme lives there: UiState is navigation and is reset by Back
+// and by the idle timeout, and the message has to outlive both of those but not
+// the next search.
+constexpr uint8_t kFindPhoneMenuIndex = 3;
+static_assert(kFindPhoneMenuIndex < kMenuItemCount, "the Find phone item must be in the menu");
+static_assert(kFindPhoneMenuIndex != kSyncMenuIndex && kFindPhoneMenuIndex != kThemeMenuIndex,
+              "the Find phone item must be its own item");
 
 // "no item was activated" — outside the menu's range on purpose, so it cannot be
 // confused with item 255 on a corrupt index.

@@ -31,12 +31,23 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Held only while a GATT operation timeout is armed - at most the 15 s of
-         PROTOCOL.md §5.2, released on arm, cancel, fire and shutdown, and
-         acquired with a kernel-side timeout as a backstop. It is what makes the
-         §4 exchange run at wall-clock speed against the watch's 12 s session cap
-         (§5.1) on a phone that would otherwise suspend between two GATT
-         callbacks. See OperationTimer. -->
+         PROTOCOL.md §5.2 for an exchange, or the 135 s ring backstop while the
+         find-phone alarm sounds (§4.1) - released on arm, cancel, fire and
+         shutdown, and acquired with a kernel-side timeout as a backstop. It is
+         what makes the §4 exchange run at wall-clock speed against the watch's
+         12 s session cap (§5.1) on a phone that would otherwise suspend between
+         two GATT callbacks, and what keeps the alarm's volume ramp stepping while
+         the phone rings. See OperationTimer. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- The find-phone alarm (PROTOCOL.md §4.1). VIBRATE is a normal permission.
+         USE_FULL_SCREEN_INTENT is what lets the alarm notification put its Stop
+         screen in front of a locked, sleeping phone; on Android 14+ it is granted
+         by default to a sideloaded app (Law 5) and revocable in Settings, and if
+         revoked the alarm still sounds and vibrates behind a heads-up
+         notification with the same Stop action. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <!-- Granted through the CompanionDeviceManager association. Together these
          are what let the service be started from the background at all. -->
@@ -165,6 +176,29 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          The find-phone alarm's screen (PROTOCOL.md §4.1): one line of text and
+          a Stop button, shown over the lock screen with the display turned on
+          when the alarm notification's full-screen intent fires.
+
+          Law 1 again: it owns nothing. The alarm is the service's; this screen
+          sends it one intent and finishes, and finishes on its own when the
+          service says the alarm has ended.
+
+          exported="false": only this app's own notification launches it.
+          singleInstance and excludeFromRecents: an alarm screen is not a place
+          the user navigates back to, and two of them stacked would be two Stop
+          buttons for one alarm.
+        -->
+        <activity
+            android:name=".FindPhoneActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:label="@string/find_title"
+            android:launchMode="singleInstance"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true" />
 
     </application>
 

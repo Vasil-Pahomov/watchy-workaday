@@ -300,8 +300,10 @@ void drawMenu(const char* const* items, uint8_t count, uint8_t selected) {
   g_display.setTextColor(g_ink);
 }
 
-void drawBanner(const char* line1, const char* line2) {
+void drawBanner(const char* line1, const char* line2, const char* line3) {
   g_display.setFont(&WorkadaySmall);
+  // Three baselines 25 px apart, with the small face's 22 px yAdvance: rows that
+  // neither touch nor drift. tools/preview_face.py draws the same three numbers.
   if (line1 != nullptr) {
     g_display.setCursor(10, 95);
     g_display.print(line1);
@@ -309,6 +311,10 @@ void drawBanner(const char* line1, const char* line2) {
   if (line2 != nullptr) {
     g_display.setCursor(10, 120);
     g_display.print(line2);
+  }
+  if (line3 != nullptr) {
+    g_display.setCursor(10, 145);
+    g_display.print(line3);
   }
 }
 

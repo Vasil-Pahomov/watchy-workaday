@@ -51,6 +51,7 @@ The boundary is mechanically enforced: the `native` environment compiles only
 | `accel_policy` | whether to configure the BMA423, and when to stop | caps the ~0.85 s config upload at 3 attempts per power cycle |
 | `sync_policy` | whether a BLE sync window opens on this wake, and the state a window leaves behind | the gate on the most expensive thing the firmware can do; the hourly timer is spent when a window *opens*, so a phone that is never there costs 24 windows a day and not 1440 |
 | `sync_window` | how long the watch may wait at each step of a window that *has* opened, and what the radio's signals mean | holds the invariant the task watchdog depends on — no wait exceeds 6 s and none outlives the 12 s cap, whatever the radio reports |
+| `find_session` | the same for a find-phone search (`PROTOCOL.md` §4.1): rounds, the attempt counter, the three early endings, where the wearer lands afterwards | the one path that stays awake for minutes; every wait it hands out is still under the 6 s bound, and the 120 s cap ends it whatever the radio or the wearer does |
 
 `step_counter` is a good illustration of the split. `board::accel` hands over one
 number — the BMA423's free-running total — and every awkward question about it is
@@ -107,6 +108,18 @@ priority order over three signals. It carried a defect a bench would never find
 and a looping caller span at radio current until the watchdog reset it) and a unit
 test found in a second once it moved. That is the whole argument for the core/board
 line, in the module where the stakes are highest.
+
+The find-phone session (`PROTOCOL.md` §4.1) reuses that split rather than
+extending it: `core::find_session` is a second classifier over the same radio
+signals plus two new ones — a write on the `Find` characteristic and the wearer's
+Back press — and `board::ble::Session` gains a second wait that blocks on all five
+bits where the sync wait blocks on three. The Back press is the one input that is
+neither the radio's nor the wake's: it arrives as a GPIO edge, through
+`board::buttons::attachPressInterrupt()`, into the same FreeRTOS event group the
+wait sleeps on — so the search wakes on it within a millisecond and never polls a
+pin. `main.cpp`'s `runFindSession()` is the loop, and its shape is the sync
+window's: one event per pass, a redraw and a watchdog feed after each completed
+step, `StillWaiting` feeding nothing.
 
 The ADC deliberately has **no** guard: the one-shot driver powers the SAR ADC per
 conversion, so there is nothing to release, and a guard would advertise protection
@@ -171,6 +184,13 @@ Anything larger or longer-lived belongs in NVS.
    central connected, a Time write processed — are genuine progress, and all three
    happen in `main.cpp` on the task the watchdog is subscribed to, not in a NimBLE
    callback.
+
+   The find-phone session is the same rule applied for two minutes instead of
+   twelve seconds: `core::find_session` never hands out a wait over 5 s, and each
+   wait ends in a completed step — a connect, a processed write, or a redraw of
+   the elapsed counter — that `main.cpp` feeds after. Twelve watchdog periods,
+   never one un-fed interval longer than the sync window's. The cost of staying
+   awake that long is energy, priced in `docs/power-budget.md`, not reliability.
 2. **Timeouts everywhere.** Every I2C transaction and BUSY wait is bounded; a
    timeout degrades and sleeps rather than retrying forever.
 3. **A timer wake as a backstop.** If the RTC alarm is ever missed or misset, the

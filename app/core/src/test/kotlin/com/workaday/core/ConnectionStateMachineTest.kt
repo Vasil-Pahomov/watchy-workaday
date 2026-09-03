@@ -6,6 +6,7 @@ import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -31,6 +32,11 @@ class ConnectionStateMachineTest {
     // The same frame with `result` = 6 (Busy) and 2 (BadVersion), nothing applied.
     private val busyStatus = hex("01 81 06 4E 00 00 00 00 01 00 00 00")
     private val badVersionStatus = hex("01 81 02 4E 00 00 00 00 01 00 00 00")
+
+    // PROTOCOL.md §7.4: §7.2 with flags.FIND_PHONE set — the watch is looking for
+    // this phone. And the Busy answer with the same flag, for the failure path.
+    private val findStatus = hex("01 81 00 4E F0 FF 82 6A 01 00 01 00")
+    private val findBusyStatus = hex("01 81 06 4E 00 00 00 00 01 00 01 00")
 
     // PROTOCOL.md §7.1: the app must put exactly these bytes on the wire when the
     // phone's clock reads 2026-08-17T12:34:56Z at UTC+180.
@@ -817,6 +823,258 @@ class ConnectionStateMachineTest {
         assertEquals(ConnectionState.WaitingForRetry(30_000), t.machine.state)
     }
 
+    // ── §4.1, find phone ─────────────────────────────────────────────────────
+
+    /** The §4 exchange, ending in the watch's flagged Status: the phone is now ringing. */
+    private fun FakeTransport.runToRinging() {
+        runToAwaitingStatus()
+        send(TransportEvent.NotificationReceived(findStatus))
+        assertEquals(ConnectionState.Ringing, machine.state)
+    }
+
+    @Test
+    fun `find phone - a Status carrying FIND_PHONE keeps the link open and starts the alarm`() {
+        val t = harness(health = HealthSnapshot(consecutiveFailures = 2))
+        t.runToAwaitingStatus()
+        assertEquals(
+            listOf(
+                "CancelTimers",
+                "PersistHealth",
+                "ReportExchange(Succeeded)",
+                "StartFindAlarm",
+                // The §5.2 ring backstop, not a per-operation timeout: nothing is
+                // outstanding on the link, and this is how long the phone will ring
+                // with no word from the watch.
+                "ArmOperationTimeout(135000)",
+            ),
+            t.send(TransportEvent.NotificationReceived(findStatus)).summary(),
+        )
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+        assertTrue(t.linkOpen, "the link is held open so the watch can end the ring by hanging up")
+        assertTrue(t.alarmOn)
+        // Recorded exactly as the ordinary success it also was: the counters, the
+        // record, the battery — nothing about the flag changes what the diagnostic
+        // screen learns.
+        assertEquals(0, t.machine.health.consecutiveFailures)
+        assertEquals(1L, t.machine.health.totalSuccesses)
+        assertEquals(ExchangeOutcome.Succeeded, t.reports.single().outcome)
+        assertEquals(78, t.reports.single().status?.batteryPercent)
+        assertEquals(true, t.reports.single().status?.findPhoneRequested)
+    }
+
+    @Test
+    fun `find phone - the watch hanging up stops the alarm and re-arms at once`() {
+        // §4.1's normal ending: Back pressed on the watch, or its two-minute cap.
+        // Also what a lost link looks like, and the answer is the same — the watch
+        // may still be looking, so no settle and no backoff.
+        val t = harness()
+        t.runToRinging()
+        assertEquals(
+            listOf("CancelTimers", "StopFindAlarm", "CloseConnection", "ArmAutoConnect"),
+            t.send(TransportEvent.Disconnected(19)).summary(),
+        )
+        assertEquals(ConnectionState.Armed, t.machine.state)
+        assertFalse(t.alarmOn)
+        assertEquals(0, t.machine.health.consecutiveFailures, "the watch ending its search is not a fault")
+        assertEquals(1, t.reports.size, "nothing new to report — the exchange was recorded when the Status arrived")
+    }
+
+    @Test
+    fun `find phone - dismissing on the phone silences it, writes Find, and closes on the reply`() {
+        val t = harness()
+        t.runToRinging()
+
+        assertEquals(
+            listOf("CancelTimers", "StopFindAlarm", "ArmOperationTimeout(5000)", "WriteFindDismiss(4)"),
+            t.send(TransportEvent.FindDismissedOnPhone).summary(),
+        )
+        assertEquals(ConnectionState.DismissingFind, t.machine.state)
+        assertFalse(t.alarmOn, "the alarm stops at the tap, not when the watch answers")
+        assertTrue(t.linkOpen, "the link stays up for the write")
+        // PROTOCOL.md §7.5, byte for byte.
+        assertContentEquals(hex("01 02 00 00"), t.lastFindPayload)
+
+        assertEquals(
+            listOf("CancelTimers", "CloseConnection", "ArmAutoConnect"),
+            t.send(TransportEvent.CharacteristicWritten(GATT_SUCCESS)).summary(),
+        )
+        assertEquals(ConnectionState.Armed, t.machine.state)
+        assertEquals(0, t.machine.health.consecutiveFailures)
+        assertEquals(1, t.reports.size)
+    }
+
+    @Test
+    fun `find phone - a dismiss write that fails still ends closed and armed, and is not a failed exchange`() {
+        // An older watch has no Find characteristic, so the Android layer reports a
+        // write it could not issue (GATT_LOCAL_FAILURE); or the stack refuses it.
+        // Either way the user already silenced the phone, the exchange finished
+        // when the Status arrived, and there is nothing to back off from.
+        for (status in listOf(GATT_LOCAL_FAILURE, 133)) {
+            val t = harness()
+            t.runToRinging()
+            t.send(TransportEvent.FindDismissedOnPhone)
+            t.send(TransportEvent.CharacteristicWritten(status))
+            assertEquals(ConnectionState.Armed, t.machine.state, "status $status")
+            assertEquals(0, t.machine.health.consecutiveFailures, "status $status")
+            assertEquals(1, t.reports.size, "status $status")
+        }
+    }
+
+    @Test
+    fun `find phone - the watch hanging up mid-dismiss still ends armed`() {
+        // The watch processed the frame and ended its search before our write
+        // callback came back, or the link dropped. Same ending.
+        val t = harness()
+        t.runToRinging()
+        t.send(TransportEvent.FindDismissedOnPhone)
+        assertEquals(
+            listOf("CancelTimers", "CloseConnection", "ArmAutoConnect"),
+            t.send(TransportEvent.Disconnected(19)).summary(),
+        )
+        assertEquals(ConnectionState.Armed, t.machine.state)
+    }
+
+    @Test
+    fun `find phone - a dismiss write that never completes times out into armed`() {
+        val t = harness()
+        t.runToRinging()
+        t.send(TransportEvent.FindDismissedOnPhone)
+        assertEquals(5_000L, t.pendingTimerDelayMillis, "the §5.2 per-operation timeout, unclamped by a long-spent exchange budget")
+        assertEquals(listOf("CloseConnection", "ArmAutoConnect"), t.fireOperationTimeout().summary())
+        assertEquals(ConnectionState.Armed, t.machine.state)
+    }
+
+    @Test
+    fun `find phone - the ring backstop ends a ring the watch never hung up`() {
+        // §5.2: longer than the watch's cap, so this only fires when the disconnect
+        // never reached us. Stop, close, re-arm — the net, not the normal ending.
+        val t = harness()
+        t.runToRinging()
+        assertEquals(135_000L, t.pendingTimerDelayMillis)
+        assertEquals(listOf("StopFindAlarm", "CloseConnection", "ArmAutoConnect"), t.fireOperationTimeout().summary())
+        assertEquals(ConnectionState.Armed, t.machine.state)
+        assertFalse(t.alarmOn)
+    }
+
+    @Test
+    fun `find phone - the radio going away silences the alarm`() {
+        for (event in listOf(TransportEvent.AdapterOff, TransportEvent.PermissionRevoked)) {
+            val t = harness()
+            t.runToRinging()
+            assertEquals(listOf("CancelTimers", "StopFindAlarm", "CloseConnection"), t.send(event).summary(), "$event")
+            assertIs<ConnectionState.Blocked>(t.machine.state, "$event")
+            assertFalse(t.alarmOn, "$event")
+            // And it comes back armed, as from any Blocked.
+            t.send(TransportEvent.AdapterOn)
+            t.send(TransportEvent.PermissionGranted)
+            assertEquals(ConnectionState.Armed, t.machine.state, "$event")
+        }
+    }
+
+    @Test
+    fun `find phone - a refused clock still rings, and is still recorded as the failure it was`() {
+        // §4.1: "whatever result says". The watch could not set its clock — Busy —
+        // but it is looking for this phone, and the two facts are read apart. The
+        // failure is counted like any other; the alarm starts like any other.
+        val t = harness()
+        t.runToAwaitingStatus()
+        assertEquals(
+            listOf(
+                "CancelTimers",
+                "PersistHealth",
+                "ReportExchange(WatchReportedFailure)",
+                "StartFindAlarm",
+                "ArmOperationTimeout(135000)",
+            ),
+            t.send(TransportEvent.NotificationReceived(findBusyStatus)).summary(),
+        )
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+        assertEquals(1, t.machine.health.consecutiveFailures)
+        assertEquals(6, t.machine.health.lastStatusResultCode)
+
+        // And when the watch hangs up, the phone still re-arms at once: a ring that
+        // ended is not a reason to wait 30 s before the watch can find us again.
+        val actions = t.send(TransportEvent.Disconnected(19))
+        assertTrue(actions.none { it is Action.ScheduleRetry })
+        assertEquals(ConnectionState.Armed, t.machine.state)
+        // The failure count survives for the next ordinary failure's backoff.
+        assertEquals(1, t.machine.health.consecutiveFailures)
+    }
+
+    @Test
+    fun `find phone - a notify that beats its own write callback still rings`() {
+        val t = harness()
+        t.send(
+            TransportEvent.Started,
+            TransportEvent.Connected(GATT_SUCCESS),
+            TransportEvent.ServicesDiscovered(GATT_SUCCESS),
+            TransportEvent.DescriptorWritten(GATT_SUCCESS),
+        )
+        assertEquals(ConnectionState.WritingTime, t.machine.state)
+        t.send(TransportEvent.NotificationReceived(findStatus))
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+        // The late write callback changes nothing — and in particular does not
+        // read as the dismiss write completing.
+        assertTrue(t.send(TransportEvent.CharacteristicWritten(GATT_SUCCESS)).isEmpty())
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+    }
+
+    @Test
+    fun `find phone - stray events while ringing change nothing`() {
+        val t = harness()
+        t.runToRinging()
+        val strays = listOf(
+            TransportEvent.Started,
+            TransportEvent.Connected(GATT_SUCCESS),
+            TransportEvent.ServicesDiscovered(GATT_SUCCESS),
+            TransportEvent.DescriptorWritten(GATT_SUCCESS),
+            TransportEvent.CharacteristicWritten(GATT_SUCCESS),
+            TransportEvent.NotificationReceived(okStatus),
+            TransportEvent.NotificationReceived(findStatus),
+            TransportEvent.NotificationReceived(ByteArray(3)),
+            TransportEvent.RetryTimerFired(t.pendingTimerToken ?: -1L),
+            TransportEvent.AdapterOn,
+            TransportEvent.PermissionGranted,
+        )
+        for (stray in strays) {
+            assertTrue(t.send(stray).isEmpty(), "$stray")
+            assertEquals(ConnectionState.Ringing, t.machine.state, "$stray")
+        }
+        assertEquals(1, t.reports.size, "a second flagged Status must not be double-counted")
+    }
+
+    @Test
+    fun `find phone - dismissing when nothing is ringing is ignored`() {
+        val armed = harness().also { it.send(TransportEvent.Started) }
+        assertTrue(armed.send(TransportEvent.FindDismissedOnPhone).isEmpty())
+        assertEquals(ConnectionState.Armed, armed.machine.state)
+
+        val awaiting = harness().also { it.runToAwaitingStatus() }
+        assertTrue(awaiting.send(TransportEvent.FindDismissedOnPhone).isEmpty())
+        assertEquals(ConnectionState.AwaitingStatus, awaiting.machine.state)
+
+        val settling = harness().also { it.runToAwaitingStatus(); it.send(TransportEvent.NotificationReceived(okStatus)) }
+        assertTrue(settling.send(TransportEvent.FindDismissedOnPhone).isEmpty())
+        assertIs<ConnectionState.Settling>(settling.machine.state)
+
+        // And twice in a row is once.
+        val dismissing = harness().also { it.runToRinging(); it.send(TransportEvent.FindDismissedOnPhone) }
+        assertTrue(dismissing.send(TransportEvent.FindDismissedOnPhone).isEmpty())
+        assertEquals(ConnectionState.DismissingFind, dismissing.machine.state)
+    }
+
+    @Test
+    fun `find phone - a plain Status still settles - the flag is what makes the difference`() {
+        // The control: identical bytes but for bit 0 of byte 10, and the machine
+        // takes the §4 path it always took.
+        val t = harness()
+        t.runToAwaitingStatus()
+        val actions = t.send(TransportEvent.NotificationReceived(okStatus))
+        assertTrue(actions.none { it == Action.StartFindAlarm })
+        assertIs<ConnectionState.Settling>(t.machine.state)
+        assertFalse(t.linkOpen)
+    }
+
     // ── Law 2's invariant, over everything reachable ─────────────────────────
 
     /**
@@ -838,6 +1096,8 @@ class ConnectionStateMachineTest {
         "Notify(ok)" to { _ -> TransportEvent.NotificationReceived(okStatus.copyOf()) },
         "Notify(busy)" to { _ -> TransportEvent.NotificationReceived(busyStatus.copyOf()) },
         "Notify(garbage)" to { _ -> TransportEvent.NotificationReceived(ByteArray(3)) },
+        "Notify(find)" to { _ -> TransportEvent.NotificationReceived(findStatus.copyOf()) },
+        "FindDismissed" to { _ -> TransportEvent.FindDismissedOnPhone },
         "Timeout(current)" to { t -> TransportEvent.OperationTimedOut(t.pendingTimerToken ?: -1L) },
         "Retry(current)" to { t -> TransportEvent.RetryTimerFired(t.pendingTimerToken ?: -1L) },
         "AdapterOff" to { _ -> TransportEvent.AdapterOff },
@@ -897,6 +1157,34 @@ class ConnectionStateMachineTest {
             ),
             ConnectionState.AwaitingStatus,
         ),
+        // The two find-phone states need the whole exchange plus the flagged
+        // Status to reach, so a triple from any earlier prefix visits them rarely
+        // or never; seeded like AwaitingStatus, for the same reason.
+        Triple(
+            "ringing",
+            listOf(
+                TransportEvent.Started,
+                TransportEvent.Connected(GATT_SUCCESS),
+                TransportEvent.ServicesDiscovered(GATT_SUCCESS),
+                TransportEvent.DescriptorWritten(GATT_SUCCESS),
+                TransportEvent.CharacteristicWritten(GATT_SUCCESS),
+                TransportEvent.NotificationReceived(findStatus),
+            ),
+            ConnectionState.Ringing,
+        ),
+        Triple(
+            "dismissing-find",
+            listOf(
+                TransportEvent.Started,
+                TransportEvent.Connected(GATT_SUCCESS),
+                TransportEvent.ServicesDiscovered(GATT_SUCCESS),
+                TransportEvent.DescriptorWritten(GATT_SUCCESS),
+                TransportEvent.CharacteristicWritten(GATT_SUCCESS),
+                TransportEvent.NotificationReceived(findStatus),
+                TransportEvent.FindDismissedOnPhone,
+            ),
+            ConnectionState.DismissingFind,
+        ),
     )
 
     @Test
@@ -933,7 +1221,8 @@ class ConnectionStateMachineTest {
         // a state and nothing says so.
         //
         // The threshold is well under what this walk actually achieves — the
-        // thinnest state, AwaitingStatus, is visited about 15,600 times — so an
+        // thinnest state, Settling, is visited about 3,600 times, and the two
+        // find-phone states 25,000 or more thanks to their own prefixes — so an
         // ordinary edit to the event list cannot trip it, while losing a state
         // to unreachability does.
         coverage.assertEveryStateVisited(atLeast = 2_000, walk = "the exhaustive triple walk")
@@ -955,9 +1244,19 @@ class ConnectionStateMachineTest {
             "DescriptorWritten(0)" to 6,
             "CharacteristicWritten(0)" to 6,
             "Retry(current)" to 6,
-            "Notify(ok)" to 4,
-            "AdapterOn" to 3,
-            "PermissionGranted" to 3,
+            // Settling needs a plain Ok inside the 15 s budget, and it now shares
+            // its two source states with the flagged Status below; six keeps it
+            // above the floor once the find events joined the pool.
+            "Notify(ok)" to 6,
+            // Heavy, like the exchange steps: Ringing is reached only through a
+            // flagged Status from WritingTime or AwaitingStatus, and DismissingFind
+            // only from Ringing, so both are two rare draws deep without these.
+            "Notify(find)" to 6,
+            "FindDismissed" to 8,
+            // Blocked is near-absorbing (see above); a little more weight on the
+            // two events that leave it buys every other state more of the stream.
+            "AdapterOn" to 4,
+            "PermissionGranted" to 4,
             "Notify(busy)" to 2,
             "Notify(garbage)" to 2,
             "Timeout(current)" to 2,
@@ -972,7 +1271,10 @@ class ConnectionStateMachineTest {
     fun `long random event streams always end somewhere the app can recover from`() {
         val coverage = StateCoverage()
         val random = Random(20260817)
-        repeat(1_500) { run ->
+        // 3,000 streams, up from 1,500 when the two find-phone states joined: each
+        // is one more rare draw deep than AwaitingStatus, and the floor below is
+        // meant to be cleared with room, not grazed.
+        repeat(3_000) { run ->
             val clock = FakeClock()
             val t = FakeTransport(ConnectionStateMachine(clock, Backoff(JitterSource.NONE)), coverage)
             // A few events before the service starts, so Idle is walked too and
@@ -1001,9 +1303,10 @@ class ConnectionStateMachineTest {
             }
             driveBackToArmed(t, "run $run")
         }
-        // Thinnest observed is AwaitingStatus at ~412 visits; the walk is
-        // deterministic (fixed seed, fixed weights), so this only moves when
-        // somebody edits the event list or the weights.
+        // Thinnest observed is DismissingFind at ~350 visits, then AwaitingStatus
+        // at ~500 and Settling at ~630; the walk is deterministic (fixed seed,
+        // fixed weights), so this only moves when somebody edits the event list,
+        // the weights or the stream count.
         coverage.assertEveryStateVisited(atLeast = 200, walk = "the random walk")
     }
 
@@ -1027,6 +1330,9 @@ class ConnectionStateMachineTest {
                 ConnectionState.AwaitingStatus,
                 // Settling is a waiting state too, and the same timer ends it.
                 is ConnectionState.Settling,
+                // As are a ring (the §5.2 backstop) and a dismiss (its write timeout).
+                ConnectionState.Ringing,
+                ConnectionState.DismissingFind,
                 -> t.fireOperationTimeout()
                 else -> fail("$label: stuck in ${t.machine.state}")
             }
@@ -1042,6 +1348,7 @@ private fun List<Action>.summary(): List<String> = map { action ->
         is Action.PersistHealth -> "PersistHealth"
         is Action.ReportExchange -> "ReportExchange(${action.outcome})"
         is Action.WriteTime -> "WriteTime(${action.payload.size})"
+        is Action.WriteFindDismiss -> "WriteFindDismiss(${action.payload.size})"
         else -> action.toString()
     }
 }

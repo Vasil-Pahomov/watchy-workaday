@@ -26,7 +26,11 @@ Workaday/
    sides have a unit test that reproduces them byte for byte. That test is what
    actually stops the two implementations from drifting — the prose does not.
 
-Status: **v1**, defined 17 Aug 2026.
+Status: **v1**, defined 17 Aug 2026. **Find phone added 3 Sep 2026** as v1
+material: one `Status` reserved byte became `flags`, and one write-only
+characteristic was added. No `PROTO_VERSION` bump, under rule 2's exception — an
+old receiver that ignores both still performs a correct time sync (§3.2, §3.3).
+The find-phone half is **not yet verified on hardware**; `BRINGUP.md` stage 5.
 
 **Verified on hardware 18 Aug 2026** — the watch's half only. A full §4 exchange
 completed against a third, independent implementation of this document (a PC BLE
@@ -89,11 +93,17 @@ arbitrary and permanent.
 | Service — Workaday Sync | `57444159-6461-4779-b0a3-1f4c7e25d908` |
 | Characteristic — **Time** (write) | `57444101-6461-4779-b0a3-1f4c7e25d908` |
 | Characteristic — **Status** (read + notify) | `57444102-6461-4779-b0a3-1f4c7e25d908` |
+| Characteristic — **Find** (write) | `57444103-6461-4779-b0a3-1f4c7e25d908` |
 | Descriptor — CCCD on Status | `00002902-0000-1000-8000-00805f9b34fb` (SIG standard) |
 
-`0x57444159` is `'WDAY'`; `0x57444101` / `…02` continue the family. This is a
-mnemonic, not a mechanism — do not derive new UUIDs by incrementing without
+`0x57444159` is `'WDAY'`; `0x57444101` / `…02` / `…03` continue the family. This
+is a mnemonic, not a mechanism — do not derive new UUIDs by incrementing without
 adding them to this table.
+
+`Find` was added 3 Sep 2026 for the find-phone feature (§4.1). Adding a
+characteristic does not bump `PROTO_VERSION`: a phone that does not know it never
+touches it, and a watch that lacks it fails the phone's dismiss write locally
+(§6.2), leaving the time sync — the only thing v1 promised — intact either way.
 
 ### 2.2 Advertising
 
@@ -112,8 +122,10 @@ v1 is **unbonded and unencrypted**. The GATT server accepts a Time write from
 any central.
 
 The accepted risk: someone within a few metres, during one of the watch's short
-windows, could set the watch's clock. That is the whole blast radius — there is
-no other writable characteristic and nothing readable that is private.
+windows, could set the watch's clock — or, during a find-phone session (§4.1),
+could write `Find` and end the search with "phone found". That is the whole
+blast radius — there is nothing readable that is private, and the second write is
+only accepted while the wearer is standing there watching the search run.
 
 The cost avoided: bonding state in the watch's NVS, a re-pair path on both sides
 for "the bond was dropped", and a longer first connection.
@@ -131,7 +143,7 @@ Little-endian throughout. All payloads are **fixed length** and a wrong length i
 rejected without being parsed — a receiver never reads past what it was given,
 and never guesses at a truncated packet.
 
-Both payloads are ≤ 20 bytes, so they fit the **default ATT MTU of 23** and
+All payloads are ≤ 20 bytes, so they fit the **default ATT MTU of 23** and
 **neither side negotiates the MTU**. Keep it that way: an MTU exchange is one
 more GATT operation, one more timeout, and one more failure mode, for no gain.
 
@@ -177,7 +189,16 @@ range check bites first and the overflow is unreachable. Stated so nobody
 | 3 | 1 | `battery_percent` | 0–100, or `0xFF` = unknown |
 | 4 | 4 | `applied_utc_epoch_s` | u32, what the watch actually committed; 0 if nothing was |
 | 8 | 2 | `fw_build` | u16, firmware build tag, diagnostic only |
-| 10 | 2 | `reserved` | sender writes 0 |
+| 10 | 1 | `flags` | bit 0 = `FIND_PHONE` (§4.1); bits 1–7 reserved, sender writes 0, receiver ignores |
+| 11 | 1 | `reserved` | sender writes 0 |
+
+`flags` was `reserved` until 3 Sep 2026 and is the one byte given meaning under
+rule 2's exception: a receiver that ignores it still performs a correct time sync,
+so `PROTO_VERSION` stays at 1. `FIND_PHONE` set means **the watch is running a
+find-phone session and asks the phone to make itself heard** for as long as this
+link lasts — it says nothing about `result`, which keeps its own meaning. The
+sender puts only the defined bit on the wire; undefined bits are never set, so a
+future receiver that gives one meaning cannot be triggered by this build.
 
 `result` codes:
 
@@ -202,6 +223,33 @@ read. Report `0xFF` rather than a stale guess if no sample has ever been taken.
 The **sender normalises**: anything outside 0–100 is encoded as `0xFF`, so a
 garbled sample never reaches the wire as a fourth kind of value the reader has to
 guess at. The reader may therefore treat 0–100 and `0xFF` as the complete domain.
+
+### 3.3 `Find` — phone → watch, write **with response**, exactly 4 bytes
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 1 | `proto_version` | `0x01` |
+| 1 | 1 | `msg_type` | `0x02` = FindDismiss |
+| 2 | 2 | `reserved` | sender writes 0, receiver ignores |
+
+The phone writes this once, when the user silences the find-phone alarm on the
+phone (§4.1). It means "the phone has been found, from the phone's side": the
+watch ends its search, shows that the phone stopped it, and hangs up.
+
+**Validation, performed by the watch:**
+
+| Check | Failure result |
+|---|---|
+| length == 4 | `BadLength` (1) |
+| `proto_version` == 1 | `BadVersion` (2) |
+| `msg_type` == 0x02 | `BadType` (5) |
+
+The codes are §3.2's, reused as a vocabulary; **a rejected `Find` write is not
+answered.** `Status` is notified only after a Time write (§4), and there is no
+other channel back, so a malformed dismiss is logged on the watch and ignored —
+the search continues and the phone keeps ringing until it either writes a valid
+frame, hangs up, or the watch's own cap ends the session. Outside a find-phone
+session a `Find` write of any shape is ignored.
 
 ---
 
@@ -272,6 +320,73 @@ Ordering rules that are not negotiable:
 - Either side may vanish at any point. Both sides' timeouts below are what makes
   that survivable rather than a hang.
 
+### 4.1 Find phone
+
+The wearer picks **Find phone** on the watch. The watch opens a **find session**:
+the same radio, the same service, but a different shape of window — it
+advertises continuously for up to **120 s** (§5.1), redraws its screen every few
+seconds with the elapsed time and an attempt counter, and ends only on one of
+the four endings below. The phone's half is the ordinary §4 exchange with one
+bit set in the answer.
+
+```
+watch                                                     phone
+  │  Find phone pressed → find session opens                 │  resting:
+  │  advertising ─────────────────────────────────────────►  │  pending autoConnect
+  │  (screen: "searching  0:05  try 2")                      │
+  │ ◄──────────────────── connect ───────────────────────────┤
+  │ ◄──── discover · CCCD(Status) · write Time ──────────────┤  §4, unchanged
+  │ ─────────── notify Status, flags.FIND_PHONE = 1 ────────►│
+  │  (screen: "phone ringing")                               │  alarm starts: sound + vibration
+  │                                                          │  link stays OPEN
+  │            … ringing, both sides waiting …               │
+  │                                                          │
+  │  ending (a): Back pressed, or 120 s cap                  │
+  │ ─────────────────── disconnect ─────────────────────────►│  alarm stops, re-arm at once
+  │                                                          │
+  │  ending (b): the user silences it on the phone           │
+  │ ◄──────────── write Find (4 B, FindDismiss) ─────────────┤  alarm already stopped
+  │  (screen: "phone found")                            │
+  │ ─────────────────── disconnect ─────────────────────────►│  close, re-arm at once
+```
+
+Rules:
+
+- **The phone's exchange is §4 verbatim.** Discover, enable notifications, write
+  Time once, wait for Status. A find session that reaches a phone therefore also
+  sets the watch's clock, and the outcome is recorded on the phone exactly as any
+  other exchange would be — health, backoff and the diagnostic record all see an
+  ordinary sync. The find session **spends the hourly timer** when it opens,
+  like the Sync item (§5.1).
+- **`flags.FIND_PHONE` in a well-formed Status frame starts the alarm, whatever
+  `result` says.** A clock that could not be set is no reason to leave the phone
+  lost. The phone keeps the link open instead of hanging up, and starts sound and
+  vibration on its alarm channel. A frame the phone cannot decode carries no
+  flag and is a failed exchange as before.
+- **The alarm sounds exactly while the find link is up.** It stops when the link
+  ends, for any reason: the watch hanging up because the wearer pressed Back or
+  the cap expired, or the link being lost. The phone does not need to know which.
+  Behind that sits the phone's own **ring backstop** (§5.2), longer than the
+  watch's cap, so the watch's hang-up is the normal ending and the backstop only
+  catches a disconnect that never arrived.
+- **Silencing on the phone writes `Find`, then closes.** The phone stops its alarm
+  the moment the user asks, writes one FindDismiss frame with response, and closes
+  the link when the write completes — success, failure or timeout alike. The watch
+  processes the write before the response leaves it, so by the time the phone
+  closes, the watch already knows the search ended on the phone and says so.
+- **After a find link ends the phone re-arms immediately** — no §4 settle and no
+  backoff. §4's one-exchange-per-window rule is about the watch's 12 s window,
+  and a watch in a find session is deliberately still advertising: if the link
+  was lost rather than ended, the watch is still looking and wants the phone back.
+  If the search ended, the watch has gone to sleep and the pending `autoConnect`
+  simply waits, as it always does.
+- **The watch re-advertises after a lost link** and counts a new attempt. It hangs
+  up explicitly when its session ends, and waits briefly for the link to drop so
+  the phone hears a disconnect rather than a supervision timeout.
+- **Only the wearer can start a search.** There is no phone-to-watch request, no
+  scan, and nothing in the advertisement changes: a phone learns of the search
+  from the Status frame and from nowhere else.
+
 ---
 
 ## 5. Timing — the load-bearing numbers
@@ -285,6 +400,15 @@ Ordering rules that are not negotiable:
 | Idle-after-connect timeout | **4 s** | connected but no valid write → tear down. The watchdog was fed on connect, so this is a fresh un-fed interval |
 | Absolute session cap | **12 s** | measured from session open to teardown, regardless of any activity. Belt to the two braces above |
 | User-initiated window | same limits | the Sync menu item opens a window immediately and resets the hourly timer |
+| **Find session cap** | **120 s** | §4.1. Measured from the session opening; ends the search whatever the link is doing, then the watch returns to the watchface. Also resets the hourly timer when it opens |
+| Find hang-up wait | ≤ 1 s | after requesting termination the watch waits for the link to drop, so the phone hears a disconnect and stops ringing at once. Watch-side only; not mirrored |
+
+The find session is **not** one long un-fed interval. It is a sequence of bounded
+waits, each no longer than the 6 s advertising timeout above, and each followed by
+a completed step — a panel redraw, a connect, a processed write — at which the
+watchdog is fed. So the 10 s watchdog margin below is the same for a two-minute
+search as for a six-second window; what a search costs is energy (§5.3), not
+reliability.
 
 **The watchdog is the binding constraint here, and it is easy to get wrong.**
 `board::power::kWatchdogTimeoutSeconds` is **10 s**. Firmware Law 2 forbids
@@ -375,6 +499,9 @@ the watch's schedule.
 | Backoff growth / cap | ×2, capped at **15 min** | comfortably under the watch's hourly window, so the app is always armed again before the next one |
 | Jitter | ±20 %, applied **after** the cap | so the worst case is 18 min, not 15. Still far under the hourly window, and the order is phone-side only — the watch cannot observe it, so it cannot desynchronise the two sides |
 | Backoff reset | **on a Status notify with `result == 0`** | not on connect |
+| **Find ring backstop** | **135 s** | §4.1. Longer than the watch's 120 s find cap, so the watch's hang-up is the normal ending and this is the safety net behind a disconnect that never arrived. When it fires the phone closes and re-arms |
+| Find dismiss write | 5 s | the per-operation timeout above, applied to the `Find` write; the phone closes and re-arms when the write completes or times out |
+| Re-arm after a find link | **immediate** | no settle, no backoff — see §4.1 for why the 12 s rule does not apply |
 
 ### 5.3 What this costs the watch — ⚠ estimates, not measurements
 
@@ -400,6 +527,21 @@ same change that adds the radio.
 For scale: continuous advertising would be ~20 mAh/day and would empty the cell
 in about ten days. That is why the window exists.
 
+**A find session (§4.1) is the most expensive single thing the wearer can ask
+for**, and it is priced separately because it is user-initiated and rare rather
+than scheduled:
+
+| Case | Estimate |
+|---|---|
+| Nobody connects: 120 s advertising @ ~11 mA, plus ~24 partial redraws | ~0.4 mAh |
+| Phone found at once and the search left to run out: 120 s connected, CPU awake @ ~40 mA | ~1.3 mAh |
+| The realistic search — found and stopped in 20–30 s | ~0.1–0.3 mAh |
+
+The worst case is about 14 % of a day's allowance, for one search. It is not in
+the daily ledger: it is bounded by the cap, it never opens on its own, and it is
+refused on a Low or Critical battery and in the degraded run modes exactly as a
+sync window is. `firmware/docs/power-budget.md` carries the row.
+
 ---
 
 ## 6. Failure handling
@@ -414,6 +556,12 @@ in about ten days. That is why the window exists.
 | `board::rtc::write()` fails | `RtcWriteFailed` (4). The clock keeps its old value; nothing is half-written |
 | BLE stack fails to init | log, skip the window, sleep normally. A radio that will not start must never cost a tick |
 | Anything at all | the path still ends in `board::power::deepSleep()`. The RAII session guard tears the radio down on **every** exit including an early return |
+| Find: nobody connects inside the cap | end the search, back to the watchface. **Not** a fault |
+| Find: link lost mid-search | re-advertise, count a new attempt, keep going until the cap |
+| Find: malformed `Find` write | ignore it, keep searching (§3.3) |
+| Find: Back pressed, or the cap | hang up, wait ≤ 1 s for the drop, then sleep. Back returns to the menu, the cap to the watchface |
+| Find: battery Low/Critical, or Safe/Recovery mode | refused before the radio comes up; the screen says why. Same gates as a sync window |
+| Find: BLE stack fails to init | the screen says the radio failed; sleep normally |
 
 ### 6.2 Phone
 
@@ -426,6 +574,11 @@ in about ten days. That is why the window exists.
 | Notify with `result != 0` | this is a **failed** exchange: backoff is not reset. Surface the code in the diagnostic UI. `BadVersion` in particular means the two sides have drifted and retrying will not help — show it, do not hot-loop |
 | Adapter off / airplane mode / permission revoked / unbonded | handled transition with a test. End state is always "armed and waiting" once the condition clears |
 | Any path whatsoever | ends armed and waiting. There is no terminal error state (`app/CLAUDE.md` Law 2) |
+| Find: disconnect while ringing | stop the alarm, `close()`, **re-arm immediately**. Normal, not a fault — the watch ended the search, or lost the link and is still looking |
+| Find: ring backstop fires | stop the alarm, `close()`, re-arm immediately |
+| Find: adapter off / permission revoked while ringing | stop the alarm, `close()`, park in the blocked state as for any other exchange |
+| Find: `Find` characteristic missing (an older watch) | the dismiss write fails locally; `close()`, re-arm. The alarm was already stopped by the user's tap |
+| Find: the phone is in "Total silence" Do Not Disturb | **platform limit, not handled.** The alarm uses the ALARM audio usage, which the default "priority only" mode lets through; a mode that blocks alarms mutes it, and no app can override that without notification-policy access the user would have to grant separately |
 
 ---
 
@@ -472,6 +625,42 @@ Result `Ok`, battery 78 %, applied epoch as above, `fw_build` 1.
 | `01 01 00 00 00 00 B4 00 00 00 00 00` (epoch 0 → 1970) | `OutOfRange` (3) |
 | `01 01 F0 FF 82 6A 59 03 00 00 00 00` (offset +857) | `OutOfRange` (3) |
 
+### 7.4 `Status` with `FIND_PHONE`
+
+§7.2's frame, sent from inside a find session (§4.1). Only byte 10 differs.
+
+```
+01 81 00 4E F0 FF 82 6A 01 00 01 00
+```
+
+The phone reads `findPhoneRequested = true`, and every other field exactly as in
+§7.2. A receiver that ignores byte 10 decodes it identically to §7.2 — which is
+what rule 2's exception requires.
+
+### 7.5 `Find`
+
+The one frame the phone sends on `Find` — FindDismiss, reserved bytes zero:
+
+```
+01 02 00 00
+```
+
+Decoded by the watch as a valid dismiss (`Ok`, 0).
+
+### 7.6 `Find` payloads that must be rejected
+
+| Bytes | Expected `result` |
+|---|---|
+| *(empty)* | `BadLength` (1) |
+| `01 02 00` (3 B) | `BadLength` (1) |
+| `01 02 00 00 00` (5 B) | `BadLength` (1) |
+| `02 02 00 00` | `BadVersion` (2) |
+| `01 01 00 00` (a Time `msg_type` on the Find characteristic) | `BadType` (5) |
+| `01 7F 00 00` | `BadType` (5) |
+
+And one that must be **accepted**: `01 02 DE AD` — the reserved bytes are ignored,
+as everywhere else in this document.
+
 ---
 
 ## 8. Where each side mirrors this
@@ -496,7 +685,13 @@ Listed so that "it's obviously needed" does not quietly become scope.
 
 - Bonding / encryption (§2.3) — the first thing to add.
 - Watch → phone data: step counts, battery history, health/fault counters.
-- Phone → watch: notifications, calendar, weather.
+- Phone → watch: notifications, calendar, weather. (`Find` is not this: it is
+  the phone answering a request the wearer made on the watch, not the phone
+  pushing anything of its own.)
+- Phone → watch "find my watch": the reverse of §4.1 would need the watch to
+  vibrate on a phone's say-so, which means a writable characteristic that costs a
+  motor pulse from any central within range while the watch is unbonded (§2.3).
+  After bonding, perhaps.
 - Any second peripheral, any device registry (`app/CLAUDE.md` Law 5).
 - MTU negotiation, long writes, indications instead of notifications.
 - OTA over BLE. `firmware/docs/backlog.md` item 9 reserves the slots; the

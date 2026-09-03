@@ -121,6 +121,27 @@ verify it and promote it to section 1 with its source.
   the same. Whether an OEM "put to sleep" sets the same flag is **not** verified
   and matters: if it does, no amount of watchdog will help and the per-vendor
   advice on the diagnostic screen is the only remedy.
+- **A foreground service cannot start an Activity from the background** (API
+  29+). The route to a screen on a locked, sleeping phone is a high-importance
+  notification with a **full-screen intent**, which the system launches itself —
+  with `showWhenLocked` / `turnScreenOn` on the Activity. This is what the
+  find-phone alarm uses (`FindPhoneAlarm`, `FindPhoneActivity`). It needs
+  `USE_FULL_SCREEN_INTENT`; on Android 14+ that permission is granted by default
+  to a sideloaded app and revocable in Settings
+  (`Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT`, API 34;
+  `NotificationManager.canUseFullScreenIntent()` reports it). Revoked, the
+  notification is downgraded to a heads-up with its actions intact — so the alarm
+  still sounds and the Stop button is still one tap away, but the screen does not
+  light up on its own. Not requested or surfaced by the app today.
+- **Do Not Disturb and the ALARM usage.** Audio on `USAGE_ALARM` and vibration
+  with the ALARM usage are let through by DND's default "priority only" mode,
+  which exempts alarms unless the user has turned that exemption off; "total
+  silence", or a rule that blocks alarms, mutes them, and `setStreamVolume` on
+  the alarm stream is refused rather than honoured in that mode. **No app can
+  override that** without `ACCESS_NOTIFICATION_POLICY`, which is a user-granted
+  special access the app does not ask for. `PROTOCOL.md` §6.2 records the
+  consequence as a platform limit: a phone in total silence is found by
+  vibration on its own, or not at all.
 - **OEM battery managers are the real adversary.** Xiaomi/MIUI, Huawei/EMUI,
   Samsung (device care / "put unused apps to sleep"), OnePlus/Oppo/Vivo and
   others kill background services regardless of the AOSP rules, and require

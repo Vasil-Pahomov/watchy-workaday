@@ -46,10 +46,29 @@ constexpr char kLocalName[] = "Workaday";
 // reaches the decoder and still comes back as BadLength.
 constexpr uint16_t kMaxPayloadLength = 20;
 
+// How long hangUp() waits for the link to actually drop after asking the host to
+// terminate it. A GAP terminate reaches the peer within a connection interval —
+// tens of milliseconds — and the phone's supervision timeout would otherwise end
+// the link seconds later with its alarm still sounding (PROTOCOL.md §4.1). Not a
+// §5 number: the phone never sees it, it bounds one local wait, and it lives
+// beside the effect it bounds like kMaxPayloadLength does. It is also a genuine
+// un-fed interval and is kept well inside §5.1's 6 s.
+constexpr uint32_t kHangUpWaitMs = 1000;
+
 constexpr EventBits_t kBitConnected = 1u << 0;
 constexpr EventBits_t kBitTimeWritten = 1u << 1;
 constexpr EventBits_t kBitDisconnected = 1u << 2;
-constexpr EventBits_t kBitAny = kBitConnected | kBitTimeWritten | kBitDisconnected;
+constexpr EventBits_t kBitFindWritten = 1u << 3;
+constexpr EventBits_t kBitAbort = 1u << 4;
+// What a sync window waits on, and what a find session waits on. Two masks
+// because a wait that wakes on a bit its classifier never consumes returns
+// instantly on every later call — the defect wait() describes below — and
+// core::SyncWindow has no signal for a Find write or a Back press. A Find write
+// during a sync window is therefore latched, ignored, and cleared by the next
+// constructor; PROTOCOL.md §3.3 says exactly that.
+constexpr EventBits_t kBitSync = kBitConnected | kBitTimeWritten | kBitDisconnected;
+constexpr EventBits_t kBitFind = kBitSync | kBitFindWritten | kBitAbort;
+constexpr EventBits_t kBitAny = kBitFind;
 
 // One window's worth of state, in static storage.
 //
@@ -70,6 +89,13 @@ struct Window {
   StaticEventGroup_t event_storage{};
   uint8_t payload[kMaxPayloadLength] = {};
   volatile uint16_t payload_length = 0;
+  // The Find characteristic's last write, kept apart from Time's: a phone that
+  // dismisses a search in the same breath as its Time write must not have one
+  // frame overwrite the other before the caller has read both.
+  uint8_t find_payload[kMaxPayloadLength] = {};
+  volatile uint16_t find_payload_length = 0;
+  // The live link, for hangUp(). BLE_HS_CONN_HANDLE_NONE when nothing is up.
+  volatile uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
   NimBLECharacteristic* status = nullptr;
 };
 
@@ -81,14 +107,32 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
   // for every event, so overriding both would report each one twice.
   void onConnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
     static_cast<void>(server);
-    static_cast<void>(desc);
+    g_window.conn_handle = desc->conn_handle;
     xEventGroupSetBits(g_window.events, kBitConnected);
   }
 
   void onDisconnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
     static_cast<void>(server);
     static_cast<void>(desc);
+    g_window.conn_handle = BLE_HS_CONN_HANDLE_NONE;
     xEventGroupSetBits(g_window.events, kBitDisconnected);
+  }
+};
+
+// PROTOCOL.md §3.3. Same shape as TimeCallbacks and the same honesty about the
+// length: what arrived, not what was copied, so core::decodeFindWrite() can
+// reject a 5-byte frame as BadLength instead of reading four bytes of it.
+class FindCallbacks final : public NimBLECharacteristicCallbacks {
+ public:
+  void onWrite(NimBLECharacteristic* characteristic) override {
+    const NimBLEAttValue value = characteristic->getValue();
+    const uint16_t length = value.length();
+    const uint16_t copied = length < kMaxPayloadLength ? length : kMaxPayloadLength;
+    if (copied != 0) {
+      memcpy(g_window.find_payload, value.data(), copied);
+    }
+    g_window.find_payload_length = length;
+    xEventGroupSetBits(g_window.events, kBitFindWritten);
   }
 };
 
@@ -114,6 +158,7 @@ class TimeCallbacks final : public NimBLECharacteristicCallbacks {
 // NimBLECharacteristic never frees its own.
 ServerCallbacks g_server_callbacks;
 TimeCallbacks g_time_callbacks;
+FindCallbacks g_find_callbacks;
 
 }  // namespace
 
@@ -121,6 +166,8 @@ Session::Session(const uint8_t* status, size_t status_length) {
   opened_ms_ = millis();
 
   g_window.payload_length = 0;
+  g_window.find_payload_length = 0;
+  g_window.conn_handle = BLE_HS_CONN_HANDLE_NONE;
   g_window.status = nullptr;
   if (g_window.events == nullptr) {
     g_window.events = xEventGroupCreateStatic(&g_window.event_storage);
@@ -204,6 +251,18 @@ Session::Session(const uint8_t* status, size_t status_length) {
   if (status != nullptr && status_length != 0 && status_length <= kMaxPayloadLength) {
     g_window.status->setValue(status, status_length);
   }
+
+  // §3.3, present in every window and not only in a find session: the service's
+  // shape is the contract, and a phone that discovers it once and caches the
+  // profile must find the same characteristics next time. A write that arrives
+  // outside a find session is latched and ignored — see kBitSync.
+  NimBLECharacteristic* find_chr = service->createCharacteristic(
+      core::kFindCharacteristicUuid, NIMBLE_PROPERTY::WRITE, kMaxPayloadLength);
+  if (find_chr == nullptr) {
+    WD_LOG("ble: Find characteristic failed");
+    return;
+  }
+  find_chr->setCallbacks(&g_find_callbacks);
 
   if (!service->start()) {
     WD_LOG("ble: service start failed");
@@ -384,7 +443,11 @@ core::SyncWindowEvent Session::wait() {
   // rather than the watch.
   static_assert(configTICK_RATE_HZ >= 1000,
                 "a sub-millisecond tick is required or short waits round to zero");
-  const EventBits_t bits = xEventGroupWaitBits(g_window.events, kBitAny, /*clearOnExit=*/pdFALSE,
+  // kBitSync, not kBitAny: a Find write or a Back press latched during a sync
+  // window has no consumer in core::SyncWindow, and waking on it would make every
+  // later wait return instantly — the spin documented below, arriving by a new
+  // door.
+  const EventBits_t bits = xEventGroupWaitBits(g_window.events, kBitSync, /*clearOnExit=*/pdFALSE,
                                                /*waitForAll=*/pdFALSE, pdMS_TO_TICKS(wait_ms));
 
   core::SyncWindowSignals signals;
@@ -463,6 +526,126 @@ bool Session::notify(const uint8_t* status, size_t length) {
   const bool subscribed = g_window.status->getSubscribedCount() != 0;
   g_window.status->notify(status, length);
   return subscribed;
+}
+
+// ── the find-phone session ───────────────────────────────────────────────────
+
+uint32_t Session::elapsedMs() const { return millis() - opened_ms_; }
+
+core::FindEvent Session::findWait(core::FindSession& session) {
+  if (!ok_ || g_window.events == nullptr) {
+    // No window ever opened. The caller checked ok() and never gets here; if it
+    // did, the honest answer is that the session is over before it started.
+    return core::FindEvent::Ended;
+  }
+
+  // The same shape as wait(), with core::FindSession owning the arithmetic: how
+  // long this round may block, and what the pending bits mean. All five bits this
+  // time — the two the sync wait deliberately ignores are exactly the two that
+  // end a search.
+  const uint32_t wait_ms = session.waitMs(elapsedMs());
+  const EventBits_t bits = xEventGroupWaitBits(g_window.events, kBitFind, /*clearOnExit=*/pdFALSE,
+                                               /*waitForAll=*/pdFALSE, pdMS_TO_TICKS(wait_ms));
+
+  core::FindSignals signals;
+  signals.connected = (bits & kBitConnected) != 0;
+  signals.time_written = (bits & kBitTimeWritten) != 0;
+  signals.disconnected = (bits & kBitDisconnected) != 0;
+  signals.find_written = (bits & kBitFindWritten) != 0;
+  signals.back_pressed = (bits & kBitAbort) != 0;
+
+  const core::FindEvent event = session.classify(elapsedMs(), signals);
+
+  // The same mechanical rule as wait(): a bit turned into a non-terminal event is
+  // spent and is cleared here, or the next call returns instantly on it. The
+  // disconnect is cleared on Disconnected whether or not core believed a link was
+  // up — core::FindSession consumes it either way for exactly this reason. Ended
+  // is latched and waitMs() is zero, so the terminal bits need no clearing.
+  switch (event) {
+    case core::FindEvent::Connected:
+      xEventGroupClearBits(g_window.events, kBitConnected);
+      break;
+    case core::FindEvent::TimeWritten:
+      xEventGroupClearBits(g_window.events, kBitTimeWritten);
+      break;
+    case core::FindEvent::FindWritten:
+      xEventGroupClearBits(g_window.events, kBitFindWritten);
+      break;
+    case core::FindEvent::Disconnected:
+      xEventGroupClearBits(g_window.events, kBitDisconnected);
+      break;
+    case core::FindEvent::RoundElapsed:
+    case core::FindEvent::Ended:
+    case core::FindEvent::StillWaiting:
+      break;
+  }
+  return event;
+}
+
+size_t Session::copyFindWrite(uint8_t* out, size_t cap) const {
+  const size_t length = g_window.find_payload_length;
+  if (out != nullptr) {
+    const size_t copied = length < cap ? length : cap;
+    const size_t available = copied < sizeof(g_window.find_payload)
+                                 ? copied
+                                 : sizeof(g_window.find_payload);
+    if (available != 0) {
+      memcpy(out, g_window.find_payload, available);
+    }
+  }
+  return length;
+}
+
+bool Session::restartAdvertising() {
+  if (!ok_) {
+    return false;
+  }
+  // The advertisement data, interval and scan response set in the constructor are
+  // still in the advertising object; only the "start" has to be repeated.
+  return NimBLEDevice::startAdvertising();
+}
+
+bool Session::hangUp() {
+  if (!ok_ || g_window.events == nullptr) {
+    return false;
+  }
+  NimBLEServer* server = NimBLEDevice::getServer();
+  const uint16_t handle = g_window.conn_handle;
+  if (server == nullptr || handle == BLE_HS_CONN_HANDLE_NONE) {
+    return true;  // nothing to hang up
+  }
+  // ble_gap_terminate() through the library: a plain host call with the host
+  // enabled, which is sound — the panic ble.h describes belongs to deinit(), which
+  // moves the host out of its enabled state, and nothing here does that.
+  xEventGroupClearBits(g_window.events, kBitDisconnected);
+  const int rc = server->disconnect(handle);
+  if (rc != 0) {
+    // Already gone, most likely — the peer dropped between the caller's last
+    // classify() and now. Either way there is no link left to wait for.
+    WD_LOG("ble: hang-up rc=%d", rc);
+    return g_window.conn_handle == BLE_HS_CONN_HANDLE_NONE;
+  }
+  // Blocked on the disconnect event, never polled, and bounded by kHangUpWaitMs
+  // so a peer that never acknowledges cannot hold the wake past the watchdog.
+  const EventBits_t bits = xEventGroupWaitBits(g_window.events, kBitDisconnected, /*clearOnExit=*/pdTRUE,
+                                               /*waitForAll=*/pdFALSE, pdMS_TO_TICKS(kHangUpWaitMs));
+  return (bits & kBitDisconnected) != 0;
+}
+
+// IRAM: this runs from the GPIO interrupt board::buttons attaches for the length
+// of a find session, and an ISR that lives in flash faults if it fires while the
+// cache is disabled. xEventGroupSetBitsFromISR() defers the actual set to the
+// FreeRTOS timer daemon — the FromISR-safe half of the event-group API, and the
+// framework builds with INCLUDE_xTimerPendFunctionCall, which it requires.
+IRAM_ATTR void Session::requestAbort() {
+  if (g_window.events == nullptr) {
+    return;
+  }
+  BaseType_t woken = pdFALSE;
+  xEventGroupSetBitsFromISR(g_window.events, kBitAbort, &woken);
+  if (woken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
 }
 
 }  // namespace ble

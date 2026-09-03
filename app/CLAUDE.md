@@ -180,10 +180,23 @@ the wire.
   side. That test, not the prose, is what stops the implementations drifting.
 
 **What the app does with the watch, v1:** push the phone's time to the watch on
-every connection, and read back the result. Nothing else — step counts,
-notifications and calendar data are explicitly out of scope (`PROTOCOL.md` §9).
-The watch opens a BLE window hourly, plus on demand from its own menu; it is
-absent from the air the rest of the time.
+every connection, and read back the result. And one thing more since 3 Sep 2026:
+when the result carries the `FIND_PHONE` flag the watch is looking for this
+phone, and the app keeps the link open and rings — sound on the alarm channel,
+vibration, a full-screen Stop button — until the watch hangs up or the user
+silences it, which writes one `Find` frame back (`PROTOCOL.md` §4.1). Nothing
+else — step counts, notifications and calendar data are explicitly out of scope
+(`PROTOCOL.md` §9). The watch opens a BLE window hourly, plus on demand from its
+own menu; it is absent from the air the rest of the time.
+
+The find-phone alarm bends one habit and it is worth naming: it is the one
+exchange after which the link is **not** closed. Every exit from that state
+stops the alarm and closes — the tests in `ConnectionStateMachineTest` hold that
+an alarm never outlives its link — and the phone re-arms at once rather than
+settling, because a watch in a search is still advertising and wants the phone
+back. It is also the one action that can be blocked by the platform rather than
+by us: a Do Not Disturb mode that mutes alarms mutes this, and
+`docs/background-execution.md` §2 says what an app can and cannot do about it.
 
 ## Open items — resolve before the code depends on them
 

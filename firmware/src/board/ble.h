@@ -78,6 +78,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "core/find_session.h"
 #include "core/sync_window.h"
 
 namespace board {
@@ -155,6 +156,62 @@ class Session {
   // this answer is worth recording; but the clock has already been set either
   // way, and the watch does not retry inside the window.
   bool notify(const uint8_t* status, size_t length);
+
+  // ── The find-phone session (PROTOCOL.md §4.1) ──────────────────────────────
+  //
+  // The same radio, the same service and the same constructor, driven by
+  // core::FindSession instead of core::SyncWindow. What differs is the wait:
+  // which signals it listens for, and whose arithmetic bounds it. Everything
+  // said above about the destructor and the watchdog still holds — a find
+  // session is a sequence of waits each no longer than a sync window's, and the
+  // caller feeds after each completed step exactly as it does in a window.
+  //
+  // The two waits listen on different bit sets, and that is load-bearing rather
+  // than tidy: the Back press and the Find write are latched as event bits, and
+  // a wait that woke on a bit its classifier never consumes would return
+  // instantly on every call for the rest of the window — the spin ble.cpp's
+  // wait() documents at length. So wait() blocks only on the three sync signals
+  // and findWait() on all five.
+
+  // Block until the next find-session event, or until the current round's wait
+  // expires — whichever comes first. The signals handed to classify() include the
+  // Back press requestAbort() latched, which is how the wearer ends a search
+  // without the watch ever polling a pin. Same contract as wait(): non-terminal
+  // events are consumed here, Ended is latched, StillWaiting means wait again
+  // and do not feed.
+  core::FindEvent findWait(core::FindSession& session);
+
+  // Copy the bytes of the most recent FindWritten event into `out`, at most `cap`
+  // of them, and return the length the central actually wrote — the same contract
+  // as copyTimeWrite(), for the same reason: core::decodeFindWrite() rejects any
+  // length but 4 before reading the buffer.
+  size_t copyFindWrite(uint8_t* out, size_t cap) const;
+
+  // Advertise again after a central dropped the link. advertiseOnDisconnect is
+  // off for the sync window's sake (see the constructor), so a find session that
+  // wants the phone back after a lost link has to ask. Returns false if the stack
+  // refused, which the caller logs and the round clock rides over.
+  bool restartAdvertising();
+
+  // Terminate the link, if one is up, and wait — bounded, on the disconnect
+  // event, never polling — for it to actually drop. §4.1: the phone stops ringing
+  // when the link ends, and a link merely abandoned to deep sleep ends for the
+  // phone as a supervision timeout seconds later, with the alarm still going.
+  // Returns whether the drop was seen inside the bound.
+  bool hangUp();
+
+  // ISR-safe: latch the wearer's Back press into the signals findWait() blocks
+  // on. The one way a GPIO interrupt reaches the event group; wired by
+  // board::buttons::attachPressInterrupt() from main.cpp for the length of a
+  // find session and detached after. Idempotent, so a bouncing contact costs
+  // nothing, and harmless outside a session, where nothing waits on the bit and
+  // the next constructor clears it.
+  static void requestAbort();
+
+  // Milliseconds since advertising started — the same reading findWait() hands
+  // core::FindSession, exposed for the screen's elapsed counter so the two cannot
+  // disagree.
+  uint32_t elapsedMs() const;
 
  private:
   bool ok_ = false;

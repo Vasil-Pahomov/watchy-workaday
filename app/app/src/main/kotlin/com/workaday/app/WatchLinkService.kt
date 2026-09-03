@@ -67,6 +67,7 @@ class WatchLinkService : Service() {
         val link: WatchLink,
         val operationTimer: OperationTimer,
         val retryAlarm: RetryAlarm,
+        val alarm: FindPhoneAlarm,
     )
 
     private lateinit var handlerThread: HandlerThread
@@ -136,6 +137,7 @@ class WatchLinkService : Service() {
         isRunning = true
         notificationManager = getSystemService(NotificationManager::class.java)
         ServiceNotification.ensureChannel(this, notificationManager)
+        FindPhoneAlarm.ensureChannel(this, notificationManager)
 
         handlerThread = HandlerThread(THREAD_NAME).apply { start() }
         handler = Handler(handlerThread.looper)
@@ -158,6 +160,11 @@ class WatchLinkService : Service() {
         }
         // Law 1. The watchdog exists because not every OEM honours it.
         handler.post(::onStarted)
+        // The one event that reaches the machine from the UI rather than from the
+        // radio: the Stop button on the find-phone screen or its notification
+        // (PROTOCOL.md §4.1). Posted after onStarted for FIFO's sake; the machine
+        // ignores it outside Ringing, so a stale tap costs nothing.
+        if (intent?.action == ACTION_DISMISS_FIND) post(TransportEvent.FindDismissedOnPhone)
         return START_STICKY
     }
 
@@ -219,6 +226,7 @@ class WatchLinkService : Service() {
             ),
             operationTimer = operationTimer,
             retryAlarm = RetryAlarm(applicationContext, getSystemService(AlarmManager::class.java)),
+            alarm = FindPhoneAlarm(applicationContext, handler),
         )
     }
 
@@ -319,6 +327,12 @@ class WatchLinkService : Service() {
             Action.DiscoverServices -> runtime.link.discoverServices()
             Action.EnableStatusNotifications -> runtime.link.enableStatusNotifications()
             is Action.WriteTime -> runtime.link.writeTime(action.payload)
+            is Action.WriteFindDismiss -> runtime.link.writeFindDismiss(action.payload)
+
+            // PROTOCOL.md §4.1. Sound, vibration and the Stop screen, started and
+            // stopped together; the machine pairs every start with a stop.
+            Action.StartFindAlarm -> runtime.alarm.start()
+            Action.StopFindAlarm -> runtime.alarm.stop()
 
             is Action.ArmOperationTimeout ->
                 runtime.operationTimer.arm(action.timeoutMillis, action.token)
@@ -357,6 +371,9 @@ class WatchLinkService : Service() {
         runtime.retryAlarm.cancel()
         // Law 2's "on every path including cancellation". This is that path.
         runtime.link.close()
+        // And the alarm, for the same reason: a service being destroyed mid-ring
+        // must not leave the phone sounding with nothing left to stop it.
+        runtime.alarm.stop()
         logInfo("service stopped; health ${runtime.machine.health}")
     }
 
@@ -463,6 +480,35 @@ class WatchLinkService : Service() {
 
     companion object {
         private const val THREAD_NAME = "workaday-link"
+
+        /** The Stop button's intent action (PROTOCOL.md §4.1). */
+        const val ACTION_DISMISS_FIND = "com.workaday.app.action.DISMISS_FIND"
+
+        /**
+         * The intent the find-phone alarm's Stop delivers, from its notification
+         * action and from [FindPhoneActivity] alike. One definition, so the two
+         * routes cannot drift apart.
+         */
+        fun dismissFindIntent(context: Context): Intent =
+            Intent(context, WatchLinkService::class.java).setAction(ACTION_DISMISS_FIND)
+
+        /**
+         * The user silenced the find-phone alarm on the phone.
+         *
+         * `startForegroundService` on a service that is already in the foreground
+         * — it is, while it rings — simply delivers another `onStartCommand`, and
+         * from a foreground Activity or a notification action the start is
+         * permitted regardless. The exception is caught for the reason [start]
+         * catches it: this runs from a tap and a crash here would take the screen
+         * offering to stop the alarm down with it.
+         */
+        fun dismissFind(context: Context) {
+            try {
+                context.startForegroundService(dismissFindIntent(context))
+            } catch (e: ForegroundServiceStartNotAllowedException) {
+                Log.e(LOG_TAG, "not allowed to reach the service to stop the alarm", e)
+            }
+        }
 
         /**
          * Whether the service is up **in this process**.

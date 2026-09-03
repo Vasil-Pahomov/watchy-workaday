@@ -32,37 +32,44 @@ struct Composed {
   // off, and WorkadaySmall is sized so that every label below still clears the
   // right edge — see tools/make_time_font.py, where those strings are the input.
   char sync[24];
+  // The Find phone screen's second and third lines: what the search is doing or
+  // how it ended, and "m:ss  try N" while it runs. Every string either can hold
+  // is in tools/make_time_font.py's list; the widest, "no phone found", inks
+  // 154 px against the 180 px a banner is budgeted.
+  char find_status[24];
+  char find_progress[24];
   core::Screen screen;
   uint8_t menu_index;
   uint8_t battery_percent;
   bool inverted;
 };
 
-Composed g_composed = {"--:--", "", "", "", "", "", "", core::Screen::Watchface, 0, 0, false};
+Composed g_composed = {"--:--", "", "", "", "", "", "", "", "",
+                       core::Screen::Watchface, 0, 0, false};
 
-constexpr uint8_t kStepsMenuIndex = 0;  // must track kFixedMenuItems below
+constexpr uint8_t kStepsMenuIndex = 0;  // must track kMenuLabels below
 
 // Only items that do something. "Battery", "Set Time" and "About" used to sit
 // here and drew "not implemented" when opened, which is a menu that wastes the
 // wearer's time to tell them so. They come back when they do something — see
 // docs/backlog.md items 1 and 11.
 //
-// The Sync item's index is core::kSyncMenuIndex, not a local constant: main.cpp
-// reads the same number to tell that a press asked for a radio window, and one of
-// the two places would drift.
-//
-// The theme item is deliberately absent: its label is a function of the theme
-// rather than a constant, so menuLabel() below owns it and this array holds only
-// the items whose label never changes.
-const char* const kFixedMenuItems[] = {"Steps", "Sync"};
-constexpr uint8_t kFixedMenuItemCount = sizeof(kFixedMenuItems) / sizeof(kFixedMenuItems[0]);
-static_assert(kFixedMenuItemCount + 1 == core::kMenuItemCount,
-              "every menu item needs a label: the fixed ones here, plus the theme item");
-// Which is only true while the theme item is the last one. It is, because items
-// are appended and never inserted (core/ui_state.h) — and if that ever stopped
-// being true, the labels below would silently shift by one.
-static_assert(core::kThemeMenuIndex == kFixedMenuItemCount,
-              "the theme item is the one appended after the fixed labels");
+// One slot per core index, so the table cannot drift from the indices main.cpp
+// compares a press against: the Sync item is core::kSyncMenuIndex and the Find
+// phone item is core::kFindPhoneMenuIndex, both read from core rather than
+// retyped here. The theme item's slot is empty on purpose: its label is a
+// function of the theme rather than a constant, so menuLabel() supplies it.
+constexpr const char* const kMenuLabels[core::kMenuItemCount] = {
+    "Steps",     // kStepsMenuIndex
+    "Sync",      // core::kSyncMenuIndex
+    nullptr,     // core::kThemeMenuIndex — themeLabel()
+    "Find phone",  // core::kFindPhoneMenuIndex
+};
+static_assert(kMenuLabels[kStepsMenuIndex] != nullptr, "the Steps item needs a label");
+static_assert(kMenuLabels[core::kSyncMenuIndex] != nullptr, "the Sync item needs a label");
+static_assert(kMenuLabels[core::kThemeMenuIndex] == nullptr,
+              "the theme item's label is a function of the theme; menuLabel() supplies it");
+static_assert(kMenuLabels[core::kFindPhoneMenuIndex] != nullptr, "the Find phone item needs a label");
 
 // The theme item's label states what the watch is doing NOW, not what the press
 // will do. "White on black" is today's default face, and pressing it leaves the
@@ -78,7 +85,48 @@ const char* menuLabel(uint8_t index, bool inverted) {
   if (index == core::kThemeMenuIndex) {
     return themeLabel(inverted);
   }
-  return index < kFixedMenuItemCount ? kFixedMenuItems[index] : "";
+  if (index >= core::kMenuItemCount || kMenuLabels[index] == nullptr) {
+    return "";
+  }
+  return kMenuLabels[index];
+}
+
+// What the search is doing, while it runs. Presentation, like syncLabel().
+const char* findPhaseLabel(core::FindPhase phase) {
+  switch (phase) {
+    case core::FindPhase::Searching:
+      return "searching";
+    case core::FindPhase::Connected:
+      return "connected";
+    case core::FindPhase::Ringing:
+      return "phone ringing";
+  }
+  return "";
+}
+
+// How the last search ended, for the wakes after it. TimedOut and BackPressed
+// leave the screen (core::applyFindOutcome), so their words are only ever shown
+// if that rule is broken; they get honest ones rather than blanks.
+const char* findOutcomeLabel(core::FindOutcome outcome) {
+  switch (outcome) {
+    case core::FindOutcome::InProgress:
+      // Stored while a session runs and never shown then (find_live is true).
+      // Seen off a live session only after a wake died inside a search.
+      return "interrupted";
+    case core::FindOutcome::BackPressed:
+      return "stopped";
+    case core::FindOutcome::TimedOut:
+      return "no phone found";
+    case core::FindOutcome::DismissedByPhone:
+      return "phone found";
+    case core::FindOutcome::RadioFailed:
+      return "radio failed";
+    case core::FindOutcome::BatteryTooLow:
+      return "battery too low";
+    case core::FindOutcome::NotAvailable:
+      return "not available";
+  }
+  return "";
 }
 
 // PROTOCOL.md §3.2's result codes, in the wearer's words rather than the wire's.
@@ -176,6 +224,21 @@ uint32_t compose(const Snapshot& snapshot) {
   snprintf(g_composed.sync, sizeof(g_composed.sync), "%s",
            syncLabel(snapshot.sync_result, snapshot.sync_applied));
 
+  if (snapshot.find_live) {
+    snprintf(g_composed.find_status, sizeof(g_composed.find_status), "%s",
+             findPhaseLabel(snapshot.find_phase));
+    // Elapsed as m:ss and the attempt counter, the two numbers the wearer asked
+    // to see while the search runs. Widest reachable: "2:00  try 255", 13 chars.
+    snprintf(g_composed.find_progress, sizeof(g_composed.find_progress), "%u:%02u  try %u",
+             static_cast<unsigned>(snapshot.find_elapsed_s / 60u),
+             static_cast<unsigned>(snapshot.find_elapsed_s % 60u),
+             static_cast<unsigned>(snapshot.find_attempts));
+  } else {
+    snprintf(g_composed.find_status, sizeof(g_composed.find_status), "%s",
+             findOutcomeLabel(snapshot.find_outcome));
+    g_composed.find_progress[0] = '\0';
+  }
+
   // Hash exactly what will be visible — nothing more, or the screen redraws for
   // invisible changes; nothing less, or a real change is missed and the panel shows
   // stale pixels.
@@ -212,6 +275,12 @@ uint32_t compose(const Snapshot& snapshot) {
     // and must never repaint the watchface — that would be a ~0.003 mAh refresh
     // for something not on screen.
     hash = core::hashCombine(hash, g_composed.sync);
+    // The Find phone screen's two lines, for the same reason. While a search runs
+    // the elapsed time changes every round, so every round repaints — which is
+    // what the wearer is watching for; when nothing else moved, it is the one
+    // thing on the panel that did.
+    hash = core::hashCombine(hash, g_composed.find_status);
+    hash = core::hashCombine(hash, g_composed.find_progress);
   }
   return hash;
 }
@@ -237,6 +306,13 @@ void draw() {
           g_composed.menu_index < core::kMenuItemCount ? g_composed.menu_index : 0;
       if (index == kStepsMenuIndex && g_composed.steps[0] != '\0') {
         board::display::drawBanner(g_composed.steps, g_composed.steps_detail);
+      } else if (index == core::kFindPhoneMenuIndex) {
+        // Redrawn every few seconds while a search runs (main.cpp's find session
+        // paints it directly), then left showing how it ended. The third line is
+        // empty once the search is over, and drawBanner() leaves the row blank.
+        board::display::drawBanner(menuLabel(index, g_composed.inverted), g_composed.find_status,
+                                   g_composed.find_progress[0] != '\0' ? g_composed.find_progress
+                                                                       : nullptr);
       } else if (index == core::kSyncMenuIndex) {
         // What the *previous* window achieved. This screen is painted before the
         // window this press opened has run — the radio comes up after the panel
@@ -247,9 +323,10 @@ void draw() {
         // not in the budget.
         board::display::drawBanner(menuLabel(index, g_composed.inverted), g_composed.sync);
       } else {
-        // kStepsMenuIndex, the only other item. An empty string means the counter
-        // is not running at all, which is a different thing from "no step data"
-        // (the sensor answered and the reading was stale) and needs its own words.
+        // kStepsMenuIndex, the only other item that opens a screen. An empty
+        // string means the counter is not running at all, which is a different
+        // thing from "no step data" (the sensor answered and the reading was
+        // stale) and needs its own words.
         board::display::drawBanner(
             g_composed.steps[0] != '\0' ? g_composed.steps : "steps off",
             g_composed.steps_detail);

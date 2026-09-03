@@ -50,6 +50,14 @@ object WatchProtocol {
     /** Characteristic — Status. Watch → phone, read + notify. */
     val STATUS_CHARACTERISTIC_UUID: UUID = UUID.fromString("57444102-6461-4779-b0a3-1f4c7e25d908")
 
+    /**
+     * Characteristic — Find. Phone → watch, write **with response** (§3.3): the
+     * one frame the phone sends when the user silences a find-phone alarm on the
+     * phone (§4.1). Added without a `PROTO_VERSION` bump; an older watch simply
+     * lacks it, and the write then fails locally (§6.2).
+     */
+    val FIND_CHARACTERISTIC_UUID: UUID = UUID.fromString("57444103-6461-4779-b0a3-1f4c7e25d908")
+
     /** The SIG-standard Client Characteristic Configuration descriptor on Status. */
     val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
@@ -68,6 +76,9 @@ object WatchProtocol {
     /** §3.1 `msg_type` for a Time write. */
     const val MSG_TYPE_SET_TIME: Int = 0x01
 
+    /** §3.3 `msg_type` for a Find write: FindDismiss. */
+    const val MSG_TYPE_FIND_DISMISS: Int = 0x02
+
     /** §3.2 `msg_type` for a Status frame. */
     const val MSG_TYPE_SYNC_RESULT: Int = 0x81
 
@@ -77,8 +88,18 @@ object WatchProtocol {
     /** §3.2. Exactly this, never more, never less. */
     const val STATUS_PAYLOAD_LENGTH: Int = 12
 
+    /** §3.3. Exactly this, never more, never less. */
+    const val FIND_PAYLOAD_LENGTH: Int = 4
+
     /** §3.2 `battery_percent` sentinel: no sample has ever been taken. */
     const val BATTERY_PERCENT_UNKNOWN: Int = 0xFF
+
+    /**
+     * §3.2 `flags`, bit 0: the watch is running a find-phone session and asks the
+     * phone to make itself heard for as long as this link lasts (§4.1). The only
+     * defined bit; bits 1–7 are reserved and the decoder ignores them.
+     */
+    const val STATUS_FLAG_FIND_PHONE: Int = 0x01
 
     // ── §5.2 Timing — the load-bearing numbers ───────────────────────────────
     //
@@ -146,7 +167,23 @@ object WatchProtocol {
      */
     const val SYNC_WINDOW_INTERVAL_SECONDS: Long = 60L * 60L
 
-    // ── Field offsets (§3.1, §3.2) ───────────────────────────────────────────
+    /**
+     * §5.1's **find session cap** — how long the watch searches before it gives up
+     * on its own. A watch-side number, mirrored under the same §8 rule as
+     * [WATCH_SESSION_CAP_MS]: the phone's [FIND_RING_BACKSTOP_MS] is chosen against
+     * it, and `WatchProtocolTest` pins the relationship.
+     */
+    const val WATCH_FIND_PHONE_TIMEOUT_MS: Long = 120_000
+
+    /**
+     * §5.2's **ring backstop**: how long the phone will sound a find-phone alarm
+     * with no word from the watch. Longer than [WATCH_FIND_PHONE_TIMEOUT_MS] so the
+     * watch's hang-up is the normal ending and this is the net behind a disconnect
+     * that never arrived. When it fires the phone closes and re-arms.
+     */
+    const val FIND_RING_BACKSTOP_MS: Long = 135_000
+
+    // ── Field offsets (§3.1, §3.2, §3.3) ─────────────────────────────────────
     //
     // Private: §8 says no field offset appears anywhere else in the app, and the
     // cheapest way to enforce that is to make it impossible to reference one.
@@ -161,6 +198,7 @@ object WatchProtocol {
     private const val STATUS_OFFSET_BATTERY = 3
     private const val STATUS_OFFSET_APPLIED_EPOCH = 4
     private const val STATUS_OFFSET_FW_BUILD = 8
+    private const val STATUS_OFFSET_FLAGS = 10
 
     /** Largest value a `u32` field can carry. */
     private const val MAX_U32: Long = 0xFFFF_FFFFL
@@ -220,6 +258,22 @@ object WatchProtocol {
     fun cccdEnableNotificationValue(): ByteArray = byteArrayOf(0x01, 0x00)
 
     /**
+     * Encode the §3.3 FindDismiss frame: exactly [FIND_PAYLOAD_LENGTH] bytes, the
+     * reserved two written as zero, a fresh array each call for the reason
+     * [encodeTime] returns one.
+     *
+     * There is nothing to parameterise. The frame has one meaning — "the phone
+     * has been found, from the phone's side" — and the watch decides what to do
+     * about it.
+     */
+    fun encodeFindDismiss(): ByteArray {
+        val out = ByteArray(FIND_PAYLOAD_LENGTH)
+        out[OFFSET_PROTO_VERSION] = PROTO_VERSION.toByte()
+        out[OFFSET_MSG_TYPE] = MSG_TYPE_FIND_DISMISS.toByte()
+        return out
+    }
+
+    /**
      * Decode a §3.2 Status payload.
      *
      * Order of checks mirrors the firmware's decoder — length, version, type —
@@ -261,10 +315,15 @@ object WatchProtocol {
                 batteryPercent = rawBattery.takeIf { it in 0..100 },
                 appliedUtcEpochSeconds = payload.u32Le(STATUS_OFFSET_APPLIED_EPOCH),
                 fwBuild = payload.u16Le(STATUS_OFFSET_FW_BUILD),
+                // §3.2 flags, bit 0 and only bit 0: the other seven are reserved
+                // and a later v1.x may give one meaning, so this build must not
+                // react to them. The masked test is what makes that true.
+                findPhoneRequested =
+                    (payload[STATUS_OFFSET_FLAGS].toInt() and STATUS_FLAG_FIND_PHONE) != 0,
             ),
         )
-        // `reserved` (offsets 10..11) is deliberately not read — §3 says the
-        // receiver ignores it, which is what lets a later v1.x give it meaning.
+        // `reserved` (offset 11) is deliberately not read — §3 says the receiver
+        // ignores it, which is what let offset 10 become `flags` without a bump.
     }
 }
 
@@ -339,6 +398,13 @@ class WatchStatus(
     val appliedUtcEpochSeconds: Long,
     /** Firmware build tag. Diagnostic only — nothing branches on it. */
     val fwBuild: Int,
+    /**
+     * §3.2 `flags.FIND_PHONE`: the watch is running a find-phone session and asks
+     * the phone to make itself heard for as long as this link lasts (§4.1).
+     * Independent of [result] on purpose — a clock that could not be set is no
+     * reason to leave the phone lost — and the state machine reads the two apart.
+     */
+    val findPhoneRequested: Boolean = false,
 ) {
     /**
      * §4: a notify with `result == 0` is *the* definition of a successful
@@ -350,7 +416,8 @@ class WatchStatus(
     override fun toString(): String =
         "WatchStatus(result=${result ?: "unknown"}($resultCode), " +
             "battery=${batteryPercent ?: "unknown"}, " +
-            "applied=$appliedUtcEpochSeconds, fwBuild=$fwBuild)"
+            "applied=$appliedUtcEpochSeconds, fwBuild=$fwBuild" +
+            (if (findPhoneRequested) ", findPhone" else "") + ")"
 }
 
 /** Why a Status frame was thrown away without being interpreted. */

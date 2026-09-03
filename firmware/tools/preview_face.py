@@ -246,7 +246,7 @@ def face(k, f, time="14:32", date="Wed 12 Aug", steps="8432", battery=76, mode="
     return fb
 
 
-def menu(k, f, items=("Steps", "Sync", "White on black"), selected=0):
+def menu(k, f, items=("Steps", "Sync", "White on black", "Find phone"), selected=0):
     fb = blank(k)
     for i, item in enumerate(items):
         y = 20 + i * 30
@@ -269,11 +269,16 @@ def inverted(fb):
     return [[PAPER if v else INK for v in row] for row in fb]
 
 
-def banner(k, f, line1, line2, battery=76):
+def banner(k, f, line1, line2, line3=None, battery=76):
+    """drawBanner(): up to three lines of the small face, baselines 95, 120, 145.
+    The third is the Find phone screen's progress line and is blank everywhere
+    else, exactly as the firmware leaves that row."""
     fb = blank(k)
     draw_gauge(fb, k, battery)
     draw_text(fb, f["WorkadaySmall"], line1, 10, 95, label="banner:" + line1)
     draw_text(fb, f["WorkadaySmall"], line2, 10, 120, label="banner:" + line2)
+    if line3:
+        draw_text(fb, f["WorkadaySmall"], line3, 10, 145, label="banner:" + line3)
     return fb
 
 
@@ -396,14 +401,23 @@ def every_screen(k, f):
         ("menu", menu(k, f)),
         ("menu, Sync selected", menu(k, f, selected=1)),
         ("menu, theme item selected", menu(k, f, selected=2)),
+        ("menu, Find phone selected", menu(k, f, selected=3)),
         ("Steps screen", banner(k, f, "8432 steps", "yesterday 11207")),
         ("Sync screen", banner(k, f, "Sync", "last sync ok")),
+        # The Find phone screen (PROTOCOL.md section 4.1), redrawn every few
+        # seconds while the search runs, then left showing how it ended. The
+        # third line is the widest reachable one: two minutes, and an attempt
+        # counter saturated at 255.
+        ("Find phone, searching", banner(k, f, "Find phone", "searching", "0:35  try 8")),
+        ("Find phone, ringing", banner(k, f, "Find phone", "phone ringing", "2:00  try 255")),
+        ("Find phone, found on the phone", banner(k, f, "Find phone", "phone found")),
+        ("Find phone, refused", banner(k, f, "Find phone", "battery too low", battery=4)),
         # The same two screens the other way round. The label states what the
         # watch is doing now rather than what the press will do, so it reads
         # "Black on white" here and "White on black" above.
         ("black on white", inverted(face(k, f, "14:32", "Wed 12 Aug", "8432", 76))),
         ("black on white, menu",
-         inverted(menu(k, f, items=("Steps", "Sync", "Black on white"), selected=2))),
+         inverted(menu(k, f, items=("Steps", "Sync", "Black on white", "Find phone"), selected=2))),
     ]
 
 

@@ -36,6 +36,14 @@ enum class ServiceNotice {
 
     /** The runtime Bluetooth permission is missing. The user has to grant it. */
     PermissionMissing,
+
+    /**
+     * The watch is running a find-phone search and this phone is making itself
+     * heard (PROTOCOL.md §4.1). The alarm itself — sound, vibration, the
+     * full-screen Stop button — is a separate notification; this is the always-on
+     * one saying why the phone is ringing.
+     */
+    FindingPhone,
 }
 
 /**
@@ -67,4 +75,11 @@ fun serviceNoticeFor(state: ConnectionState): ServiceNotice = when (state) {
     ConnectionState.WritingTime,
     ConnectionState.AwaitingStatus,
     -> ServiceNotice.Exchanging
+
+    // The phone is ringing, or the user has just silenced it and the watch is
+    // being told. One notice for both: the dismissal takes at most a few seconds
+    // and the caption is about why the phone rang, not about the write.
+    ConnectionState.Ringing,
+    ConnectionState.DismissingFind,
+    -> ServiceNotice.FindingPhone
 }

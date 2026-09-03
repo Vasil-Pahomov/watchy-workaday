@@ -83,6 +83,9 @@ internal object ServiceNotification {
             ServiceNotice.RetryingSoon -> builder.plain(context, R.string.notice_retrying)
             ServiceNotice.BluetoothOff -> builder.plain(context, R.string.notice_bluetooth_off)
             ServiceNotice.PermissionMissing -> builder.plain(context, R.string.notice_permission_missing)
+            // The alarm itself — sound, vibration, the Stop button — is
+            // FindPhoneAlarm's own notification. This one only says why.
+            ServiceNotice.FindingPhone -> builder.plain(context, R.string.notice_finding_phone)
         }.build()
     }
 

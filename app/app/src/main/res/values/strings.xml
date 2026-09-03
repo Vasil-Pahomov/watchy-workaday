@@ -14,6 +14,16 @@
     <string name="notice_retrying">Retrying shortly</string>
     <string name="notice_bluetooth_off">Bluetooth is off</string>
     <string name="notice_permission_missing">Nearby devices permission needed</string>
+    <string name="notice_finding_phone">Your watch is looking for this phone</string>
+
+    <!-- The find-phone alarm (PROTOCOL.md §4.1): its own channel, its own
+         notification, and the full-screen Stop screen. -->
+    <string name="find_channel_name">Find phone</string>
+    <string name="find_channel_description">Sounds when you look for this phone from your Workaday watch. It rings like an alarm, so Do Not Disturb\'s usual quiet does not silence it.</string>
+    <string name="find_title">Your watch is looking for this phone</string>
+    <string name="find_text">Tap Stop to silence it. The watch will show that the phone was found.</string>
+    <string name="find_stop">Stop</string>
+    <string name="find_screen_hint">The alarm also stops on its own when the watch\'s search ends — press Back on the watch, or wait two minutes.</string>
 
     <!-- ServiceNotice.Waiting, which is the state the app is in almost all of the
          time. One per RestingSummary case, decided in core/RestingSummary.kt.

@@ -74,18 +74,24 @@ void test_uuids_match_the_document(void) {
                            core::kTimeCharacteristicUuid);
   TEST_ASSERT_EQUAL_STRING("57444102-6461-4779-b0a3-1f4c7e25d908",
                            core::kStatusCharacteristicUuid);
+  TEST_ASSERT_EQUAL_STRING("57444103-6461-4779-b0a3-1f4c7e25d908",
+                           core::kFindCharacteristicUuid);
   TEST_ASSERT_EQUAL_STRING("00002902-0000-1000-8000-00805f9b34fb", core::kCccdUuid);
 }
 
 void test_protocol_constants_match_the_document(void) {
   TEST_ASSERT_EQUAL_UINT8(0x01, core::kProtocolVersion);
   TEST_ASSERT_EQUAL_UINT8(0x01, core::kMsgTypeSetTime);
+  TEST_ASSERT_EQUAL_UINT8(0x02, core::kMsgTypeFindDismiss);
   TEST_ASSERT_EQUAL_UINT8(0x81, core::kMsgTypeSyncResult);
   TEST_ASSERT_EQUAL_UINT32(12, static_cast<uint32_t>(core::kTimePayloadLength));
   TEST_ASSERT_EQUAL_UINT32(12, static_cast<uint32_t>(core::kStatusPayloadLength));
+  TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(core::kFindPayloadLength));
   TEST_ASSERT_EQUAL_INT16(-840, core::kMinUtcOffsetMinutes);
   TEST_ASSERT_EQUAL_INT16(840, core::kMaxUtcOffsetMinutes);
   TEST_ASSERT_EQUAL_UINT8(0xFF, core::kBatteryPercentUnknown);
+  // §3.2 flags, bit 0. The only defined bit; a second one is a PROTOCOL.md change.
+  TEST_ASSERT_EQUAL_UINT8(0x01, core::kStatusFlagFindPhone);
 }
 
 // §3.2's result table. These numbers are on the wire; renumbering the enum would
@@ -107,6 +113,10 @@ void test_timing_constants_match_the_document(void) {
   TEST_ASSERT_EQUAL_UINT16(6000, core::kAdvertiseTimeoutMs);
   TEST_ASSERT_EQUAL_UINT16(4000, core::kIdleAfterConnectTimeoutMs);
   TEST_ASSERT_EQUAL_UINT16(12000, core::kSessionCapMs);
+  // §5.1's find session cap. The phone mirrors it as the floor of its ring
+  // backstop, so a change here without the document changes which side ends a
+  // ring that the disconnect never reached.
+  TEST_ASSERT_EQUAL_UINT32(120000, core::kFindPhoneTimeoutMs);
 }
 
 // The constraint that makes those numbers what they are. The task watchdog is
@@ -193,6 +203,145 @@ void test_golden_status_vector_encodes(void) {
 
   TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
   TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenStatus, encoded, 12);
+}
+
+// ── PROTOCOL.md §7.4 — the golden Status vector with FIND_PHONE ──────────────
+//
+//   §7.2's frame, sent from inside a find session. Only byte 10 differs.
+//   01 81 00 4E F0 FF 82 6A 01 00 01 00
+static const uint8_t kGoldenFindStatus[12] = {0x01, 0x81, 0x00, 0x4E, 0xF0, 0xFF,
+                                              0x82, 0x6A, 0x01, 0x00, 0x01, 0x00};
+
+void test_golden_find_status_vector_encodes(void) {
+  Status status;
+  status.result = SyncResult::Ok;
+  status.battery_percent = 78;
+  status.applied_utc_epoch_s = 1786970096u;
+  status.fw_build = 1;
+  status.flags = core::kStatusFlagFindPhone;
+
+  uint8_t encoded[12];
+  for (size_t i = 0; i < sizeof(encoded); ++i) {
+    encoded[i] = 0xAA;
+  }
+  TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenFindStatus, encoded, 12);
+}
+
+// §3.2: flags default to zero, so the §7.2 vector — which is what every sync
+// window sends — is untouched by the byte gaining a meaning. Pinned separately
+// from the §7.2 test so that a default that drifted to "find phone" would fail a
+// test named for it rather than one named for the golden vector.
+void test_status_flags_default_to_zero(void) {
+  const Status fresh;
+  TEST_ASSERT_EQUAL_HEX8(0, fresh.flags);
+}
+
+// §3.2: "The sender puts only the defined bit on the wire." A garbled flags field
+// must not reach a receiver that has since given bit 5 a meaning.
+void test_undefined_flag_bits_never_reach_the_wire(void) {
+  Status status;
+  status.result = SyncResult::Ok;
+  status.battery_percent = 78;
+  status.applied_utc_epoch_s = 1786970096u;
+  status.fw_build = 1;
+  uint8_t encoded[12] = {};
+
+  status.flags = 0xFF;
+  TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenFindStatus, encoded, 12);
+
+  status.flags = 0xFE;  // every bit but the defined one
+  TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenStatus, encoded, 12);
+}
+
+// ── PROTOCOL.md §7.5 — the golden Find vector ────────────────────────────────
+//
+//   The one frame the phone sends on Find — FindDismiss, reserved bytes zero:
+//   01 02 00 00
+static const uint8_t kGoldenFindDismiss[4] = {0x01, 0x02, 0x00, 0x00};
+
+void test_golden_find_vector_decodes(void) {
+  TEST_ASSERT_EQUAL_INT(
+      resultAsInt(SyncResult::Ok),
+      resultAsInt(core::decodeFindWrite(kGoldenFindDismiss, sizeof(kGoldenFindDismiss))));
+}
+
+// ── PROTOCOL.md §7.6 — Find payloads that must be rejected ───────────────────
+//
+// One assertion per row of the table, bytes transcribed literally.
+
+void test_reject_find_wrong_lengths(void) {
+  const uint8_t nothing[1] = {0x00};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadLength),
+                        resultAsInt(core::decodeFindWrite(nothing, 0)));
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadLength),
+                        resultAsInt(core::decodeFindWrite(nullptr, 0)));
+  // A null pointer with a plausible length is still nothing to parse.
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadLength),
+                        resultAsInt(core::decodeFindWrite(nullptr, 4)));
+
+  // 01 02 00
+  const uint8_t three[3] = {0x01, 0x02, 0x00};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadLength),
+                        resultAsInt(core::decodeFindWrite(three, sizeof(three))));
+
+  // 01 02 00 00 00
+  const uint8_t five[5] = {0x01, 0x02, 0x00, 0x00, 0x00};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadLength),
+                        resultAsInt(core::decodeFindWrite(five, sizeof(five))));
+
+  // Every length from 0 to 20 but 4, so the check is on the number and not on
+  // the three rows above happening to bracket it.
+  uint8_t padded[20] = {0x01, 0x02, 0x00, 0x00};
+  for (size_t length = 0; length <= sizeof(padded); ++length) {
+    if (length == core::kFindPayloadLength) {
+      continue;
+    }
+    TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadLength),
+                          resultAsInt(core::decodeFindWrite(padded, length)));
+  }
+}
+
+void test_reject_find_wrong_version(void) {
+  // 02 02 00 00
+  const uint8_t payload[4] = {0x02, 0x02, 0x00, 0x00};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadVersion),
+                        resultAsInt(core::decodeFindWrite(payload, sizeof(payload))));
+}
+
+void test_reject_find_wrong_type(void) {
+  // 01 01 00 00 — a Time msg_type arriving on the Find characteristic.
+  const uint8_t time_type[4] = {0x01, 0x01, 0x00, 0x00};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadType),
+                        resultAsInt(core::decodeFindWrite(time_type, sizeof(time_type))));
+  // 01 7F 00 00
+  const uint8_t unknown[4] = {0x01, 0x7F, 0x00, 0x00};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadType),
+                        resultAsInt(core::decodeFindWrite(unknown, sizeof(unknown))));
+}
+
+// §7.6's last line: the reserved bytes are ignored, as everywhere else.
+void test_find_reserved_bytes_are_ignored(void) {
+  const uint8_t payload[4] = {0x01, 0x02, 0xDE, 0xAD};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::Ok),
+                        resultAsInt(core::decodeFindWrite(payload, sizeof(payload))));
+}
+
+// §3.3's table is ordered like §3.1's, and for the same reason: a frame with two
+// faults names the same one on both sides.
+void test_find_validation_follows_the_documented_order(void) {
+  // Wrong version *and* wrong type -> BadVersion.
+  const uint8_t version_and_type[4] = {0x02, 0x7F, 0x00, 0x00};
+  TEST_ASSERT_EQUAL_INT(
+      resultAsInt(SyncResult::BadVersion),
+      resultAsInt(core::decodeFindWrite(version_and_type, sizeof(version_and_type))));
+  // Wrong length beats every content fault.
+  const uint8_t short_and_wrong[2] = {0x02, 0x7F};
+  TEST_ASSERT_EQUAL_INT(
+      resultAsInt(SyncResult::BadLength),
+      resultAsInt(core::decodeFindWrite(short_and_wrong, sizeof(short_and_wrong))));
 }
 
 // Not from §7 — constructed from §3.2's field table — but it is what actually
@@ -619,6 +768,15 @@ int main(void) {
   RUN_TEST(test_golden_time_vector_decodes);
   RUN_TEST(test_payload_builder_matches_golden_bytes);
   RUN_TEST(test_golden_status_vector_encodes);
+  RUN_TEST(test_golden_find_status_vector_encodes);
+  RUN_TEST(test_status_flags_default_to_zero);
+  RUN_TEST(test_undefined_flag_bits_never_reach_the_wire);
+  RUN_TEST(test_golden_find_vector_decodes);
+  RUN_TEST(test_reject_find_wrong_lengths);
+  RUN_TEST(test_reject_find_wrong_version);
+  RUN_TEST(test_reject_find_wrong_type);
+  RUN_TEST(test_find_reserved_bytes_are_ignored);
+  RUN_TEST(test_find_validation_follows_the_documented_order);
   RUN_TEST(test_rejection_status_encodes);
   RUN_TEST(test_status_battery_extremes);
   RUN_TEST(test_status_max_fields_encode);

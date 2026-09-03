@@ -191,6 +191,42 @@ The user-initiated window (the Sync menu item) costs exactly the same ~0.031 mAh
 and **spends the same hour**, so pressing Sync repeatedly cannot outrun the
 schedule — the second press inside an hour is refused.
 
+#### The find-phone session ⚠
+
+The one thing in this firmware that stays awake for minutes rather than
+milliseconds, and the most expensive single press the wearer can make
+(`PROTOCOL.md` §4.1, §5.3). It is user-initiated, never scheduled, bounded by a
+120 s cap, refused on a Low or Critical battery and in Safe or Recovery mode by
+the same gates as a sync window — and it spends the hourly sync timer when it
+opens, since a phone that turns up performs the sync exchange on the way.
+
+| Case | Estimate |
+|---|---|
+| Nobody connects: 120 s advertising @ ~11 mA, plus ~24 partial redraws @ 0.003 mAh | ~0.4 mAh |
+| Phone found at once, search left to run out: 120 s of live link, CPU awake, @ ~40 mA | ~1.3 mAh |
+| The realistic search — found and stopped inside 20–30 s | ~0.1–0.3 mAh |
+| The radio idle between the session closing and the final frame (~0.3 s) | ~0.003 mAh, inside the rows above |
+
+The worst case is ~14 % of a day's allowance, in one press. It is **not carried
+as a recurring cost** in the ledger, for the reason the pathological sync window
+is not: budgeting it would assume a wearer who loses their phone every day and
+never presses Back, and the realistic search costs about what ten minute-ticks
+do. What keeps it from compounding is the same pair of limits the sync window
+has — the cap is absolute, and the hourly timer is spent on opening — plus one
+of its own: a search does not re-run on the next wake, because the request lives
+on the wake that made it (`core::SyncContext::user_requested`) and the outcome
+the screen shows afterwards is a message, not a queued retry.
+
+Where the ~40 mA comes from: the ESP32 with the BLE controller enabled and the CPU
+awake in a FreeRTOS wait. The Arduino framework does not light-sleep the CPU
+between events, so a connected-and-waiting watch draws roughly what an
+exchanging one does. Un-metered, like every figure in this file.
+
+The redraws are partial refreshes and count against the ghosting cadence in
+`core::refresh_policy`; a full-length search spends about a third of the
+60-partials budget, and the next full refresh arrives that much sooner. Priced
+above, and small.
+
 ## First field run — what it settles, and what it cannot
 
 One watch ran about a week on a charge and came back with roughly a third of the
@@ -307,6 +343,7 @@ Update this table in the same change that adds or alters a wake source.
 | BMA423 config upload | ≤ 3 per power cycle | ~0.007 | ~0 | ~0.02 mAh once, then never; capped by `core::kMaxAccelConfigAttempts` |
 | BMA423 park after give-up | ≤ 3 per power cycle | ~0 | 0 | 2 register transactions; reclaims the sensor's ~0.34 mAh/day |
 | BLE sync window | 24/day | 0.031 | ~0.9 | extends an existing tick, adds no wake; hourly gate in `core::sync_policy`, hard 6/4/12 s timeouts |
+| Find-phone session | rare, user-initiated | 0.1–1.3 | ~0 | `PROTOCOL.md` §4.1; up to 120 s awake at radio current, 5 s redraw cadence; same gates as the sync window and spends its hour; not carried as recurring — see the section above |
 | Radio — WiFi/NTP | none | 0.1 | 0 | not built; the clock comes from the phone over BLE |
 | **Total** | | | **~6.9** | allowance 9.5 → **~27 % headroom** |
 

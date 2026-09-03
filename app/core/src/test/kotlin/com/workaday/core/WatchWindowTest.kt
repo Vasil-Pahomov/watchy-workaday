@@ -113,8 +113,14 @@ class WatchWindowTest {
                 is ConnectionState.Settling -> if (!advanceToTimer(w, state.delayMillis)) return
                 is ConnectionState.WaitingForRetry -> if (!advanceToTimer(w, state.delayMillis)) return
 
-                ConnectionState.Idle, is ConnectionState.Blocked ->
-                    fail("unreachable in this simulation: $state")
+                // The find-phone states need a Status with FIND_PHONE set, and this
+                // watch only ever answers §7.2's plain frame — so they are as
+                // unreachable here as Idle and Blocked.
+                ConnectionState.Idle,
+                is ConnectionState.Blocked,
+                ConnectionState.Ringing,
+                ConnectionState.DismissingFind,
+                -> fail("unreachable in this simulation: $state")
             }
         }
     }

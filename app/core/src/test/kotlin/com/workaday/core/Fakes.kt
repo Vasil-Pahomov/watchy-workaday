@@ -22,6 +22,8 @@ enum class StateLabel {
     EnablingNotifications,
     WritingTime,
     AwaitingStatus,
+    Ringing,
+    DismissingFind,
 }
 
 fun ConnectionState.label(): StateLabel = when (this) {
@@ -34,6 +36,8 @@ fun ConnectionState.label(): StateLabel = when (this) {
     ConnectionState.EnablingNotifications -> StateLabel.EnablingNotifications
     ConnectionState.WritingTime -> StateLabel.WritingTime
     ConnectionState.AwaitingStatus -> StateLabel.AwaitingStatus
+    ConnectionState.Ringing -> StateLabel.Ringing
+    ConnectionState.DismissingFind -> StateLabel.DismissingFind
 }
 
 /**
@@ -104,7 +108,10 @@ class FakeClock(
  *   the leak that eventually makes every connection fail with no visible cause;
  * - which timer is pending, so "no operation outstanding without a timeout" is
  *   checkable rather than asserted in prose;
- * - how many Time writes happened in one connection (PROTOCOL.md §4 allows one).
+ * - how many Time writes happened in one connection (PROTOCOL.md §4 allows one);
+ * - whether the find-phone alarm is sounding, refusing a second start or a stop
+ *   with nothing sounding, and holding it to exactly the Ringing state — an
+ *   alarm that outlives its link is the §4.1 failure nobody wants to hear.
  */
 class FakeTransport(
     val machine: ConnectionStateMachine,
@@ -117,6 +124,16 @@ class FakeTransport(
     val persisted = mutableListOf<HealthSnapshot>()
 
     var linkOpen: Boolean = false
+        private set
+
+    /** The find-phone alarm, as the Android layer would hold it: on or off. */
+    var alarmOn: Boolean = false
+        private set
+
+    var findWritesThisConnection: Int = 0
+        private set
+
+    var lastFindPayload: ByteArray? = null
         private set
 
     var pendingTimerToken: Long? = null
@@ -193,6 +210,7 @@ class FakeTransport(
                 expect(!linkOpen) { "connectGatt() while a GATT client is still open" }
                 linkOpen = true
                 timeWritesThisConnection = 0
+                findWritesThisConnection = 0
             }
 
             Action.CloseConnection -> {
@@ -210,6 +228,26 @@ class FakeTransport(
                 expect(timeWritesThisConnection == 1) {
                     "PROTOCOL.md section 4 allows one Time push per connection, saw $timeWritesThisConnection"
                 }
+            }
+
+            is Action.WriteFindDismiss -> {
+                expect(linkOpen) { "Find write issued with no open client" }
+                findWritesThisConnection++
+                lastFindPayload = action.payload
+                expect(findWritesThisConnection == 1) {
+                    "PROTOCOL.md section 4.1 writes Find once per link, saw $findWritesThisConnection"
+                }
+            }
+
+            Action.StartFindAlarm -> {
+                expect(!alarmOn) { "the find-phone alarm was started while already sounding" }
+                expect(linkOpen) { "the find-phone alarm was started with no link to the watch" }
+                alarmOn = true
+            }
+
+            Action.StopFindAlarm -> {
+                expect(alarmOn) { "the find-phone alarm was stopped while not sounding" }
+                alarmOn = false
             }
 
             is Action.ArmOperationTimeout -> {
@@ -238,6 +276,12 @@ class FakeTransport(
      */
     private fun assertInvariant() {
         coverage?.record(machine.state)
+        // PROTOCOL.md §4.1: the alarm sounds exactly while the find link is up and
+        // the machine is Ringing. Anywhere else, an alarm still going is an alarm
+        // that outlived its link.
+        expect(alarmOn == (machine.state == ConnectionState.Ringing)) {
+            if (alarmOn) "the find-phone alarm is sounding outside Ringing" else "Ringing with no alarm sounding"
+        }
         when (val state = machine.state) {
             ConnectionState.Idle -> {
                 expect(!linkOpen) { "idle but holding a GATT client" }
@@ -283,6 +327,22 @@ class FakeTransport(
             -> {
                 expect(linkOpen) { "mid-exchange with no GATT client" }
                 expect(pendingTimerToken != null) { "GATT operation outstanding with no timeout armed" }
+            }
+
+            ConnectionState.Ringing -> {
+                // The link is held open on purpose, and the §5.2 ring backstop is
+                // what bounds it: a ring with no timer is an alarm that only the
+                // watch can end, and the watch may be out of range.
+                expect(linkOpen) { "ringing with no link to the watch" }
+                expect(pendingTimerToken != null && !pendingTimerIsRetry) { "ringing with no backstop armed" }
+                expect(pendingTimerDelayMillis == com.workaday.core.protocol.WatchProtocol.FIND_RING_BACKSTOP_MS) {
+                    "ring backstop is $pendingTimerDelayMillis, not the section 5.2 value"
+                }
+            }
+
+            ConnectionState.DismissingFind -> {
+                expect(linkOpen) { "dismissing with no link to write on" }
+                expect(pendingTimerToken != null && !pendingTimerIsRetry) { "Find write outstanding with no timeout armed" }
             }
         }
     }

@@ -11,8 +11,9 @@ void tearDown(void) {}
 
 static int screenAsInt(Screen screen) { return static_cast<int>(screen); }
 
-// The last item that opens an app screen. Not simply kMenuItemCount - 1 any more:
-// the theme item is appended last and acts in place, so a test about entering an
+// The last item that opens an app screen. Not simply kMenuItemCount - 1: the
+// theme item acts in place rather than entering an app, and whether it happens to
+// be last depends on what has been appended since, so a test about entering an
 // app has to walk to something that enters one. Computed rather than written down
 // for the reason the comment in test_menu_button_enters_the_selected_app gives —
 // a literal here stops meaning anything the next time the menu changes shape.
@@ -176,17 +177,65 @@ void test_reaching_sync_and_activating_it(void) {
 }
 
 void test_the_short_way_round_no_longer_reaches_sync(void) {
-  // Up from the first item wraps to the last, which used to be Sync and is now
-  // the theme item. Worth pinning rather than deleting with the old assertion: it
-  // is the one press whose meaning the append silently changed, and what it must
-  // NOT do is power up the radio.
+  // Up from the first item wraps to the last, which used to be Sync, was then the
+  // theme item, and is now Find phone. Worth pinning rather than deleting with
+  // each append: it is the one press whose meaning an append silently changes,
+  // and what it must NOT do is open a *sync* window — the Find phone item asks
+  // for the radio too, but for a different session, and main.cpp tells the two
+  // apart by exactly the comparison below.
   UiState state;
   core::handleButton(state, ButtonId::Menu);
   TEST_ASSERT_TRUE(core::handleButton(state, ButtonId::Up));
   TEST_ASSERT_EQUAL_UINT8(core::kMenuItemCount - 1, state.menu_index);
-  TEST_ASSERT_EQUAL_UINT8(core::kThemeMenuIndex, state.menu_index);
+  TEST_ASSERT_EQUAL_UINT8(core::kFindPhoneMenuIndex, state.menu_index);
 
   TEST_ASSERT_TRUE(core::activatedMenuItem(state, ButtonId::Menu) != core::kSyncMenuIndex);
+}
+
+// ── the Find phone item ──────────────────────────────────────────────────────
+
+void test_reaching_find_phone_and_activating_it(void) {
+  // The wearer's route to a search: open the menu, walk to Find phone, press Menu.
+  UiState state = menuAt(core::kFindPhoneMenuIndex);
+  TEST_ASSERT_EQUAL_UINT8(core::kFindPhoneMenuIndex, state.menu_index);
+  TEST_ASSERT_EQUAL_UINT8(core::kFindPhoneMenuIndex, core::activatedMenuItem(state, ButtonId::Menu));
+}
+
+void test_the_find_phone_item_opens_a_screen(void) {
+  // Unlike the theme item it enters an app: the search has a screen — elapsed
+  // time, attempt counter, how it ended — and Back from it goes to the menu.
+  UiState state = menuAt(core::kFindPhoneMenuIndex);
+  TEST_ASSERT_TRUE(core::handleButton(state, ButtonId::Menu));
+  TEST_ASSERT_EQUAL_INT(screenAsInt(Screen::App), screenAsInt(state.screen));
+  TEST_ASSERT_EQUAL_UINT8(core::kFindPhoneMenuIndex, state.app_index);
+
+  TEST_ASSERT_TRUE(core::handleButton(state, ButtonId::Back));
+  TEST_ASSERT_EQUAL_INT(screenAsInt(Screen::Menu), screenAsInt(state.screen));
+  TEST_ASSERT_EQUAL_UINT8(core::kFindPhoneMenuIndex, state.menu_index);
+}
+
+void test_the_find_phone_item_is_neither_sync_nor_theme(void) {
+  // main.cpp compares one activated index against two constants and does two
+  // different things with the radio. The three items must stay three numbers.
+  const UiState state = menuAt(core::kFindPhoneMenuIndex);
+  const uint8_t activated = core::activatedMenuItem(state, ButtonId::Menu);
+  TEST_ASSERT_EQUAL_UINT8(core::kFindPhoneMenuIndex, activated);
+  TEST_ASSERT_TRUE(activated != core::kSyncMenuIndex);
+  TEST_ASSERT_TRUE(activated != core::kThemeMenuIndex);
+  TEST_ASSERT_FALSE(core::themeAfterButton(state, ButtonId::Menu, false).changed);
+}
+
+void test_a_find_screen_left_open_asks_for_nothing(void) {
+  // Same rule as the Sync screen: once entered, no press — and no tick — may ask
+  // for another search. Only the Menu press that enters it counts, which is what
+  // keeps a "phone found" screen from re-running the radio on every wake.
+  const ButtonId all[] = {ButtonId::None, ButtonId::Menu, ButtonId::Back, ButtonId::Up,
+                          ButtonId::Down};
+  for (const ButtonId button : all) {
+    UiState state = menuAt(core::kFindPhoneMenuIndex);
+    core::handleButton(state, ButtonId::Menu);  // now on the Find phone screen
+    TEST_ASSERT_EQUAL_UINT8(core::kNoMenuItem, core::activatedMenuItem(state, button));
+  }
 }
 
 void test_nothing_is_activated_from_the_watchface(void) {
@@ -263,10 +312,14 @@ void test_activation_does_not_mutate_the_state(void) {
 
 // ── the display theme (the item that acts in place) ──────────────────────────
 
-void test_the_theme_item_is_appended_last(void) {
+void test_items_are_appended_never_inserted(void) {
   // Appended, never inserted: an item added in the middle would change what an
-  // already-persisted menu_index means (core/ui_state.h).
-  TEST_ASSERT_EQUAL_UINT8(core::kMenuItemCount - 1, core::kThemeMenuIndex);
+  // already-persisted menu_index means (core/ui_state.h). So every index is
+  // pinned where it was first written, and the newest item is the last one.
+  TEST_ASSERT_EQUAL_UINT8(1, core::kSyncMenuIndex);
+  TEST_ASSERT_EQUAL_UINT8(2, core::kThemeMenuIndex);
+  TEST_ASSERT_EQUAL_UINT8(3, core::kFindPhoneMenuIndex);
+  TEST_ASSERT_EQUAL_UINT8(core::kMenuItemCount - 1, core::kFindPhoneMenuIndex);
   TEST_ASSERT_TRUE(core::kThemeMenuIndex != core::kSyncMenuIndex);
   TEST_ASSERT_LESS_THAN_UINT8(core::kMenuItemCount, core::kThemeMenuIndex);
 }
@@ -555,7 +608,12 @@ int main(void) {
   RUN_TEST(test_a_corrupt_menu_index_activates_nothing);
   RUN_TEST(test_activation_does_not_mutate_the_state);
 
-  RUN_TEST(test_the_theme_item_is_appended_last);
+  RUN_TEST(test_reaching_find_phone_and_activating_it);
+  RUN_TEST(test_the_find_phone_item_opens_a_screen);
+  RUN_TEST(test_the_find_phone_item_is_neither_sync_nor_theme);
+  RUN_TEST(test_a_find_screen_left_open_asks_for_nothing);
+
+  RUN_TEST(test_items_are_appended_never_inserted);
   RUN_TEST(test_the_theme_item_does_not_leave_the_menu);
   RUN_TEST(test_the_theme_item_flips_the_theme);
   RUN_TEST(test_pressing_it_twice_returns_to_where_it_started);

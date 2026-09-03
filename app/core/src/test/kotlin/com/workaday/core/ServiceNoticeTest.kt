@@ -22,6 +22,10 @@ class ServiceNoticeTest {
             ConnectionState.WritingTime to ServiceNotice.Exchanging,
             ConnectionState.AwaitingStatus to ServiceNotice.Exchanging,
             ConnectionState.Blocked(adapterOff = true, permissionMissing = false) to ServiceNotice.BluetoothOff,
+            // The phone is ringing for the watch, and the few seconds after the
+            // user silences it read the same: the caption is about why it rang.
+            ConnectionState.Ringing to ServiceNotice.FindingPhone,
+            ConnectionState.DismissingFind to ServiceNotice.FindingPhone,
         )
         for ((state, notice) in expected) {
             assertEquals(notice, serviceNoticeFor(state), "$state")

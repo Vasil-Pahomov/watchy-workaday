@@ -18,7 +18,13 @@ The failure we refuse to ship: a frozen watch needing a manual reset.
       must happen on the task the watchdog is subscribed to rather than in a radio
       callback. Deleting the first of the three is not a tidy-up — it puts
       NimBLE's stack init back inside the 6 s advertising interval, which is what
-      stops 6 s being 6 s.
+      stops 6 s being 6 s. The find-phone session (`runFindSession()`) is the same
+      rule over two minutes: every wait `core::find_session` hands out is under
+      that bound, and the feed comes *after* the redraw or the processed event
+      that ended the wait — never on `StillWaiting`. A change that feeds inside
+      `findWait()`, or lengthens `kFindRoundMs` past `kAdvertiseTimeoutMs`, has
+      made the watchdog blind for the one path that stays awake long enough to
+      need it.
 - [ ] Every blocking hardware call has a timeout: I2C transaction, e-paper BUSY
       wait, radio connect, any `while` on a hardware flag.
 - [ ] Every timeout is *handled* — degrade and sleep. Not an assert, not a retry
@@ -69,7 +75,16 @@ each item.
       BLE sync window that means: the gate is `core::sync_policy` and nothing
       bypasses or re-implements it; `noteSyncWindowOpened()` is called *before*
       the radio comes up, never on a success path; and the window is bounded by
-      `PROTOCOL.md` §5.1's 6/4/12 s timeouts rather than by a peer.
+      `PROTOCOL.md` §5.1's 6/4/12 s timeouts rather than by a peer. The find-phone
+      session goes through the same `evaluateSyncWindow()` gate with
+      `user_requested` set, spends the same hour, and is bounded by
+      `kFindPhoneTimeoutMs` — a search that bypasses the battery gate, or one
+      whose request outlives the wake it arrived on, is the unbounded radio use
+      this law forbids wearing a new name.
+- [ ] **Anything that stays awake past a panel refresh is priced.** Today that is
+      one path — the find-phone session, up to two minutes at ~40 mA — and it is
+      in the ledger with the reasons it is affordable. A second such path needs
+      the same row and the same reasons.
 - [ ] No display refresh when the rendered content is unchanged.
 - [ ] Partial refresh preferred; full refresh only for ghosting cleanup, within
       the documented cap (≤ 1 per 60 partials or 12 h).

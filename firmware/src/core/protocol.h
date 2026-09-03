@@ -37,6 +37,10 @@ namespace core {
 constexpr const char* kSyncServiceUuid = "57444159-6461-4779-b0a3-1f4c7e25d908";
 constexpr const char* kTimeCharacteristicUuid = "57444101-6461-4779-b0a3-1f4c7e25d908";
 constexpr const char* kStatusCharacteristicUuid = "57444102-6461-4779-b0a3-1f4c7e25d908";
+// §3.3, the phone's answer to a find-phone search (§4.1): write-only, one frame,
+// "the phone has been found from the phone's side". Added 3 Sep 2026 without a
+// PROTO_VERSION bump — a phone that does not know it never touches it.
+constexpr const char* kFindCharacteristicUuid = "57444103-6461-4779-b0a3-1f4c7e25d908";
 // The SIG-standard Client Characteristic Configuration descriptor on Status. It
 // is in §2.1's table and therefore belongs here rather than being spelled out at
 // whatever line of board/ first needs it.
@@ -73,6 +77,17 @@ constexpr uint16_t kAdvertiseTimeoutMs = 6000;
 constexpr uint16_t kIdleAfterConnectTimeoutMs = 4000;
 constexpr uint16_t kSessionCapMs = 12000;
 
+// §5.1's find session cap (§4.1). Two minutes of advertising, or of a live link
+// with the phone ringing, and then the search ends whatever the radio is doing.
+//
+// This is NOT one un-fed interval and must never be waited on in one go: the
+// watchdog is still 10 s. core::FindSession hands out waits of at most
+// kAdvertiseTimeoutMs, each followed by a completed step the caller feeds after
+// — a redraw, a connect, a processed write. The phone mirrors this number as the
+// floor of its own ring backstop (§5.2), which is why it lives here and not in
+// find_session.h.
+constexpr uint32_t kFindPhoneTimeoutMs = 120000;
+
 // ── §3 Wire format ───────────────────────────────────────────────────────────
 //
 // Little-endian throughout. Both payloads are a fixed 12 bytes, which is what
@@ -82,11 +97,18 @@ constexpr uint16_t kSessionCapMs = 12000;
 // was handed and never guesses at a truncated packet.
 constexpr uint8_t kProtocolVersion = 0x01;
 
-constexpr uint8_t kMsgTypeSetTime = 0x01;     // phone -> watch
-constexpr uint8_t kMsgTypeSyncResult = 0x81;  // watch -> phone
+constexpr uint8_t kMsgTypeSetTime = 0x01;      // phone -> watch, on Time
+constexpr uint8_t kMsgTypeFindDismiss = 0x02;  // phone -> watch, on Find (§3.3)
+constexpr uint8_t kMsgTypeSyncResult = 0x81;   // watch -> phone
 
 constexpr size_t kTimePayloadLength = 12;
 constexpr size_t kStatusPayloadLength = 12;
+constexpr size_t kFindPayloadLength = 4;
+
+// §3.2 `flags`, bit 0: the watch is running a find-phone session and asks the
+// phone to make itself heard for as long as this link lasts (§4.1). The only
+// defined bit; encodeStatus() puts no other bit on the wire.
+constexpr uint8_t kStatusFlagFindPhone = 0x01;
 
 // §3.1. UTC+14 and UTC-14 are the real-world extremes; 840 == 14 * 60.
 constexpr int16_t kMinUtcOffsetMinutes = -840;
@@ -173,6 +195,12 @@ struct Status {
   uint32_t applied_utc_epoch_s = 0;
 
   uint16_t fw_build = 0;  // diagnostic only
+
+  // §3.2 `flags`. Zero on every Status the sync window sends; kStatusFlagFindPhone
+  // only from inside a find session (§4.1). Independent of `result` on purpose: a
+  // find session that reached a phone but could not set the clock still wants the
+  // phone to ring, and the phone reads the two fields separately.
+  uint8_t flags = 0;
 };
 
 // Encode a Status payload (§3.2) into `out`, writing exactly kStatusPayloadLength
@@ -182,5 +210,15 @@ struct Status {
 // convention as formatTime(), for the same reason: a half-written packet is worse
 // than no packet.
 bool encodeStatus(uint8_t* out, size_t cap, const Status& status);
+
+// Decode and validate a Find write (§3.3). The checks run in §3.3's order —
+// length, version, type — and the codes are §3.2's, reused as a vocabulary: Ok is
+// a valid FindDismiss, anything else is a frame the watch ignores. A null pointer
+// is a wrong length. The reserved bytes are never read.
+//
+// There is deliberately nothing to decode beyond validity: the frame has one
+// meaning, and what the watch does about it — end the search, say the phone
+// stopped it — is core::FindSession::noteFindWrite()'s decision.
+SyncResult decodeFindWrite(const uint8_t* payload, size_t length);
 
 }  // namespace core

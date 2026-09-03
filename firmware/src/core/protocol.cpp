@@ -22,7 +22,15 @@ constexpr size_t kStatusOffsetResult = 2;
 constexpr size_t kStatusOffsetBattery = 3;
 constexpr size_t kStatusOffsetAppliedEpoch = 4;
 constexpr size_t kStatusOffsetFwBuild = 8;
-constexpr size_t kStatusOffsetReserved = 10;
+// Offset 10 was the first reserved byte until 3 Sep 2026; §3.2 gave it meaning
+// under rule 2's exception, so a receiver that still ignores it is still right.
+constexpr size_t kStatusOffsetFlags = 10;
+constexpr size_t kStatusOffsetReserved = 11;
+
+// ── PROTOCOL.md §3.3, the Find layout ────────────────────────────────────────
+constexpr size_t kFindOffsetProtoVersion = 0;
+constexpr size_t kFindOffsetMsgType = 1;
+// Offsets 2..3 are reserved and never read, for the same reason Time's are not.
 
 uint32_t readU32Le(const uint8_t* p) {
   return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -124,13 +132,31 @@ bool encodeStatus(uint8_t* out, size_t cap, const Status& status) {
   out[kStatusOffsetBattery] = battery;
   writeU32Le(out + kStatusOffsetAppliedEpoch, status.applied_utc_epoch_s);
   writeU16Le(out + kStatusOffsetFwBuild, status.fw_build);
-  // §3.2: the sender writes the reserved bytes as zero. Leaving whatever the
+  // §3.2: only the defined flag bit goes on the wire. Bits 1..7 are reserved,
+  // and a caller that set one — a garbled field, a future build's idea of a flag
+  // — must not reach a receiver that has since given that bit a meaning.
+  out[kStatusOffsetFlags] = static_cast<uint8_t>(status.flags & kStatusFlagFindPhone);
+  // §3.2: the sender writes the reserved byte as zero. Leaving whatever the
   // caller's buffer happened to hold would put stack contents on the air and
-  // would make a future receiver that gives those bytes meaning behave randomly
+  // would make a future receiver that gives that byte meaning behave randomly
   // against this build.
   out[kStatusOffsetReserved] = 0;
-  out[kStatusOffsetReserved + 1] = 0;
   return true;
+}
+
+SyncResult decodeFindWrite(const uint8_t* payload, size_t length) {
+  // §3.3's table, top to bottom, for the same reason decodeTimeWrite() keeps
+  // §3.1's order: a frame with two faults names the same one on both sides.
+  if (payload == nullptr || length != kFindPayloadLength) {
+    return SyncResult::BadLength;
+  }
+  if (payload[kFindOffsetProtoVersion] != kProtocolVersion) {
+    return SyncResult::BadVersion;
+  }
+  if (payload[kFindOffsetMsgType] != kMsgTypeFindDismiss) {
+    return SyncResult::BadType;
+  }
+  return SyncResult::Ok;
 }
 
 }  // namespace core

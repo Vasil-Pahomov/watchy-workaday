@@ -201,7 +201,7 @@ internal class WatchLink(
         }
     }
 
-    // ── Action.WriteTime ─────────────────────────────────────────────────────
+    // ── Action.WriteTime, Action.WriteFindDismiss ────────────────────────────
 
     /**
      * PROTOCOL.md §4 op 3, §3.1: 12 bytes, **with response**.
@@ -209,32 +209,49 @@ internal class WatchLink(
      * The bytes arrive already encoded — the wire format is `core/`'s and the
      * Android layer never touches it (§8).
      */
-    fun writeTime(payload: ByteArray) {
+    fun writeTime(payload: ByteArray) =
+        writeWithResponse(WatchProtocol.TIME_CHARACTERISTIC_UUID, "Time", payload)
+
+    /**
+     * PROTOCOL.md §4.1, §3.3: the FindDismiss frame, **with response**, on Find.
+     *
+     * The same write as Time on a different characteristic, and answered by the
+     * same `onCharacteristicWrite` — the machine tells the two apart by the state
+     * it is in, which is the only place a write can be outstanding from. An older
+     * watch has no Find characteristic; that is the `missing from the discovered
+     * profile` path below, reported at once as a local failure so the machine
+     * closes and re-arms instead of waiting five seconds for a callback that will
+     * never come (§6.2).
+     */
+    fun writeFindDismiss(payload: ByteArray) =
+        writeWithResponse(WatchProtocol.FIND_CHARACTERISTIC_UUID, "Find", payload)
+
+    private fun writeWithResponse(uuid: UUID, name: String, payload: ByteArray) {
         val client = gatt ?: return failLocally { TransportEvent.CharacteristicWritten(it) }
-        val time = characteristic(client, WatchProtocol.TIME_CHARACTERISTIC_UUID)
-        if (time == null) {
-            Log.w(LOG_TAG, "Time characteristic missing from the discovered profile")
+        val target = characteristic(client, uuid)
+        if (target == null) {
+            Log.w(LOG_TAG, "$name characteristic missing from the discovered profile")
             return failLocally { TransportEvent.CharacteristicWritten(it) }
         }
         try {
-            // WRITE_TYPE_DEFAULT is "write with response", which is what §3.1
-            // specifies. The version branch is *how*; both halves write the same
-            // twelve bytes the same way.
+            // WRITE_TYPE_DEFAULT is "write with response", which is what §3.1 and
+            // §3.3 both specify. The version branch is *how*; both halves write the
+            // same bytes the same way.
             @Suppress("DEPRECATION")
             val issued = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 client.writeCharacteristic(
-                    time,
+                    target,
                     payload,
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
                 ) == BluetoothStatusCodes.SUCCESS
             } else {
-                time.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                time.value = payload
-                client.writeCharacteristic(time)
+                target.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                target.value = payload
+                client.writeCharacteristic(target)
             }
             if (!issued) failLocally { TransportEvent.CharacteristicWritten(it) }
         } catch (e: SecurityException) {
-            Log.w(LOG_TAG, "Time write denied", e)
+            Log.w(LOG_TAG, "$name write denied", e)
             dispatchLater(TransportEvent.PermissionRevoked)
         }
     }

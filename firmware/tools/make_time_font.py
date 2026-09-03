@@ -96,7 +96,20 @@ SMALL_LINES = ["yesterday " + DIGIT * 5, "clock write fail", "sync unfinished",
                # every string the face can be asked to draw, not only the ones
                # that set the size - and neither is: at the 21 px this search
                # settles on they measure 150 and 143.
-               "White on black", "Black on white"]
+               "White on black", "Black on white",
+               # The Find phone screen (PROTOCOL.md section 4.1): its menu label,
+               # every status and outcome it can show, and the widest reachable
+               # progress line - two minutes, and an attempt counter saturated at
+               # 255. None of them sets the size either; the widest, "no phone
+               # found", is 156 px. "stopped on phone" was the first wording for
+               # the dismissed case and measured 182 - two pixels over - which
+               # would have shrunk every screen's UI face by a pixel to fit one
+               # message. Hence "phone found", which is also the plainer thing to
+               # say.
+               "Find phone", "searching", "connected", "phone ringing",
+               "phone found", "no phone found", "battery too low", "radio failed",
+               "not available", "interrupted", "stopped",
+               "2:00  try 255"]
 SMALL_BUDGET = 180
 
 

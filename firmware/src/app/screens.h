@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 
+#include "core/find_session.h"
 #include "core/health.h"
 #include "core/protocol.h"
 #include "core/step_counter.h"
@@ -51,6 +52,22 @@ struct Snapshot {
   // Whether an epoch has ever actually reached the PCF8563. Busy is both "never
   // synced" and "a window did not finish", and only this distinguishes them.
   bool sync_applied = false;
+
+  // The Find phone screen (core::kFindPhoneMenuIndex, PROTOCOL.md §4.1). Only
+  // that screen renders any of it and only that screen hashes it, so a search
+  // never repaints anything else.
+  //
+  // `find_live` is true only for frames drawn while a session is running — the
+  // first paint of the wake that starts one, and every redraw the session makes.
+  // Then the phase, the attempt counter and the elapsed time are what is shown.
+  // Off it, the screen shows `find_outcome` alone; a persisted InProgress with no
+  // live session reads as "interrupted", because the one way that pair arises is
+  // a wake that died inside a search.
+  bool find_live = false;
+  core::FindPhase find_phase = core::FindPhase::Searching;
+  core::FindOutcome find_outcome = core::FindOutcome::InProgress;
+  uint8_t find_attempts = 0;
+  uint16_t find_elapsed_s = 0;
 };
 
 // Renders `snapshot` into internal buffers and returns a hash of everything that

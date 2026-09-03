@@ -136,6 +136,30 @@ sealed interface ConnectionState {
 
     /** Connected; waiting for the Status notify that ends the exchange. */
     data object AwaitingStatus : ConnectionState
+
+    /**
+     * Connected, the §4 exchange finished, and its Status carried `FIND_PHONE`
+     * (PROTOCOL.md §4.1): the link is held **open** and the phone's alarm is
+     * sounding. A [Action.ArmOperationTimeout] for the §5.2 ring backstop is armed.
+     *
+     * The one state in which a finished exchange does not end in `close()`, and
+     * deliberately so: the alarm sounds exactly while the find link is up, and the
+     * watch ends it by hanging up. Left by [TransportEvent.Disconnected] (the
+     * normal ending), by the backstop, by the user dismissing it on the phone
+     * ([DismissingFind]), or by the radio going away ([Blocked]). Every exit stops
+     * the alarm; none of them backs off or touches health — the exchange itself
+     * was recorded when the Status arrived, as any other would be.
+     */
+    data object Ringing : ConnectionState
+
+    /**
+     * The user silenced the alarm on the phone. The alarm is already off, the §3.3
+     * FindDismiss write is outstanding with a §5.2 per-operation timeout, and the
+     * link closes — and re-arms at once — when the write completes, fails or times
+     * out. §4.1: the watch has processed the write before its response leaves, so
+     * closing on the reply never cuts the message short.
+     */
+    data object DismissingFind : ConnectionState
 }
 
 /**
@@ -204,6 +228,15 @@ sealed interface TransportEvent {
 
     /** `BLUETOOTH_CONNECT` granted again. */
     data object PermissionGranted : TransportEvent
+
+    /**
+     * The user silenced the find-phone alarm on the phone — the Stop button on the
+     * alarm screen or on its notification. Not a radio event: it comes from the
+     * UI, which is why it is the one event the Android layer feeds from an
+     * `onStartCommand` rather than from a GATT callback. Ignored outside
+     * [ConnectionState.Ringing]; there is nothing to dismiss.
+     */
+    data object FindDismissedOnPhone : TransportEvent
 }
 
 /**
@@ -254,6 +287,32 @@ sealed interface Action {
     class WriteTime(val payload: ByteArray) : Action {
         override fun toString(): String = "WriteTime(${payload.size} bytes)"
     }
+
+    /**
+     * Write [payload] to [WatchProtocol.FIND_CHARACTERISTIC_UUID], **with
+     * response** — the §3.3 FindDismiss frame, already encoded. Issued only from
+     * [ConnectionState.Ringing], once per link, and answered by
+     * [TransportEvent.CharacteristicWritten] like any other write.
+     */
+    class WriteFindDismiss(val payload: ByteArray) : Action {
+        override fun toString(): String = "WriteFindDismiss(${payload.size} bytes)"
+    }
+
+    /**
+     * Make the phone heard: sound on the alarm channel, vibration, and the
+     * full-screen alarm UI (PROTOCOL.md §4.1). Idempotent for the Android layer —
+     * the machine issues it once per [ConnectionState.Ringing] and always pairs it
+     * with a [StopFindAlarm] before the state is left.
+     */
+    data object StartFindAlarm : Action
+
+    /**
+     * Silence it and take the alarm UI down. Emitted on **every** exit from
+     * [ConnectionState.Ringing] — the watch hanging up, the backstop, the user's
+     * dismissal, the radio going away — so there is no path on which the alarm
+     * outlives the link.
+     */
+    data object StopFindAlarm : Action
 
     /**
      * Post a single delayed callback that will deliver
@@ -418,6 +477,7 @@ class ConnectionStateMachine(
             is TransportEvent.NotificationReceived -> onNotification(event.payload, actions)
             is TransportEvent.OperationTimedOut -> onOperationTimedOut(event.token, actions)
             is TransportEvent.RetryTimerFired -> onRetryTimerFired(event.token, actions)
+            TransportEvent.FindDismissedOnPhone -> onFindDismissedOnPhone(actions)
         }
         return actions
     }
@@ -451,6 +511,9 @@ class ConnectionStateMachine(
     private fun enterBlockedIfNeeded(actions: MutableList<Action>) {
         if (!started || !isBlocked()) return
         cancelTimer(actions)
+        // The alarm sounds exactly while the find link is up (§4.1), and the link
+        // is about to be closed under it. Every exit from Ringing silences it.
+        if (state == ConnectionState.Ringing) actions += Action.StopFindAlarm
         closeLink(actions)
         state = blockedState()
     }
@@ -522,6 +585,17 @@ class ConnectionStateMachine(
     }
 
     private fun onCharacteristicWritten(gattStatus: Int, actions: MutableList<Action>) {
+        if (state == ConnectionState.DismissingFind) {
+            // The §3.3 write is done — delivered, refused, or never issued at all
+            // (an older watch with no Find characteristic reports GATT_LOCAL_FAILURE
+            // here). §4.1: the alarm was already stopped by the user's tap, the
+            // watch has processed a delivered frame before its response left, and
+            // there is nothing else to say on this link. Close and re-arm; the
+            // status is not a failed exchange, because the exchange finished when
+            // the Status arrived.
+            finishDismiss(actions)
+            return
+        }
         if (state != ConnectionState.WritingTime) return
         if (gattStatus != GATT_SUCCESS) {
             failExchange(ExchangeOutcome.GattOperationFailed, actions)
@@ -553,7 +627,15 @@ class ConnectionStateMachine(
             is StatusDecode.Valid -> {
                 val status = decoded.status
                 lastStatus = status
-                if (status.isSuccess) {
+                if (status.findPhoneRequested) {
+                    // §4.1: the watch is looking for this phone. The exchange is
+                    // recorded exactly as it would be without the flag — success
+                    // or failure, health, backoff counter, diagnostic record — but
+                    // the link is kept and the alarm starts, whatever `result`
+                    // said. A clock that could not be set is no reason to leave the
+                    // phone lost.
+                    ring(status, actions)
+                } else if (status.isSuccess) {
                     succeed(status, actions)
                 } else {
                     // §6.2: a non-zero result is a **failed** exchange. Backoff
@@ -588,6 +670,19 @@ class ConnectionStateMachine(
             ConnectionState.WritingTime,
             ConnectionState.AwaitingStatus,
             -> failExchange(ExchangeOutcome.DisconnectedMidExchange, actions)
+
+            // §4.1's normal ending: the watch hung up because its search is over —
+            // Back pressed, or its cap — or the link was lost and it is still
+            // looking. The phone cannot tell and does not need to: the alarm stops
+            // with the link, and re-arming at once serves both. Not a fault, no
+            // backoff, no health increment — the exchange was recorded when the
+            // Status arrived.
+            ConnectionState.Ringing -> endRinging(actions)
+
+            // The watch hung up before the dismiss write completed — it processed
+            // the frame and ended its search, or the link dropped. Either way the
+            // alarm is already off and the link is gone; re-arm.
+            ConnectionState.DismissingFind -> finishDismiss(actions)
 
             // §6.2 row "disconnect after a successful notify" lands here: the
             // exchange already ended, the link is already closed and re-armed,
@@ -625,16 +720,112 @@ class ConnectionStateMachine(
                 arm(actions)
             }
 
+            // §5.2's ring backstop: the watch's cap has passed and no disconnect
+            // reached us. Stop the alarm and close — the net behind a hang-up that
+            // never arrived, not the normal ending.
+            ConnectionState.Ringing -> {
+                armedTimer = TimerKind.None
+                endRinging(actions)
+            }
+
+            // The dismiss write never completed inside its §5.2 timeout. The alarm
+            // is already off; close and re-arm.
+            ConnectionState.DismissingFind -> {
+                armedTimer = TimerKind.None
+                finishDismiss(actions)
+            }
+
             ConnectionState.Idle,
             ConnectionState.Armed,
             is ConnectionState.WaitingForRetry,
             is ConnectionState.Blocked,
-            // An operation timer only exists in the four states above, so this
-            // is unreachable. Deliberately leaving the timer armed rather than
+            // An operation timer only exists in the states above, so this is
+            // unreachable. Deliberately leaving the timer armed rather than
             // clearing it: disarming a timer we are not going to act on is
             // precisely how a state ends up waiting for nothing.
             -> Unit
         }
+    }
+
+    // ── Find phone, §4.1 ─────────────────────────────────────────────────────
+
+    /**
+     * The Status carried `FIND_PHONE`: record the exchange as any other, then
+     * keep the link and make the phone heard.
+     *
+     * Recording comes first and is unconditional on the flag, so the counters and
+     * the diagnostic record see exactly what a plain sync would have produced —
+     * a find session that also set the clock is a success, one whose Time write
+     * the watch refused is a failure, and neither is changed by the ringing that
+     * follows. What the flag changes is only what happens to the link.
+     */
+    private fun ring(status: WatchStatus, actions: MutableList<Action>) {
+        cancelTimer(actions)
+        val now = clock.utcEpochSeconds()
+        if (status.isSuccess) {
+            healthCounter.recordSuccess(now, status.resultCode)
+            actions += Action.PersistHealth(health)
+            actions += Action.ReportExchange(ExchangeOutcome.Succeeded, status, now)
+        } else {
+            healthCounter.recordFailure(now, ExchangeOutcome.WatchReportedFailure, status.resultCode)
+            actions += Action.PersistHealth(health)
+            actions += Action.ReportExchange(ExchangeOutcome.WatchReportedFailure, status, now)
+        }
+        actions += Action.StartFindAlarm
+        // The backstop, not a per-operation timeout: nothing is outstanding on the
+        // link, and this is the whole of how long the phone will ring unasked.
+        armTimer(WatchProtocol.FIND_RING_BACKSTOP_MS, actions)
+        state = ConnectionState.Ringing
+    }
+
+    /**
+     * Every way out of [ConnectionState.Ringing] that is not the user's own tap:
+     * silence, close, and — §4.1 — re-arm **immediately**. No settle: the watch
+     * may still be searching and wants the phone back; if it is not, the pending
+     * autoConnect simply waits. No backoff: nothing failed.
+     */
+    private fun endRinging(actions: MutableList<Action>) {
+        cancelTimer(actions)
+        actions += Action.StopFindAlarm
+        closeLink(actions)
+        if (isBlocked()) {
+            // The radio went away in the same breath. Blocked is a waiting state
+            // too, and AdapterOn / PermissionGranted arms from it.
+            state = blockedState()
+            return
+        }
+        arm(actions)
+    }
+
+    /**
+     * The user's tap. The alarm stops now — not when the watch answers — because
+     * the person holding the phone has already found it, and a write that takes
+     * five seconds to fail must not keep them listening to it. Then the §3.3
+     * frame goes out with a per-operation timeout, and the link closes on the
+     * reply.
+     */
+    private fun onFindDismissedOnPhone(actions: MutableList<Action>) {
+        if (state != ConnectionState.Ringing) return
+        cancelTimer(actions)
+        actions += Action.StopFindAlarm
+        state = ConnectionState.DismissingFind
+        // The plain per-operation timeout, not armOperationTimeout(): that one is
+        // clamped to what is left of the §5.2 exchange budget, and the exchange
+        // budget ran out long ago — a ring lasts minutes. Nothing here is an
+        // exchange; it is one write on a link that has outlived its exchange.
+        armTimer(WatchProtocol.OPERATION_TIMEOUT_MS, actions)
+        actions += Action.WriteFindDismiss(WatchProtocol.encodeFindDismiss())
+    }
+
+    /** The dismiss write is over, one way or another. Close and re-arm at once. */
+    private fun finishDismiss(actions: MutableList<Action>) {
+        cancelTimer(actions)
+        closeLink(actions)
+        if (isBlocked()) {
+            state = blockedState()
+            return
+        }
+        arm(actions)
     }
 
     private fun onRetryTimerFired(token: Long, actions: MutableList<Action>) {

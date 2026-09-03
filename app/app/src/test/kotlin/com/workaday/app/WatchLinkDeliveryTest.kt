@@ -201,8 +201,28 @@ class WatchLinkDeliveryTest {
         h.link.discoverServices()
         h.link.enableStatusNotifications()
         h.link.writeTime(ByteArray(12))
+        h.link.writeFindDismiss(ByteArray(4))
         h.runPosted()
 
         assertTrue(h.dispatched.isEmpty(), "a closed link still spoke to the machine: ${h.dispatched}")
+    }
+
+    @Test
+    fun `a Find write with no client fails at once rather than stalling the dismiss`() {
+        // PROTOCOL.md §6.2: an older watch has no Find characteristic, and a phone
+        // whose dismiss write could not be issued must close and re-arm now, not
+        // after a five-second timeout. Same shape as the discovery case above, on
+        // the one write the find-phone path adds.
+        val h = Harness()
+        h.link.arm()
+        h.runPosted()
+        h.dispatched.clear()
+
+        h.link.writeFindDismiss(ByteArray(4))
+        h.runPosted()
+
+        val event = h.dispatched.single()
+        assertTrue(event is TransportEvent.CharacteristicWritten)
+        assertTrue(event.gattStatus != GATT_SUCCESS, "a write that was never issued must not read as delivered")
     }
 }

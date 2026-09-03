@@ -101,18 +101,91 @@ class WatchProtocolTest {
         assertEquals("57444159-6461-4779-b0a3-1f4c7e25d908", WatchProtocol.SYNC_SERVICE_UUID.toString())
         assertEquals("57444101-6461-4779-b0a3-1f4c7e25d908", WatchProtocol.TIME_CHARACTERISTIC_UUID.toString())
         assertEquals("57444102-6461-4779-b0a3-1f4c7e25d908", WatchProtocol.STATUS_CHARACTERISTIC_UUID.toString())
+        assertEquals("57444103-6461-4779-b0a3-1f4c7e25d908", WatchProtocol.FIND_CHARACTERISTIC_UUID.toString())
         assertEquals("00002902-0000-1000-8000-00805f9b34fb", WatchProtocol.CCCD_UUID.toString())
     }
 
     @Test
-    fun `the four UUIDs are distinct`() {
+    fun `the five UUIDs are distinct`() {
         val all = setOf(
             WatchProtocol.SYNC_SERVICE_UUID,
             WatchProtocol.TIME_CHARACTERISTIC_UUID,
             WatchProtocol.STATUS_CHARACTERISTIC_UUID,
+            WatchProtocol.FIND_CHARACTERISTIC_UUID,
             WatchProtocol.CCCD_UUID,
         )
-        assertEquals(4, all.size)
+        assertEquals(5, all.size)
+    }
+
+    // ── §3.3 / §4.1, the find-phone additions ────────────────────────────────
+
+    @Test
+    fun `golden vector 7_5 - FindDismiss encodes byte for byte, a fresh array each call`() {
+        assertContentEquals(hex("01 02 00 00"), WatchProtocol.encodeFindDismiss())
+        assertEquals(WatchProtocol.FIND_PAYLOAD_LENGTH, WatchProtocol.encodeFindDismiss().size)
+        val first = WatchProtocol.encodeFindDismiss()
+        first[0] = 0x7F
+        assertContentEquals(hex("01 02 00 00"), WatchProtocol.encodeFindDismiss())
+    }
+
+    @Test
+    fun `golden vector 7_4 - a Status carrying FIND_PHONE decodes to the 7_2 fields plus the flag`() {
+        val plain = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(goldenStatus)).status
+        val flagged = assertIs<StatusDecode.Valid>(
+            WatchProtocol.decodeStatus(hex("01 81 00 4E F0 FF 82 6A 01 00 01 00")),
+        ).status
+
+        assertFalse(plain.findPhoneRequested, "the sync window's frame never asks the phone to ring")
+        assertTrue(flagged.findPhoneRequested)
+        // Everything else is §7.2, byte for byte — which is what rule 2's exception
+        // requires of a receiver that ignores the byte.
+        assertEquals(plain.resultCode, flagged.resultCode)
+        assertEquals(plain.batteryPercent, flagged.batteryPercent)
+        assertEquals(plain.appliedUtcEpochSeconds, flagged.appliedUtcEpochSeconds)
+        assertEquals(plain.fwBuild, flagged.fwBuild)
+        assertTrue(flagged.isSuccess, "the flag says nothing about result")
+    }
+
+    @Test
+    fun `FIND_PHONE is independent of result`() {
+        // §4.1: a clock that could not be set is no reason to leave the phone lost.
+        val busyAndFinding = hex("01 81 06 4E 00 00 00 00 01 00 01 00")
+        val status = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(busyAndFinding)).status
+        assertTrue(status.findPhoneRequested)
+        assertFalse(status.isSuccess)
+        assertEquals(SyncResult.Busy, status.result)
+    }
+
+    @Test
+    fun `only bit 0 of flags is read - the reserved bits cannot ring the phone`() {
+        // Bits 1..7 are reserved, and a later v1.x may give one meaning this build
+        // does not know. Every byte with bit 0 clear must read as "not finding";
+        // every byte with it set must read as finding, whatever else is in it.
+        for (flags in 0..255) {
+            val payload = goldenStatus.copyOf().also { it[10] = flags.toByte() }
+            val status = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(payload)).status
+            assertEquals((flags and 0x01) != 0, status.findPhoneRequested, "flags 0x%02X".format(flags))
+        }
+        assertEquals(0x01, WatchProtocol.STATUS_FLAG_FIND_PHONE)
+    }
+
+    @Test
+    fun `section 3_3 constants`() {
+        assertEquals(0x02, WatchProtocol.MSG_TYPE_FIND_DISMISS)
+        assertEquals(4, WatchProtocol.FIND_PAYLOAD_LENGTH)
+        assertNotEquals(WatchProtocol.MSG_TYPE_FIND_DISMISS, WatchProtocol.MSG_TYPE_SET_TIME)
+        assertNotEquals(WatchProtocol.MSG_TYPE_FIND_DISMISS, WatchProtocol.MSG_TYPE_SYNC_RESULT)
+    }
+
+    @Test
+    fun `the ring backstop outlives the watch's find cap`() {
+        // §5.2: "Longer than the watch's 120 s find cap, so the watch's hang-up is
+        // the normal ending and this is the safety net behind a disconnect that
+        // never arrived." If the two ever crossed, the phone would hang up on a
+        // watch that was still searching, reconnect at once, and ring again.
+        assertEquals(120_000L, WatchProtocol.WATCH_FIND_PHONE_TIMEOUT_MS)
+        assertEquals(135_000L, WatchProtocol.FIND_RING_BACKSTOP_MS)
+        assertTrue(WatchProtocol.FIND_RING_BACKSTOP_MS > WatchProtocol.WATCH_FIND_PHONE_TIMEOUT_MS)
     }
 
     @Test
@@ -364,6 +437,9 @@ class WatchProtocolTest {
 
     @Test
     fun `reserved bytes are ignored, so a later v1_x can use them`() {
+        // Offset 10 was the proof of this rule — it became `flags` on 3 Sep 2026
+        // without a version bump — so the bits that are still reserved are what is
+        // exercised now: flags bits 1..7 (0x5A has bit 0 clear) and offset 11.
         val withReserved = goldenStatus.copyOf().also { it[10] = 0x5A; it[11] = 0xA5.toByte() }
         val a = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(goldenStatus)).status
         val b = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(withReserved)).status
@@ -371,6 +447,7 @@ class WatchProtocolTest {
         assertEquals(a.batteryPercent, b.batteryPercent)
         assertEquals(a.appliedUtcEpochSeconds, b.appliedUtcEpochSeconds)
         assertEquals(a.fwBuild, b.fwBuild)
+        assertEquals(a.findPhoneRequested, b.findPhoneRequested)
     }
 
     @Test

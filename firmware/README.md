@@ -12,7 +12,11 @@ Gilroy ExtraBold throughout, white on black — or black on white, from the thir
 menu item, which states which way round it currently is rather than what pressing
 it would do. The charge is a gauge in the top-right corner rather than a
 percentage, the step count is digits alone in the bottom-left, and neither the
-hour nor the day carries a leading zero.
+hour nor the day carries a leading zero. The fourth menu item, **Find phone**,
+makes the paired phone ring: the watch advertises for up to two minutes, counting
+the seconds and the attempts on screen, the phone rings until the link ends or
+someone silences it, and the watch says "phone found" if that someone was on the
+phone's side.
 
 The two corner readings sit *on* the corners rather than a margin inside them,
 and the clock is sized to the panel rather than to a taste: at its widest minute
@@ -75,7 +79,7 @@ Five non-negotiable rules, spelled out in [CLAUDE.md](CLAUDE.md):
    Safe and Recovery modes so a crash loop degrades instead of flattening the
    battery in five hours.
 3. **Logic is host-tested.** `src/core/**` is pure C++17 with no hardware headers,
-   covered by 327 Unity tests running on the developer's machine.
+   covered by 384 Unity tests running on the developer's machine.
 4. **VS Code + PlatformIO out of the box.** Pinned platform, pinned dependencies.
 5. **Watchy 2.0 only.** No revision `#if`s, no abstraction for hypothetical
    hardware.
@@ -132,7 +136,9 @@ steps → decide refresh → draw → sleep, with health escalation and the time
 backstop in place. The clock is set from the companion app over BLE — one window
 an hour, to [PROTOCOL.md](../PROTOCOL.md) — so a fresh board does not sit at
 `--:--`. Daily step counting is implemented against the BMA423's hardware counter
-and costs no extra wakes.
+and costs no extra wakes. Finding the phone from the watch is implemented on both
+sides ([PROTOCOL.md](../PROTOCOL.md) §4.1) and not yet tried on a wrist —
+[BRINGUP.md](../BRINGUP.md) stage 5.
 
 See [docs/backlog.md](docs/backlog.md) for what is not built yet: setting the time
 on the watch alone, without a phone; vibration alerts; bonding and encryption on

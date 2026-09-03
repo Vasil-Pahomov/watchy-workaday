@@ -163,6 +163,37 @@ Still open, and deliberately not built (`PROTOCOL.md` §9): bonding and encrypti
 (the first thing to add), step/battery history in the other direction, and
 notifications from the phone.
 
+### 14. ~~Find the phone from the watch~~ — done, unverified on hardware
+Shipped: the fourth menu item, `core::find_session` (32 tests) driving
+`board::ble::Session::findWait()`, a `Find` characteristic and a `flags` byte in
+`PROTOCOL.md` (§3.3, §4.1), and the phone's half in the companion app. The watch
+advertises for up to two minutes, redrawing the elapsed time and an attempt
+counter every five seconds; the phone connects, does the ordinary sync, reads the
+flag in the answer, and rings until the link ends or the user silences it — which
+writes `Find`, and the watch then says "phone found".
+
+Two things about it are worth knowing before touching it:
+
+- **It is the one path that stays awake for minutes**, at radio current, and it is
+  affordable only because it is user-initiated, bounded by the cap, and refused on
+  a low battery or in a degraded mode by the same gates as a sync window. The
+  worst case — phone found at once and the search left to run out — is ~1.3 mAh,
+  about 14 % of a day; `docs/power-budget.md` has the row. A search also spends the
+  hourly sync timer, since it performs the sync if a phone turns up.
+- **The Back button is read by a GPIO interrupt during the search**
+  (`board::buttons::attachPressInterrupt()`), the only place in the firmware a pin
+  is read by anything other than an ext1 wake. `pinMode()` first, because ext1
+  leaves the pad muxed to the RTC domain where a digital interrupt never fires;
+  detached before sleep, because `deepSleep()` re-arms the same pin as a wake
+  source.
+
+Not yet done on a wrist — `BRINGUP.md` stage 5. The things only hardware settles:
+that the phone's `autoConnect` actually fires inside the first few rounds rather
+than tens of seconds in (the controller's background scan sets that, not us);
+that `NimBLEServer::disconnect()` ends the phone's ring promptly; that a
+two-minute session with the stack up does not trip anything the twelve-second
+window never reached; and what the search really costs on a meter.
+
 ### 7. ~~Watchface layout worth looking at~~ — done, and the rule held
 The face is now Gilroy ExtraBold throughout (three sizes, `tools/make_time_font.py`),
 the charge is a gauge hard against the top-right corner instead of a percentage, and
