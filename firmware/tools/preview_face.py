@@ -409,6 +409,9 @@ def every_screen(k, f):
         # third line is the widest reachable one: two minutes, and an attempt
         # counter saturated at 255.
         ("Find phone, searching", banner(k, f, "Find phone", "searching", "0:35  try 8")),
+        # Vibration only by default; a Menu press while the phone is on the link
+        # adds the tone, and this line is how the wearer sees the press land.
+        ("Find phone, vibrating", banner(k, f, "Find phone", "phone vibrating", "0:52  try 8")),
         ("Find phone, ringing", banner(k, f, "Find phone", "phone ringing", "2:00  try 255")),
         ("Find phone, found on the phone", banner(k, f, "Find phone", "phone found")),
         ("Find phone, refused", banner(k, f, "Find phone", "battery too low", battery=4)),

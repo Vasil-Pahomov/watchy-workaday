@@ -111,15 +111,20 @@ line, in the module where the stakes are highest.
 
 The find-phone session (`PROTOCOL.md` §4.1) reuses that split rather than
 extending it: `core::find_session` is a second classifier over the same radio
-signals plus two new ones — a write on the `Find` characteristic and the wearer's
-Back press — and `board::ble::Session` gains a second wait that blocks on all five
-bits where the sync wait blocks on three. The Back press is the one input that is
-neither the radio's nor the wake's: it arrives as a GPIO edge, through
+signals plus the session's own — a write on the `Find` characteristic, the phone
+subscribing to it, and the wearer's Back and Menu presses — and
+`board::ble::Session` gains a second wait that blocks on all of those bits where
+the sync wait blocks on three. The button presses are the inputs that are neither
+the radio's nor the wake's: each arrives as a GPIO edge, through
 `board::buttons::attachPressInterrupt()`, into the same FreeRTOS event group the
 wait sleeps on — so the search wakes on it within a millisecond and never polls a
-pin. `main.cpp`'s `runFindSession()` is the loop, and its shape is the sync
-window's: one event per pass, a redraw and a watchdog feed after each completed
-step, `StillWaiting` feeding nothing.
+pin. Menu is the one that needs judgement, and the judgement is in `core/`: an edge
+only starts a 40 ms settle clock, and the press counts if the board still reads
+the pin high when it runs out (`FindSignals::menu_held`, sampled by `main.cpp`
+after the wait). Without that, the release of the press that opened the search
+bounces straight into the tone toggle. `main.cpp`'s `runFindSession()` is the
+loop, and its shape is the sync window's: one event per pass, a redraw and a
+watchdog feed after each completed step, `StillWaiting` feeding nothing.
 
 The ADC deliberately has **no** guard: the one-shot driver powers the SAR ADC per
 conversion, so there is nothing to release, and a guard would advertise protection

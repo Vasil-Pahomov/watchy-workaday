@@ -28,29 +28,34 @@ import java.io.IOException
  * The phone making itself heard — `Action.StartFindAlarm` and `Action.StopFindAlarm`
  * performed (PROTOCOL.md §4.1).
  *
- * Three effects, all started together and all stopped together, on every path:
+ * Three effects, all stopped together on every path, two of them always on:
  *
- * - **Sound**, from a `MediaPlayer` looping the device's alarm tone on the ALARM
- *   audio usage, with the alarm stream turned up to its maximum for the duration
- *   and the player's own volume ramped from quiet to full along [FindAlarm]'s
- *   curve. ALARM rather than NOTIFICATION or RING because that is the usage Do Not
- *   Disturb's default "priority only" mode lets through; a mode that blocks alarms
- *   — "total silence" — mutes this too, and no app can override that without
- *   notification-policy access the user would have to grant separately. Stated in
- *   `PROTOCOL.md` §6.2 as a platform limit rather than papered over.
- * - **Vibration**, a repeating pulse on the same usage, for a phone face-down on a
- *   sofa cushion.
+ * - **Vibration**, a repeating pulse on the ALARM usage, for a phone face-down on
+ *   a sofa cushion. On from the first moment: `PROTOCOL.md` §4.1 makes the
+ *   vibration-only alarm the default a search starts in.
  * - **The alarm notification**, high importance with a full-screen intent, which
  *   is Android's mechanism for putting a screen in front of a locked or sleeping
  *   phone: on a phone that is off it launches [FindPhoneActivity] over the lock
  *   screen with the display turned on; on a phone in use it is a heads-up with a
  *   Stop action. Both routes end in the same `Action` back to the machine.
+ * - **Sound**, only when the watch asks for it — the Status's `FIND_SOUND` at the
+ *   start, a `FindMode` notify mid-link, either way the wearer's Menu press — from
+ *   a `MediaPlayer` looping the device's alarm tone on the ALARM audio usage, with
+ *   the alarm stream turned up to its maximum while the tone plays and the
+ *   player's own volume ramped from quiet to full along [FindAlarm]'s curve, the
+ *   ramp starting afresh each time the tone is switched on. ALARM rather than
+ *   NOTIFICATION or RING because that is the usage Do Not Disturb's default
+ *   "priority only" mode lets through; a mode that blocks alarms — "total
+ *   silence" — mutes this too, and no app can override that without
+ *   notification-policy access the user would have to grant separately. Stated in
+ *   `PROTOCOL.md` §6.2 as a platform limit rather than papered over.
  *
- * **No decision here.** Whether to ring, for how long, and when to stop are the
- * state machine's; the volume curve is `core/`'s. This class turns a start into
- * three platform calls and a stop into their three undo calls, and the one
- * `if` it has — `isRinging` — is idempotence, so a second start or stop is a
- * no-op rather than a second player.
+ * **No decision here.** Whether to ring, in which mode, for how long, and when to
+ * stop are the state machine's; the volume curve is `core/`'s. This class turns a
+ * start into platform calls and a stop into their undo calls, and the `if`s it
+ * has — `isRinging`, and whether the tone is already what was asked for — are
+ * idempotence, so a second start, stop or identical mode is a no-op rather than a
+ * second player.
  *
  * Every method runs on the link's serial thread. `MediaPlayer.prepare()` blocks
  * for the length of a small file read, which is fine there and would not be on
@@ -68,10 +73,14 @@ internal class FindPhoneAlarm(
 
     private var player: MediaPlayer? = null
 
-    /** The alarm stream's volume before we raised it, restored on stop. */
+    /** Whether the tone has been asked for — what [setSound] compares against. */
+    private var soundOn = false
+
+    /** The alarm stream's volume before we raised it, restored when the tone stops. */
     private var previousAlarmVolume: Int? = null
 
-    private var startedAtMillis = 0L
+    /** When the tone was last switched on: the ramp's origin. */
+    private var toneStartedAtMillis = 0L
 
     /**
      * Re-applies [FindAlarm.volumeAt] every [FindAlarm.STEP_MS] until the curve
@@ -81,36 +90,71 @@ internal class FindPhoneAlarm(
     private val ramp = object : Runnable {
         override fun run() {
             val current = player ?: return
-            val volume = FindAlarm.volumeAt(SystemClock.elapsedRealtime() - startedAtMillis)
+            val volume = FindAlarm.volumeAt(SystemClock.elapsedRealtime() - toneStartedAtMillis)
             try {
                 current.setVolume(volume, volume)
             } catch (e: IllegalStateException) {
-                // Released under us — stop() ran. Nothing more to do.
+                // Released under us — stopTone() ran. Nothing more to do.
                 return
             }
             if (volume < 1f) handler.postDelayed(this, FindAlarm.STEP_MS)
         }
     }
 
-    fun start() {
+    /**
+     * @param sound whether the tone plays from the start, alongside the vibration
+     *   that always does. `PROTOCOL.md` §4.1: false unless the wearer pressed
+     *   Menu before the phone connected.
+     */
+    fun start(sound: Boolean) {
         if (isRinging) return
         isRinging = true
-        startedAtMillis = SystemClock.elapsedRealtime()
-        raiseAlarmStream()
-        player = openPlayer()
         vibrate()
         notifications?.notify(NOTIFICATION_ID, notification())
-        handler.post(ramp)
-        logInfo("find phone: alarm started (tone ${if (player != null) "playing" else "unavailable"})")
+        if (sound) startTone()
+        logInfo("find phone: alarm started (${if (sound) "tone and vibration" else "vibration only"})")
     }
 
     /**
-     * Idempotent, and it runs on every exit from the ringing state as well as on
+     * The mid-link mode change (§3.3 FindMode): add the tone or take it away,
+     * vibration untouched either way. A mode that matches what is already playing
+     * is a no-op, so a repeated notify cannot restart the ramp.
+     */
+    fun setSound(sound: Boolean) {
+        if (!isRinging || sound == soundOn) return
+        if (sound) startTone() else stopTone()
+        logInfo("find phone: tone ${if (sound) "on" else "off"}")
+    }
+
+    /**
+     * Idempotent, and it runs on every exit from the ringing states as well as on
      * service shutdown — Law 2's "on every path including cancellation".
      */
     fun stop() {
         if (!isRinging) return
         isRinging = false
+        stopTone()
+        vibrator?.cancel()
+        notifications?.cancel(NOTIFICATION_ID)
+        // Tells FindPhoneActivity, if it is up, to go away. Package-scoped: nothing
+        // outside this app has any business hearing it.
+        context.sendBroadcast(Intent(ACTION_FIND_ENDED).setPackage(context.packageName))
+        logInfo("find phone: alarm stopped")
+    }
+
+    // ── sound ────────────────────────────────────────────────────────────────
+
+    private fun startTone() {
+        soundOn = true
+        toneStartedAtMillis = SystemClock.elapsedRealtime()
+        raiseAlarmStream()
+        player = openPlayer()
+        handler.post(ramp)
+        if (player == null) Log.w(LOG_TAG, "find phone: tone asked for but no alarm tone could be opened")
+    }
+
+    private fun stopTone() {
+        soundOn = false
         handler.removeCallbacks(ramp)
         player?.let { current ->
             try {
@@ -121,16 +165,8 @@ internal class FindPhoneAlarm(
             current.release()
         }
         player = null
-        vibrator?.cancel()
         restoreAlarmStream()
-        notifications?.cancel(NOTIFICATION_ID)
-        // Tells FindPhoneActivity, if it is up, to go away. Package-scoped: nothing
-        // outside this app has any business hearing it.
-        context.sendBroadcast(Intent(ACTION_FIND_ENDED).setPackage(context.packageName))
-        logInfo("find phone: alarm stopped")
     }
-
-    // ── sound ────────────────────────────────────────────────────────────────
 
     private fun raiseAlarmStream() {
         val manager = audio ?: return

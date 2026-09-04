@@ -147,9 +147,12 @@ verified to actually fail when the constants were corrupted. Look instead at:
 
 ## Stage 5 — find the phone
 
-Added 3 Sep 2026 with the feature, and **not yet run against hardware**. Do it
-only after stage 4 has completed at least once: it is stage 4 with the link held
-open, and a failure here has all of stage 4's candidate causes plus its own.
+Added 3 Sep 2026 with the feature. The search itself ran against hardware the
+same day — the phone connected within seconds, rang, and stopped on both Stop and
+Back. The Menu tone toggle was added afterwards and **its rows have not yet been
+run**. Do the stage only after stage 4 has completed at least once: it is stage 4
+with the link held open, and a failure here has all of stage 4's candidate causes
+plus its own.
 
 On the watch, Menu → Find phone. Expect, in order:
 
@@ -158,9 +161,11 @@ On the watch, Menu → Find phone. Expect, in order:
 | The screen shows "searching", `0:00  try 1`, and then advances every ~5 s | The find session is running and redrawing on its round clock. A screen that never advances means the loop is stuck in `StillWaiting` with no round expiring — check `WORKADAY_DIAG` for `find:` lines |
 | The attempt counter climbs while nobody connects | `core::FindSession` counting rounds. If the phone connects inside the first round the counter stays at 1, which is correct |
 | The phone connects within a few rounds, not tens of seconds | The controller's background scan behind `autoConnect` sets this, not us. If it is routinely slow, the fix is on the phone side (a faster scan mode is a design change) and `PROTOCOL.md` §4.1's "few seconds" wording needs the measured figure |
-| "connected", then "phone ringing", and the phone rings and vibrates | The §4 exchange ran and the Status carried `FIND_PHONE`. "connected" that never becomes "phone ringing" means the Time write or the notify failed — the ordinary stage 4 table applies |
+| "connected", then "phone vibrating", and the phone vibrates — no tone | The §4 exchange ran and the Status carried `FIND_PHONE`. §4.1's default is vibration only. "connected" that never becomes "phone vibrating" means the Time write or the notify failed — the ordinary stage 4 table applies |
 | The phone's screen lights up over the lock screen with a Stop button | The full-screen intent. If instead a heads-up notification appears with Stop, `USE_FULL_SCREEN_INTENT` has been revoked — `app/docs/background-execution.md` §2 — and everything else still works |
-| Sound rises from quiet to full over ~20 s | The `FindAlarm` ramp. A phone in "total silence" Do Not Disturb stays silent and only vibrates; that is the platform, not a bug |
+| Menu on the watch: the watch says "phone ringing" and the tone starts on the phone; Menu again: "phone vibrating", the tone stops, the vibration does not | The `FindMode` notify over the phone's `Find` subscription (§4.1). A press the watch shows but the phone ignores means the subscription failed — the phone's log says whether `EnableFindNotifications` completed, and an older app has no subscription at all. A press the watch ignores too: the pin was low again 40 ms after the edge (a bounce), or nobody was connected — Menu does nothing while "searching" |
+| With the tone on, sound rises from quiet to full over ~20 s, afresh each time it is switched on | The `FindAlarm` ramp. A phone in "total silence" Do Not Disturb stays silent and only vibrates; that is the platform, not a bug |
+| The link drops with the tone on and the phone reconnects: the tone is back with no further press | The mode travels in the Status `flags` (`FIND_SOUND`) as well as in the notify, so a fresh link starts in the mode the wearer chose |
 | Back on the watch: the phone stops **at once** and the watch shows the menu | `hangUp()` terminated the link and the phone heard a disconnect. A stop that takes several seconds means the terminate did not go out and the phone waited for its supervision timeout — look at `find: ended … link dropped 0` |
 | Stop on the phone: the phone goes quiet and the watch says "phone found" | The `Find` write reached the watch. A watch that keeps searching means the write did not arrive or was malformed — `find: dismiss write result=` says which |
 | Left alone: the phone stops at two minutes and the watch returns to the watchface | The cap, on both sides. The phone's own 135 s backstop should never be what ends it; if `adb logcat -s Workaday` shows the ring ending on an operation timeout rather than a disconnect, the watch's hang-up is not reaching the phone |

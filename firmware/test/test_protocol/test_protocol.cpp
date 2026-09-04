@@ -84,14 +84,18 @@ void test_protocol_constants_match_the_document(void) {
   TEST_ASSERT_EQUAL_UINT8(0x01, core::kMsgTypeSetTime);
   TEST_ASSERT_EQUAL_UINT8(0x02, core::kMsgTypeFindDismiss);
   TEST_ASSERT_EQUAL_UINT8(0x81, core::kMsgTypeSyncResult);
+  TEST_ASSERT_EQUAL_UINT8(0x83, core::kMsgTypeFindMode);
   TEST_ASSERT_EQUAL_UINT32(12, static_cast<uint32_t>(core::kTimePayloadLength));
   TEST_ASSERT_EQUAL_UINT32(12, static_cast<uint32_t>(core::kStatusPayloadLength));
   TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(core::kFindPayloadLength));
   TEST_ASSERT_EQUAL_INT16(-840, core::kMinUtcOffsetMinutes);
   TEST_ASSERT_EQUAL_INT16(840, core::kMaxUtcOffsetMinutes);
   TEST_ASSERT_EQUAL_UINT8(0xFF, core::kBatteryPercentUnknown);
-  // §3.2 flags, bit 0. The only defined bit; a second one is a PROTOCOL.md change.
+  // §3.2 flags, bits 0 and 1. The only defined bits; a third is a PROTOCOL.md
+  // change. §3.3 FindMode's mode bit 0 carries the same fact as flags bit 1.
   TEST_ASSERT_EQUAL_UINT8(0x01, core::kStatusFlagFindPhone);
+  TEST_ASSERT_EQUAL_UINT8(0x02, core::kStatusFlagFindSound);
+  TEST_ASSERT_EQUAL_UINT8(0x01, core::kFindModeSound);
 }
 
 // §3.2's result table. These numbers are on the wire; renumbering the enum would
@@ -237,7 +241,24 @@ void test_status_flags_default_to_zero(void) {
   TEST_ASSERT_EQUAL_HEX8(0, fresh.flags);
 }
 
-// §3.2: "The sender puts only the defined bit on the wire." A garbled flags field
+// §7.4's second frame: the wearer asked for the tone as well.
+static const uint8_t kGoldenFindSoundStatus[12] = {0x01, 0x81, 0x00, 0x4E, 0xF0, 0xFF,
+                                                   0x82, 0x6A, 0x01, 0x00, 0x03, 0x00};
+
+void test_golden_find_sound_status_vector_encodes(void) {
+  Status status;
+  status.result = SyncResult::Ok;
+  status.battery_percent = 78;
+  status.applied_utc_epoch_s = 1786970096u;
+  status.fw_build = 1;
+  status.flags = core::kStatusFlagFindPhone | core::kStatusFlagFindSound;
+
+  uint8_t encoded[12] = {};
+  TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenFindSoundStatus, encoded, 12);
+}
+
+// §3.2: "The sender puts only the defined bits on the wire." A garbled flags field
 // must not reach a receiver that has since given bit 5 a meaning.
 void test_undefined_flag_bits_never_reach_the_wire(void) {
   Status status;
@@ -249,11 +270,65 @@ void test_undefined_flag_bits_never_reach_the_wire(void) {
 
   status.flags = 0xFF;
   TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenFindSoundStatus, encoded, 12);
+
+  status.flags = 0xFD;  // every bit but FIND_SOUND's
+  TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
   TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenFindStatus, encoded, 12);
 
-  status.flags = 0xFE;  // every bit but the defined one
+  status.flags = 0xFC;  // every bit but the two defined ones
   TEST_ASSERT_TRUE(core::encodeStatus(encoded, sizeof(encoded), status));
   TEST_ASSERT_EQUAL_HEX8_ARRAY(kGoldenStatus, encoded, 12);
+}
+
+// ── PROTOCOL.md §7.7 — the golden FindMode vectors ───────────────────────────
+//
+//   01 83 01 00      tone and vibration (SOUND = 1)
+//   01 83 00 00      vibration only
+void test_golden_find_mode_vectors_encode(void) {
+  const uint8_t sound[4] = {0x01, 0x83, 0x01, 0x00};
+  const uint8_t vibrate[4] = {0x01, 0x83, 0x00, 0x00};
+
+  uint8_t encoded[4];
+  for (size_t i = 0; i < sizeof(encoded); ++i) {
+    encoded[i] = 0xAA;
+  }
+  TEST_ASSERT_TRUE(core::encodeFindMode(encoded, sizeof(encoded), true));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(sound, encoded, 4);
+
+  TEST_ASSERT_TRUE(core::encodeFindMode(encoded, sizeof(encoded), false));
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(vibrate, encoded, 4);
+}
+
+void test_find_mode_encoder_refuses_a_short_buffer(void) {
+  uint8_t buffer[4];
+  for (size_t i = 0; i < sizeof(buffer); ++i) {
+    buffer[i] = 0xAA;
+  }
+  TEST_ASSERT_FALSE(core::encodeFindMode(buffer, 3, true));
+  for (size_t i = 0; i < sizeof(buffer); ++i) {
+    TEST_ASSERT_EQUAL_HEX8(0xAA, buffer[i]);
+  }
+  TEST_ASSERT_FALSE(core::encodeFindMode(nullptr, 4, true));
+  TEST_ASSERT_TRUE(core::encodeFindMode(buffer, 4, true));
+
+  // Extra capacity is left alone: exactly four bytes, never more.
+  uint8_t wide[8];
+  for (size_t i = 0; i < sizeof(wide); ++i) {
+    wide[i] = 0xAA;
+  }
+  TEST_ASSERT_TRUE(core::encodeFindMode(wide, sizeof(wide), false));
+  for (size_t i = 4; i < sizeof(wide); ++i) {
+    TEST_ASSERT_EQUAL_HEX8(0xAA, wide[i]);
+  }
+}
+
+// A FindMode frame arriving on the Find characteristic is not a dismissal, and the
+// dismiss decoder must say so rather than read the mode byte as reserved.
+void test_a_find_mode_frame_is_not_a_dismiss(void) {
+  const uint8_t mode[4] = {0x01, 0x83, 0x01, 0x00};
+  TEST_ASSERT_EQUAL_INT(resultAsInt(SyncResult::BadType),
+                        resultAsInt(core::decodeFindWrite(mode, sizeof(mode))));
 }
 
 // ── PROTOCOL.md §7.5 — the golden Find vector ────────────────────────────────
@@ -769,8 +844,12 @@ int main(void) {
   RUN_TEST(test_payload_builder_matches_golden_bytes);
   RUN_TEST(test_golden_status_vector_encodes);
   RUN_TEST(test_golden_find_status_vector_encodes);
+  RUN_TEST(test_golden_find_sound_status_vector_encodes);
   RUN_TEST(test_status_flags_default_to_zero);
   RUN_TEST(test_undefined_flag_bits_never_reach_the_wire);
+  RUN_TEST(test_golden_find_mode_vectors_encode);
+  RUN_TEST(test_find_mode_encoder_refuses_a_short_buffer);
+  RUN_TEST(test_a_find_mode_frame_is_not_a_dismiss);
   RUN_TEST(test_golden_find_vector_decodes);
   RUN_TEST(test_reject_find_wrong_lengths);
   RUN_TEST(test_reject_find_wrong_version);

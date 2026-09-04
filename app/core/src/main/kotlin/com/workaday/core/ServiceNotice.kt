@@ -76,9 +76,12 @@ fun serviceNoticeFor(state: ConnectionState): ServiceNotice = when (state) {
     ConnectionState.AwaitingStatus,
     -> ServiceNotice.Exchanging
 
-    // The phone is ringing, or the user has just silenced it and the watch is
-    // being told. One notice for both: the dismissal takes at most a few seconds
-    // and the caption is about why the phone rang, not about the write.
+    // The phone is ringing — from the moment the alarm starts, through the
+    // subscription round trip — or the user has just silenced it and the watch is
+    // being told. One notice for all three: the subscription and the dismissal
+    // take at most a few seconds each, and the caption is about why the phone
+    // rang, not about the writes.
+    is ConnectionState.SubscribingFind,
     ConnectionState.Ringing,
     ConnectionState.DismissingFind,
     -> ServiceNotice.FindingPhone

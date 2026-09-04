@@ -118,6 +118,7 @@ class WatchWindowTest {
                 // unreachable here as Idle and Blocked.
                 ConnectionState.Idle,
                 is ConnectionState.Blocked,
+                is ConnectionState.SubscribingFind,
                 ConnectionState.Ringing,
                 ConnectionState.DismissingFind,
                 -> fail("unreachable in this simulation: $state")

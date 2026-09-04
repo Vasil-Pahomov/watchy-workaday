@@ -182,12 +182,14 @@ the wire.
 **What the app does with the watch, v1:** push the phone's time to the watch on
 every connection, and read back the result. And one thing more since 3 Sep 2026:
 when the result carries the `FIND_PHONE` flag the watch is looking for this
-phone, and the app keeps the link open and rings — sound on the alarm channel,
-vibration, a full-screen Stop button — until the watch hangs up or the user
-silences it, which writes one `Find` frame back (`PROTOCOL.md` §4.1). Nothing
-else — step counts, notifications and calendar data are explicitly out of scope
-(`PROTOCOL.md` §9). The watch opens a BLE window hourly, plus on demand from its
-own menu; it is absent from the air the rest of the time.
+phone, and the app keeps the link open and makes itself felt — vibration and a
+full-screen Stop button by default, the alarm tone as well when the wearer
+presses Menu on the watch, which arrives as a `FindMode` notify on `Find` — until
+the watch hangs up or the user silences it, which writes one `Find` frame back
+(`PROTOCOL.md` §4.1). Nothing else — step counts, notifications and calendar data
+are explicitly out of scope (`PROTOCOL.md` §9). The watch opens a BLE window
+hourly, plus on demand from its own menu; it is absent from the air the rest of
+the time.
 
 The find-phone alarm bends one habit and it is worth naming: it is the one
 exchange after which the link is **not** closed. Every exit from that state

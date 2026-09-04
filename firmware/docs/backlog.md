@@ -163,14 +163,20 @@ Still open, and deliberately not built (`PROTOCOL.md` §9): bonding and encrypti
 (the first thing to add), step/battery history in the other direction, and
 notifications from the phone.
 
-### 14. ~~Find the phone from the watch~~ — done, unverified on hardware
-Shipped: the fourth menu item, `core::find_session` (32 tests) driving
+### 14. ~~Find the phone from the watch~~ — done; the search verified on hardware, the tone toggle not yet
+Shipped: the fourth menu item, `core::find_session` (43 tests) driving
 `board::ble::Session::findWait()`, a `Find` characteristic and a `flags` byte in
 `PROTOCOL.md` (§3.3, §4.1), and the phone's half in the companion app. The watch
 advertises for up to two minutes, redrawing the elapsed time and an attempt
 counter every five seconds; the phone connects, does the ordinary sync, reads the
-flag in the answer, and rings until the link ends or the user silences it — which
-writes `Find`, and the watch then says "phone found".
+flag in the answer, and vibrates until the link ends or the user silences it —
+which writes `Find`, and the watch then says "phone found". Menu, pressed while a
+phone is on the link, adds the alarm tone and takes it away again: the watch
+notifies a `FindMode` on `Find`, which the phone subscribes to after the flagged
+Status, and carries the mode in the Status `flags` too so a reconnecting phone
+starts in it. The press is debounced in `core/` — an edge starts a 40 ms clock,
+and the pin has to be high still when it runs out — because the Menu release that
+started the search bounces into the same interrupt.
 
 Two things about it are worth knowing before touching it:
 

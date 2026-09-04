@@ -484,6 +484,26 @@ void runSyncWindow(PersistedState& persist) {
 // `base` is the frame the wake would otherwise have drawn — the Find phone
 // screen, since the press that opened it moved the UI there — and each redraw is
 // that frame with the live counters filled in.
+
+// The Menu pin's level, for core::FindSession to confirm a press against
+// kFindButtonSettleMs after its edge. One digitalRead per wake of the find loop —
+// the loop wakes on events and deadlines, never to look at this — and the reason
+// it is a function pointer rather than a call inside board::ble is that the radio
+// module has no business knowing which pin the wearer's thumb is on.
+bool menuHeld() { return board::buttons::isPressed(core::ButtonId::Menu); }
+
+// The watch's side of §3.3: the current alarm mode, for the phone that just
+// subscribed or for the phone that is already ringing when the wearer flips it.
+void notifyFindMode(board::ble::Session& radio, const core::FindSession& session) {
+  uint8_t frame[core::kFindPayloadLength] = {};
+  if (!core::encodeFindMode(frame, sizeof(frame), session.sound())) {
+    return;
+  }
+  const bool heard = radio.notifyFind(frame, sizeof(frame));
+  WD_LOG("find: mode sound=%d notified=%d", session.sound() ? 1 : 0, heard ? 1 : 0);
+  static_cast<void>(heard);
+}
+
 core::FindOutcome runFindSession(PersistedState& persist, const app::Snapshot& base) {
   // §3.2's read path with the flag set, so even a phone that reads Status before
   // writing learns what kind of window it walked into.
@@ -511,15 +531,21 @@ core::FindOutcome runFindSession(PersistedState& persist, const app::Snapshot& b
 
   core::FindSession session;
 
-  // The wearer's way out. Back is delivered as a GPIO edge into the same event
-  // group the wait blocks on, so the loop wakes on it within a millisecond
-  // instead of at the next round — and without ever polling a pin, which is what
-  // Law 1 would otherwise have to forbid here. Detached before the radio scope
-  // ends, because deepSleep() re-arms the same pin as an ext1 wake source.
+  // The wearer's two buttons. Back is the way out; Menu flips the phone's alarm
+  // between vibration and vibration-plus-tone (§4.1). Both are delivered as GPIO
+  // edges into the same event group the wait blocks on, so the loop wakes on them
+  // within a millisecond instead of at the next round — and without ever polling
+  // a pin, which is what Law 1 would otherwise have to forbid here. Menu's edge
+  // is confirmed against the pin kFindButtonSettleMs later (core::FindSession),
+  // because the press that started this very search may still be releasing, and
+  // a tactile switch bounces on the way up. Both are detached before the radio
+  // scope ends, because deepSleep() re-arms the same pins as ext1 wake sources.
   board::buttons::attachPressInterrupt(core::ButtonId::Back, &board::ble::Session::requestAbort);
+  board::buttons::attachPressInterrupt(core::ButtonId::Menu,
+                                       &board::ble::Session::requestSoundToggle);
 
   for (;;) {
-    const core::FindEvent event = radio.findWait(session);
+    const core::FindEvent event = radio.findWait(session, &menuHeld);
 
     if (event == core::FindEvent::StillWaiting) {
       // Nothing progressed. Wait again and, above all, do not feed.
@@ -536,15 +562,29 @@ core::FindOutcome runFindSession(PersistedState& persist, const app::Snapshot& b
         break;
 
       case core::FindEvent::TimeWritten: {
-        // §4 verbatim — decode, clock, record, answer — with FIND_PHONE in the
-        // answer. §4.1: the result is recorded but decides nothing here; the
-        // phone rings whatever it was.
-        const core::SyncResult result =
-            answerTimeWrite(radio, persist, core::kStatusFlagFindPhone);
+        // §4 verbatim — decode, clock, record, answer — with FIND_PHONE, and
+        // FIND_SOUND if the wearer has asked for the tone, in the answer. §4.1:
+        // the result is recorded but decides nothing here; the phone rings
+        // whatever it was.
+        const core::SyncResult result = answerTimeWrite(radio, persist, session.statusFlags());
         static_cast<void>(result);
         session.noteStatusNotified();
         break;
       }
+
+      case core::FindEvent::FindSubscribed:
+        // §4.1: the phone can hear the mode from here on, so it is told the
+        // current one — which delivers a Menu press that landed before the
+        // subscription instead of losing it.
+        notifyFindMode(radio, session);
+        break;
+
+      case core::FindEvent::SoundToggled:
+        // A confirmed Menu press. The phone hears it now if it is subscribed, the
+        // screen shows it below, and the next Status carries it if the link has
+        // to be rebuilt.
+        notifyFindMode(radio, session);
+        break;
 
       case core::FindEvent::FindWritten: {
         // The phone's side of "found". Whether the bytes mean that is core's
@@ -592,6 +632,7 @@ core::FindOutcome runFindSession(PersistedState& persist, const app::Snapshot& b
     app::Snapshot frame = base;
     frame.find_live = true;
     frame.find_phase = session.phase();
+    frame.find_sound = session.sound();
     frame.find_outcome = core::FindOutcome::InProgress;
     frame.find_attempts = session.attempts();
     frame.find_elapsed_s = core::FindSession::elapsedSeconds(radio.elapsedMs());
@@ -599,6 +640,7 @@ core::FindOutcome runFindSession(PersistedState& persist, const app::Snapshot& b
     board::power::feedWatchdog();
   }
 
+  board::buttons::detachPressInterrupt(core::ButtonId::Menu);
   board::buttons::detachPressInterrupt(core::ButtonId::Back);
 
   // §4.1: the phone stops ringing when the link ends, and it must hear a

@@ -38,6 +38,14 @@ class ConnectionStateMachineTest {
     private val findStatus = hex("01 81 00 4E F0 FF 82 6A 01 00 01 00")
     private val findBusyStatus = hex("01 81 06 4E 00 00 00 00 01 00 01 00")
 
+    // PROTOCOL.md §7.4's second vector: FIND_PHONE | FIND_SOUND — the wearer pressed
+    // Menu before the phone connected, so the tone is wanted from the start.
+    private val findSoundStatus = hex("01 81 00 4E F0 FF 82 6A 01 00 03 00")
+
+    // PROTOCOL.md §7.7: the two FindMode frames the watch notifies on Find.
+    private val findModeSound = hex("01 83 01 00")
+    private val findModeSilent = hex("01 83 00 00")
+
     // PROTOCOL.md §7.1: the app must put exactly these bytes on the wire when the
     // phone's clock reads 2026-08-17T12:34:56Z at UTC+180.
     private val goldenTimePayload = hex("01 01 F0 FF 82 6A B4 00 00 00 00 00")
@@ -825,10 +833,20 @@ class ConnectionStateMachineTest {
 
     // ── §4.1, find phone ─────────────────────────────────────────────────────
 
-    /** The §4 exchange, ending in the watch's flagged Status: the phone is now ringing. */
-    private fun FakeTransport.runToRinging() {
+    /**
+     * The §4 exchange, ending in the watch's flagged Status: the alarm is on and
+     * the phone's subscription to Find is outstanding.
+     */
+    private fun FakeTransport.runToSubscribingFind(status: ByteArray = findStatus) {
         runToAwaitingStatus()
-        send(TransportEvent.NotificationReceived(findStatus))
+        send(TransportEvent.NotificationReceived(status))
+        assertEquals(ConnectionState.SubscribingFind(), machine.state)
+    }
+
+    /** ...and the subscription's callback: the phone is now ringing under the backstop. */
+    private fun FakeTransport.runToRinging(status: ByteArray = findStatus) {
+        runToSubscribingFind(status)
+        send(TransportEvent.DescriptorWritten(GATT_SUCCESS))
         assertEquals(ConnectionState.Ringing, machine.state)
     }
 
@@ -841,16 +859,31 @@ class ConnectionStateMachineTest {
                 "CancelTimers",
                 "PersistHealth",
                 "ReportExchange(Succeeded)",
-                "StartFindAlarm",
-                // The §5.2 ring backstop, not a per-operation timeout: nothing is
-                // outstanding on the link, and this is how long the phone will ring
-                // with no word from the watch.
-                "ArmOperationTimeout(135000)",
+                // Vibration only, unless the Status says the wearer already asked
+                // for the tone — and on before the subscription is even issued: a
+                // lost phone does not wait a round trip to make itself felt.
+                "StartFindAlarm(sound=false)",
+                // Then one GATT operation, under the plain per-operation timeout:
+                // the phone's subscription to the mode channel (§4.1).
+                "ArmOperationTimeout(5000)",
+                "EnableFindNotifications",
             ),
             t.send(TransportEvent.NotificationReceived(findStatus)).summary(),
         )
-        assertEquals(ConnectionState.Ringing, t.machine.state)
+        assertEquals(ConnectionState.SubscribingFind(), t.machine.state)
         assertTrue(t.linkOpen, "the link is held open so the watch can end the ring by hanging up")
+        assertTrue(t.alarmOn)
+        assertFalse(t.alarmSound, "§4.1: a search starts vibration-only")
+
+        // The subscription's callback settles into the ring proper, under the §5.2
+        // ring backstop — not a per-operation timeout: nothing is outstanding on
+        // the link any more, and this is how long the phone will ring with no word
+        // from the watch.
+        assertEquals(
+            listOf("CancelTimers", "ArmOperationTimeout(135000)"),
+            t.send(TransportEvent.DescriptorWritten(GATT_SUCCESS)).summary(),
+        )
+        assertEquals(ConnectionState.Ringing, t.machine.state)
         assertTrue(t.alarmOn)
         // Recorded exactly as the ordinary success it also was: the counters, the
         // record, the battery — nothing about the flag changes what the diagnostic
@@ -860,6 +893,220 @@ class ConnectionStateMachineTest {
         assertEquals(ExchangeOutcome.Succeeded, t.reports.single().outcome)
         assertEquals(78, t.reports.single().status?.batteryPercent)
         assertEquals(true, t.reports.single().status?.findPhoneRequested)
+        assertEquals(false, t.reports.single().status?.findSoundRequested)
+    }
+
+    @Test
+    fun `find phone - a Status carrying FIND_SOUND starts the tone straight away`() {
+        // The wearer pressed Menu on the watch before the phone connected (§4.1):
+        // the Status carries the mode, and the alarm starts in it rather than
+        // waiting for a FindMode the watch will only send once subscribed.
+        val t = harness()
+        t.runToAwaitingStatus()
+        val actions = t.send(TransportEvent.NotificationReceived(findSoundStatus)).summary()
+        assertTrue("StartFindAlarm(sound=true)" in actions, "$actions")
+        assertEquals(ConnectionState.SubscribingFind(), t.machine.state)
+        assertTrue(t.alarmOn)
+        assertTrue(t.alarmSound)
+        assertEquals(true, t.reports.single().status?.findSoundRequested)
+        t.send(TransportEvent.DescriptorWritten(GATT_SUCCESS))
+        assertTrue(t.alarmSound, "settling into the ring keeps the mode")
+    }
+
+    @Test
+    fun `find phone - a FindMode notify adds the tone and takes it away again`() {
+        // The wearer's Menu press, arriving as PROTOCOL.md §7.7's frames. Vibration
+        // continues throughout; only the tone comes and goes.
+        val t = harness()
+        t.runToRinging()
+        assertFalse(t.alarmSound)
+
+        assertEquals(
+            listOf("SetFindAlarmSound(sound=true)"),
+            t.send(TransportEvent.NotificationReceived(findModeSound)).summary(),
+        )
+        assertTrue(t.alarmSound)
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+
+        assertEquals(
+            listOf("SetFindAlarmSound(sound=false)"),
+            t.send(TransportEvent.NotificationReceived(findModeSilent)).summary(),
+        )
+        assertFalse(t.alarmSound)
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+
+        // The backstop is untouched by any of it: a ring is bounded however often
+        // its mode changes, and the exchange was recorded once.
+        assertEquals(135_000L, t.pendingTimerDelayMillis)
+        assertEquals(1, t.reports.size)
+    }
+
+    @Test
+    fun `find phone - the watch's answer to the subscription can beat the CCCD callback`() {
+        // §4.1: the watch notifies the current mode as soon as the phone
+        // subscribes, and Android delivers onCharacteristicChanged and
+        // onDescriptorWrite independently. A mode that wins that race is still a
+        // mode — the same reasoning as a Status beating its write callback.
+        val t = harness()
+        t.runToSubscribingFind()
+        assertEquals(
+            listOf("SetFindAlarmSound(sound=true)"),
+            t.send(TransportEvent.NotificationReceived(findModeSound)).summary(),
+        )
+        assertTrue(t.alarmSound)
+        assertEquals(ConnectionState.SubscribingFind(), t.machine.state)
+
+        t.send(TransportEvent.DescriptorWritten(GATT_SUCCESS))
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+        assertTrue(t.alarmSound, "settling into the ring does not reset the mode")
+    }
+
+    @Test
+    fun `find phone - a subscription that fails rings on in the mode the Status asked for`() {
+        // An older watch has no notify on Find and therefore no CCCD there — the
+        // Android layer reports GATT_LOCAL_FAILURE at once — or the stack refuses
+        // the write. Either way the alarm is already on; what is lost is only the
+        // mid-link mode change. Not a failed exchange: nothing to back off from.
+        for (status in listOf(GATT_LOCAL_FAILURE, 133)) {
+            val t = harness(health = HealthSnapshot(consecutiveFailures = 2))
+            t.runToSubscribingFind()
+            assertEquals(
+                listOf("CancelTimers", "ArmOperationTimeout(135000)"),
+                t.send(TransportEvent.DescriptorWritten(status)).summary(),
+                "status $status",
+            )
+            assertEquals(ConnectionState.Ringing, t.machine.state, "status $status")
+            assertTrue(t.alarmOn, "status $status")
+            assertEquals(0, t.machine.health.consecutiveFailures, "status $status")
+            assertEquals(1, t.reports.size, "status $status")
+        }
+    }
+
+    @Test
+    fun `find phone - a subscription that never completes times out into the ring`() {
+        val t = harness()
+        t.runToSubscribingFind()
+        assertEquals(
+            5_000L,
+            t.pendingTimerDelayMillis,
+            "the plain §5.2 per-operation timeout: the exchange budget is spent, and this is not an exchange",
+        )
+        assertEquals(listOf("ArmOperationTimeout(135000)"), t.fireOperationTimeout().summary())
+        assertEquals(ConnectionState.Ringing, t.machine.state)
+        assertTrue(t.alarmOn)
+        assertEquals(0, t.machine.health.consecutiveFailures, "a lost mode channel is not a fault")
+        assertEquals(1, t.reports.size)
+    }
+
+    @Test
+    fun `find phone - Stop tapped during the subscription silences at once and writes Find on the callback`() {
+        // Law 2: one outstanding operation at a time. The CCCD write is on the
+        // link, so the §3.3 dismiss waits for its callback — but the alarm does
+        // not wait, because the person holding the phone has already found it.
+        val t = harness()
+        t.runToSubscribingFind()
+
+        assertEquals(listOf("StopFindAlarm"), t.send(TransportEvent.FindDismissedOnPhone).summary())
+        assertEquals(ConnectionState.SubscribingFind(dismissRequested = true), t.machine.state)
+        assertFalse(t.alarmOn, "the alarm stops at the tap")
+        assertTrue(t.linkOpen, "the link stays up for the write to come")
+        assertEquals(5_000L, t.pendingTimerDelayMillis, "the CCCD write's own timeout keeps running")
+        assertEquals(0, t.findWritesThisConnection, "no second operation on top of the first")
+
+        // A second tap, and a mode for an alarm that is already off, change nothing.
+        assertTrue(t.send(TransportEvent.FindDismissedOnPhone).isEmpty())
+        assertTrue(t.send(TransportEvent.NotificationReceived(findModeSound)).isEmpty())
+        assertEquals(ConnectionState.SubscribingFind(dismissRequested = true), t.machine.state)
+
+        assertEquals(
+            listOf("CancelTimers", "ArmOperationTimeout(5000)", "WriteFindDismiss(4)"),
+            t.send(TransportEvent.DescriptorWritten(GATT_SUCCESS)).summary(),
+        )
+        assertEquals(ConnectionState.DismissingFind, t.machine.state)
+        assertContentEquals(hex("01 02 00 00"), t.lastFindPayload)
+
+        assertEquals(
+            listOf("CancelTimers", "CloseConnection", "ArmAutoConnect"),
+            t.send(TransportEvent.CharacteristicWritten(GATT_SUCCESS)).summary(),
+        )
+        assertEquals(ConnectionState.Armed, t.machine.state)
+        assertEquals(1, t.reports.size)
+    }
+
+    @Test
+    fun `find phone - Stop tapped during a subscription that fails still writes Find, one that times out closes`() {
+        // The CCCD write failing says nothing about the Find characteristic itself
+        // — an older watch has it write-only — so the dismiss is still worth a
+        // try. A timeout is different: a link whose last operation never answered
+        // is not one to issue another write on; the user has already silenced the
+        // phone, so close and re-arm.
+        val failed = harness()
+        failed.runToSubscribingFind()
+        failed.send(TransportEvent.FindDismissedOnPhone)
+        assertEquals(
+            listOf("CancelTimers", "ArmOperationTimeout(5000)", "WriteFindDismiss(4)"),
+            failed.send(TransportEvent.DescriptorWritten(133)).summary(),
+        )
+        assertEquals(ConnectionState.DismissingFind, failed.machine.state)
+
+        val timedOut = harness()
+        timedOut.runToSubscribingFind()
+        timedOut.send(TransportEvent.FindDismissedOnPhone)
+        assertEquals(listOf("CloseConnection", "ArmAutoConnect"), timedOut.fireOperationTimeout().summary())
+        assertEquals(ConnectionState.Armed, timedOut.machine.state)
+        assertEquals(0, timedOut.machine.health.consecutiveFailures)
+    }
+
+    @Test
+    fun `find phone - the watch hanging up during the subscription stops the alarm and re-arms`() {
+        val t = harness()
+        t.runToSubscribingFind()
+        assertEquals(
+            listOf("CancelTimers", "StopFindAlarm", "CloseConnection", "ArmAutoConnect"),
+            t.send(TransportEvent.Disconnected(19)).summary(),
+        )
+        assertEquals(ConnectionState.Armed, t.machine.state)
+        assertFalse(t.alarmOn)
+        assertEquals(0, t.machine.health.consecutiveFailures)
+        assertEquals(1, t.reports.size)
+
+        // With Stop already tapped there is nothing left to silence.
+        val silenced = harness()
+        silenced.runToSubscribingFind()
+        silenced.send(TransportEvent.FindDismissedOnPhone)
+        assertEquals(
+            listOf("CancelTimers", "CloseConnection", "ArmAutoConnect"),
+            silenced.send(TransportEvent.Disconnected(19)).summary(),
+        )
+        assertEquals(ConnectionState.Armed, silenced.machine.state)
+    }
+
+    @Test
+    fun `find phone - stray events while subscribing change nothing`() {
+        val t = harness()
+        t.runToSubscribingFind()
+        val strays = listOf(
+            TransportEvent.Started,
+            TransportEvent.Connected(GATT_SUCCESS),
+            TransportEvent.ServicesDiscovered(GATT_SUCCESS),
+            // The Time write's late callback — not the dismiss completing.
+            TransportEvent.CharacteristicWritten(GATT_SUCCESS),
+            // PROTOCOL.md §7.8: none of these is a FindMode, and none is acted on.
+            TransportEvent.NotificationReceived(okStatus),
+            TransportEvent.NotificationReceived(findStatus),
+            TransportEvent.NotificationReceived(ByteArray(3)),
+            TransportEvent.NotificationReceived(hex("01 02 00 00")),
+            TransportEvent.NotificationReceived(hex("02 83 01 00")),
+            TransportEvent.RetryTimerFired(t.pendingTimerToken ?: -1L),
+            TransportEvent.AdapterOn,
+            TransportEvent.PermissionGranted,
+        )
+        for (stray in strays) {
+            assertTrue(t.send(stray).isEmpty(), "$stray")
+            assertEquals(ConnectionState.SubscribingFind(), t.machine.state, "$stray")
+        }
+        assertFalse(t.alarmSound, "no stray can switch the tone on")
+        assertEquals(1, t.reports.size)
     }
 
     @Test
@@ -958,17 +1205,34 @@ class ConnectionStateMachineTest {
 
     @Test
     fun `find phone - the radio going away silences the alarm`() {
+        val reach = listOf<Pair<String, FakeTransport.() -> Unit>>(
+            "ringing" to { runToRinging() },
+            "subscribing" to { runToSubscribingFind() },
+        )
         for (event in listOf(TransportEvent.AdapterOff, TransportEvent.PermissionRevoked)) {
-            val t = harness()
-            t.runToRinging()
-            assertEquals(listOf("CancelTimers", "StopFindAlarm", "CloseConnection"), t.send(event).summary(), "$event")
-            assertIs<ConnectionState.Blocked>(t.machine.state, "$event")
-            assertFalse(t.alarmOn, "$event")
-            // And it comes back armed, as from any Blocked.
-            t.send(TransportEvent.AdapterOn)
-            t.send(TransportEvent.PermissionGranted)
-            assertEquals(ConnectionState.Armed, t.machine.state, "$event")
+            for ((where, arrive) in reach) {
+                val t = harness()
+                arrive(t)
+                assertEquals(
+                    listOf("CancelTimers", "StopFindAlarm", "CloseConnection"),
+                    t.send(event).summary(),
+                    "$event while $where",
+                )
+                assertIs<ConnectionState.Blocked>(t.machine.state, "$event while $where")
+                assertFalse(t.alarmOn, "$event while $where")
+                // And it comes back armed, as from any Blocked.
+                t.send(TransportEvent.AdapterOn)
+                t.send(TransportEvent.PermissionGranted)
+                assertEquals(ConnectionState.Armed, t.machine.state, "$event while $where")
+            }
         }
+
+        // With Stop already tapped, the alarm is off and only the link goes.
+        val silenced = harness()
+        silenced.runToSubscribingFind()
+        silenced.send(TransportEvent.FindDismissedOnPhone)
+        assertEquals(listOf("CancelTimers", "CloseConnection"), silenced.send(TransportEvent.AdapterOff).summary())
+        assertIs<ConnectionState.Blocked>(silenced.machine.state)
     }
 
     @Test
@@ -983,14 +1247,17 @@ class ConnectionStateMachineTest {
                 "CancelTimers",
                 "PersistHealth",
                 "ReportExchange(WatchReportedFailure)",
-                "StartFindAlarm",
-                "ArmOperationTimeout(135000)",
+                "StartFindAlarm(sound=false)",
+                "ArmOperationTimeout(5000)",
+                "EnableFindNotifications",
             ),
             t.send(TransportEvent.NotificationReceived(findBusyStatus)).summary(),
         )
-        assertEquals(ConnectionState.Ringing, t.machine.state)
+        assertEquals(ConnectionState.SubscribingFind(), t.machine.state)
         assertEquals(1, t.machine.health.consecutiveFailures)
         assertEquals(6, t.machine.health.lastStatusResultCode)
+        t.send(TransportEvent.DescriptorWritten(GATT_SUCCESS))
+        assertEquals(ConnectionState.Ringing, t.machine.state)
 
         // And when the watch hangs up, the phone still re-arms at once: a ring that
         // ended is not a reason to wait 30 s before the watch can find us again.
@@ -1012,9 +1279,12 @@ class ConnectionStateMachineTest {
         )
         assertEquals(ConnectionState.WritingTime, t.machine.state)
         t.send(TransportEvent.NotificationReceived(findStatus))
-        assertEquals(ConnectionState.Ringing, t.machine.state)
+        assertEquals(ConnectionState.SubscribingFind(), t.machine.state)
         // The late write callback changes nothing — and in particular does not
-        // read as the dismiss write completing.
+        // read as the dismiss write completing — before or after the subscription.
+        assertTrue(t.send(TransportEvent.CharacteristicWritten(GATT_SUCCESS)).isEmpty())
+        assertEquals(ConnectionState.SubscribingFind(), t.machine.state)
+        t.send(TransportEvent.DescriptorWritten(GATT_SUCCESS))
         assertTrue(t.send(TransportEvent.CharacteristicWritten(GATT_SUCCESS)).isEmpty())
         assertEquals(ConnectionState.Ringing, t.machine.state)
     }
@@ -1029,9 +1299,14 @@ class ConnectionStateMachineTest {
             TransportEvent.ServicesDiscovered(GATT_SUCCESS),
             TransportEvent.DescriptorWritten(GATT_SUCCESS),
             TransportEvent.CharacteristicWritten(GATT_SUCCESS),
+            // PROTOCOL.md §7.8: a Status, garbage, our own dismiss echoed, a wrong
+            // version, a wrong length — none of them a FindMode, none acted on.
             TransportEvent.NotificationReceived(okStatus),
             TransportEvent.NotificationReceived(findStatus),
             TransportEvent.NotificationReceived(ByteArray(3)),
+            TransportEvent.NotificationReceived(hex("01 02 00 00")),
+            TransportEvent.NotificationReceived(hex("02 83 01 00")),
+            TransportEvent.NotificationReceived(hex("01 83 01 00 00")),
             TransportEvent.RetryTimerFired(t.pendingTimerToken ?: -1L),
             TransportEvent.AdapterOn,
             TransportEvent.PermissionGranted,
@@ -1040,6 +1315,7 @@ class ConnectionStateMachineTest {
             assertTrue(t.send(stray).isEmpty(), "$stray")
             assertEquals(ConnectionState.Ringing, t.machine.state, "$stray")
         }
+        assertFalse(t.alarmSound, "no stray can switch the tone on")
         assertEquals(1, t.reports.size, "a second flagged Status must not be double-counted")
     }
 
@@ -1070,7 +1346,7 @@ class ConnectionStateMachineTest {
         val t = harness()
         t.runToAwaitingStatus()
         val actions = t.send(TransportEvent.NotificationReceived(okStatus))
-        assertTrue(actions.none { it == Action.StartFindAlarm })
+        assertTrue(actions.none { it is Action.StartFindAlarm })
         assertIs<ConnectionState.Settling>(t.machine.state)
         assertFalse(t.linkOpen)
     }
@@ -1097,6 +1373,9 @@ class ConnectionStateMachineTest {
         "Notify(busy)" to { _ -> TransportEvent.NotificationReceived(busyStatus.copyOf()) },
         "Notify(garbage)" to { _ -> TransportEvent.NotificationReceived(ByteArray(3)) },
         "Notify(find)" to { _ -> TransportEvent.NotificationReceived(findStatus.copyOf()) },
+        "Notify(find-sound)" to { _ -> TransportEvent.NotificationReceived(findSoundStatus.copyOf()) },
+        "Notify(mode-sound)" to { _ -> TransportEvent.NotificationReceived(findModeSound.copyOf()) },
+        "Notify(mode-silent)" to { _ -> TransportEvent.NotificationReceived(findModeSilent.copyOf()) },
         "FindDismissed" to { _ -> TransportEvent.FindDismissedOnPhone },
         "Timeout(current)" to { t -> TransportEvent.OperationTimedOut(t.pendingTimerToken ?: -1L) },
         "Retry(current)" to { t -> TransportEvent.RetryTimerFired(t.pendingTimerToken ?: -1L) },
@@ -1157,9 +1436,21 @@ class ConnectionStateMachineTest {
             ),
             ConnectionState.AwaitingStatus,
         ),
-        // The two find-phone states need the whole exchange plus the flagged
+        // The three find-phone states need the whole exchange plus the flagged
         // Status to reach, so a triple from any earlier prefix visits them rarely
         // or never; seeded like AwaitingStatus, for the same reason.
+        Triple(
+            "subscribing-find",
+            listOf(
+                TransportEvent.Started,
+                TransportEvent.Connected(GATT_SUCCESS),
+                TransportEvent.ServicesDiscovered(GATT_SUCCESS),
+                TransportEvent.DescriptorWritten(GATT_SUCCESS),
+                TransportEvent.CharacteristicWritten(GATT_SUCCESS),
+                TransportEvent.NotificationReceived(findStatus),
+            ),
+            ConnectionState.SubscribingFind(),
+        ),
         Triple(
             "ringing",
             listOf(
@@ -1169,6 +1460,7 @@ class ConnectionStateMachineTest {
                 TransportEvent.DescriptorWritten(GATT_SUCCESS),
                 TransportEvent.CharacteristicWritten(GATT_SUCCESS),
                 TransportEvent.NotificationReceived(findStatus),
+                TransportEvent.DescriptorWritten(GATT_SUCCESS),
             ),
             ConnectionState.Ringing,
         ),
@@ -1181,6 +1473,7 @@ class ConnectionStateMachineTest {
                 TransportEvent.DescriptorWritten(GATT_SUCCESS),
                 TransportEvent.CharacteristicWritten(GATT_SUCCESS),
                 TransportEvent.NotificationReceived(findStatus),
+                TransportEvent.DescriptorWritten(GATT_SUCCESS),
                 TransportEvent.FindDismissedOnPhone,
             ),
             ConnectionState.DismissingFind,
@@ -1221,10 +1514,12 @@ class ConnectionStateMachineTest {
         // a state and nothing says so.
         //
         // The threshold is well under what this walk actually achieves — the
-        // thinnest state, Settling, is visited about 3,600 times, and the two
-        // find-phone states 25,000 or more thanks to their own prefixes — so an
+        // thinnest state, Settling, is visited about 4,500 times, and the three
+        // find-phone states 40,000 or more thanks to their own prefixes — so an
         // ordinary edit to the event list cannot trip it, while losing a state
-        // to unreachability does.
+        // to unreachability does. The count is printed so the figures here can
+        // be checked against the test report rather than believed.
+        println("exhaustive triple walk coverage: $coverage")
         coverage.assertEveryStateVisited(atLeast = 2_000, walk = "the exhaustive triple walk")
     }
 
@@ -1248,10 +1543,13 @@ class ConnectionStateMachineTest {
             // its two source states with the flagged Status below; six keeps it
             // above the floor once the find events joined the pool.
             "Notify(ok)" to 6,
-            // Heavy, like the exchange steps: Ringing is reached only through a
-            // flagged Status from WritingTime or AwaitingStatus, and DismissingFind
-            // only from Ringing, so both are two rare draws deep without these.
+            // Heavy, like the exchange steps: SubscribingFind is reached only
+            // through a flagged Status from WritingTime or AwaitingStatus, Ringing
+            // only from there through the CCCD callback, and DismissingFind from
+            // either through the tap — so each is one rare draw deeper than the
+            // last without these.
             "Notify(find)" to 6,
+            "Notify(find-sound)" to 3,
             "FindDismissed" to 8,
             // Blocked is near-absorbing (see above); a little more weight on the
             // two events that leave it buys every other state more of the stream.
@@ -1303,10 +1601,12 @@ class ConnectionStateMachineTest {
             }
             driveBackToArmed(t, "run $run")
         }
-        // Thinnest observed is DismissingFind at ~350 visits, then AwaitingStatus
-        // at ~500 and Settling at ~630; the walk is deterministic (fixed seed,
-        // fixed weights), so this only moves when somebody edits the event list,
-        // the weights or the stream count.
+        // Thinnest observed is AwaitingStatus at ~330 visits, then DismissingFind
+        // at ~380, Ringing at ~415 and Settling at ~450; the walk is deterministic
+        // (fixed seed, fixed weights), so this only moves when somebody edits the
+        // event list, the weights or the stream count. Printed for the same reason
+        // as above.
+        println("random walk coverage: $coverage")
         coverage.assertEveryStateVisited(atLeast = 200, walk = "the random walk")
     }
 
@@ -1330,7 +1630,9 @@ class ConnectionStateMachineTest {
                 ConnectionState.AwaitingStatus,
                 // Settling is a waiting state too, and the same timer ends it.
                 is ConnectionState.Settling,
-                // As are a ring (the §5.2 backstop) and a dismiss (its write timeout).
+                // As are the Find subscription (its own timeout, into the ring), a
+                // ring (the §5.2 backstop) and a dismiss (its write timeout).
+                is ConnectionState.SubscribingFind,
                 ConnectionState.Ringing,
                 ConnectionState.DismissingFind,
                 -> t.fireOperationTimeout()

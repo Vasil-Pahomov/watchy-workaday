@@ -157,24 +157,94 @@ class WatchProtocolTest {
     }
 
     @Test
-    fun `only bit 0 of flags is read - the reserved bits cannot ring the phone`() {
-        // Bits 1..7 are reserved, and a later v1.x may give one meaning this build
-        // does not know. Every byte with bit 0 clear must read as "not finding";
-        // every byte with it set must read as finding, whatever else is in it.
+    fun `golden vector 7_4 - a Status carrying FIND_PHONE and FIND_SOUND asks for the tone as well`() {
+        // §7.4's second vector: the wearer pressed Menu before the phone connected.
+        val plain = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(goldenStatus)).status
+        val vibrating = assertIs<StatusDecode.Valid>(
+            WatchProtocol.decodeStatus(hex("01 81 00 4E F0 FF 82 6A 01 00 01 00")),
+        ).status
+        val sounding = assertIs<StatusDecode.Valid>(
+            WatchProtocol.decodeStatus(hex("01 81 00 4E F0 FF 82 6A 01 00 03 00")),
+        ).status
+
+        assertFalse(plain.findSoundRequested)
+        assertFalse(vibrating.findSoundRequested, "§4.1: a search starts vibration-only")
+        assertTrue(sounding.findPhoneRequested)
+        assertTrue(sounding.findSoundRequested)
+        // Byte 10 is all that differs from §7.2.
+        assertEquals(plain.resultCode, sounding.resultCode)
+        assertEquals(plain.batteryPercent, sounding.batteryPercent)
+        assertEquals(plain.appliedUtcEpochSeconds, sounding.appliedUtcEpochSeconds)
+        assertEquals(plain.fwBuild, sounding.fwBuild)
+        assertTrue(sounding.isSuccess)
+    }
+
+    @Test
+    fun `only bits 0 and 1 of flags are read - the reserved bits cannot ring the phone`() {
+        // Bits 2..7 are reserved, and a later v1.x may give one meaning this build
+        // does not know. Every byte with bit 0 clear must read as "not finding",
+        // every byte with bit 1 clear as "no tone", whatever else is in it.
         for (flags in 0..255) {
             val payload = goldenStatus.copyOf().also { it[10] = flags.toByte() }
             val status = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(payload)).status
             assertEquals((flags and 0x01) != 0, status.findPhoneRequested, "flags 0x%02X".format(flags))
+            assertEquals((flags and 0x02) != 0, status.findSoundRequested, "flags 0x%02X".format(flags))
         }
         assertEquals(0x01, WatchProtocol.STATUS_FLAG_FIND_PHONE)
+        assertEquals(0x02, WatchProtocol.STATUS_FLAG_FIND_SOUND)
     }
 
     @Test
     fun `section 3_3 constants`() {
         assertEquals(0x02, WatchProtocol.MSG_TYPE_FIND_DISMISS)
+        assertEquals(0x83, WatchProtocol.MSG_TYPE_FIND_MODE)
+        assertEquals(0x01, WatchProtocol.FIND_MODE_SOUND)
         assertEquals(4, WatchProtocol.FIND_PAYLOAD_LENGTH)
-        assertNotEquals(WatchProtocol.MSG_TYPE_FIND_DISMISS, WatchProtocol.MSG_TYPE_SET_TIME)
-        assertNotEquals(WatchProtocol.MSG_TYPE_FIND_DISMISS, WatchProtocol.MSG_TYPE_SYNC_RESULT)
+        // Four message types, all distinct; the high bit marks the watch's two.
+        val types = setOf(
+            WatchProtocol.MSG_TYPE_SET_TIME,
+            WatchProtocol.MSG_TYPE_FIND_DISMISS,
+            WatchProtocol.MSG_TYPE_SYNC_RESULT,
+            WatchProtocol.MSG_TYPE_FIND_MODE,
+        )
+        assertEquals(4, types.size)
+    }
+
+    @Test
+    fun `golden vector 7_7 - FindMode decodes to the document's two modes`() {
+        assertEquals(FindMode(sound = true), WatchProtocol.decodeFindMode(hex("01 83 01 00")))
+        assertEquals(FindMode(sound = false), WatchProtocol.decodeFindMode(hex("01 83 00 00")))
+        // Bits 1–7 of `mode` are reserved and ignored, as is the reserved byte.
+        assertEquals(FindMode(sound = true), WatchProtocol.decodeFindMode(hex("01 83 FF 00")))
+        assertEquals(FindMode(sound = false), WatchProtocol.decodeFindMode(hex("01 83 FE 00")))
+        assertEquals(FindMode(sound = true), WatchProtocol.decodeFindMode(hex("01 83 01 5A")))
+    }
+
+    @Test
+    fun `golden vector 7_8 - anything that is not a FindMode is null, not a crash and not a mode`() {
+        // §3.3: an invalid frame is ignored and the phone keeps doing what it was
+        // doing — so the decoder answers "not a mode", never throws, and never
+        // reads a mode out of bytes that only look like one.
+        val ignored = listOf<Pair<String, ByteArray?>>(
+            "null" to null,
+            "empty" to ByteArray(0),
+            "3 bytes" to hex("01 83 01"),
+            "5 bytes" to hex("01 83 01 00 00"),
+            "wrong version" to hex("02 83 01 00"),
+            "a Status frame" to hex("01 81 00 4E F0 FF 82 6A 01 00 01 00"),
+            "our own FindDismiss echoed" to hex("01 02 00 00"),
+            "a Time msg_type" to hex("01 01 01 00"),
+        )
+        for ((name, payload) in ignored) {
+            assertNull(WatchProtocol.decodeFindMode(payload), name)
+        }
+    }
+
+    @Test
+    fun `decodeFindMode does not mutate the payload it was given`() {
+        val payload = hex("01 83 01 00")
+        WatchProtocol.decodeFindMode(payload)
+        assertContentEquals(hex("01 83 01 00"), payload)
     }
 
     @Test
@@ -439,8 +509,8 @@ class WatchProtocolTest {
     fun `reserved bytes are ignored, so a later v1_x can use them`() {
         // Offset 10 was the proof of this rule — it became `flags` on 3 Sep 2026
         // without a version bump — so the bits that are still reserved are what is
-        // exercised now: flags bits 1..7 (0x5A has bit 0 clear) and offset 11.
-        val withReserved = goldenStatus.copyOf().also { it[10] = 0x5A; it[11] = 0xA5.toByte() }
+        // exercised now: flags bits 2..7 (0x58 has bits 0 and 1 clear) and offset 11.
+        val withReserved = goldenStatus.copyOf().also { it[10] = 0x58; it[11] = 0xA5.toByte() }
         val a = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(goldenStatus)).status
         val b = assertIs<StatusDecode.Valid>(WatchProtocol.decodeStatus(withReserved)).status
         assertEquals(a.resultCode, b.resultCode)
@@ -448,6 +518,7 @@ class WatchProtocolTest {
         assertEquals(a.appliedUtcEpochSeconds, b.appliedUtcEpochSeconds)
         assertEquals(a.fwBuild, b.fwBuild)
         assertEquals(a.findPhoneRequested, b.findPhoneRequested)
+        assertEquals(a.findSoundRequested, b.findSoundRequested)
     }
 
     @Test

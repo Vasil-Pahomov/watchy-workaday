@@ -65,6 +65,9 @@ struct Snapshot {
   // a wake that died inside a search.
   bool find_live = false;
   core::FindPhase find_phase = core::FindPhase::Searching;
+  // Whether the phone has been asked for its alarm tone as well (§4.1's Menu
+  // toggle). Read only in the Ringing phase, where it picks the status line.
+  bool find_sound = false;
   core::FindOutcome find_outcome = core::FindOutcome::InProgress;
   uint8_t find_attempts = 0;
   uint16_t find_elapsed_s = 0;

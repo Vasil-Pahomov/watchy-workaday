@@ -22,8 +22,10 @@ class ServiceNoticeTest {
             ConnectionState.WritingTime to ServiceNotice.Exchanging,
             ConnectionState.AwaitingStatus to ServiceNotice.Exchanging,
             ConnectionState.Blocked(adapterOff = true, permissionMissing = false) to ServiceNotice.BluetoothOff,
-            // The phone is ringing for the watch, and the few seconds after the
-            // user silences it read the same: the caption is about why it rang.
+            // The phone is ringing for the watch — from the alarm's first moment,
+            // through the Find subscription — and the few seconds after the user
+            // silences it read the same: the caption is about why it rang.
+            ConnectionState.SubscribingFind() to ServiceNotice.FindingPhone,
             ConnectionState.Ringing to ServiceNotice.FindingPhone,
             ConnectionState.DismissingFind to ServiceNotice.FindingPhone,
         )

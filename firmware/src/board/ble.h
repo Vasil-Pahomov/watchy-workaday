@@ -175,17 +175,25 @@ class Session {
 
   // Block until the next find-session event, or until the current round's wait
   // expires — whichever comes first. The signals handed to classify() include the
-  // Back press requestAbort() latched, which is how the wearer ends a search
-  // without the watch ever polling a pin. Same contract as wait(): non-terminal
-  // events are consumed here, Ended is latched, StillWaiting means wait again
-  // and do not feed.
-  core::FindEvent findWait(core::FindSession& session);
+  // Back press requestAbort() latched and the Menu edge requestSoundToggle()
+  // latched, which is how the wearer steers a search without the watch ever
+  // polling a pin. `menu_held` reads the Menu pin's level when the wait returns;
+  // core::FindSession asks for it only to confirm a press kFindButtonSettleMs
+  // after its edge. Same contract as wait(): non-terminal events are consumed
+  // here, Ended is latched, StillWaiting means wait again and do not feed.
+  core::FindEvent findWait(core::FindSession& session, bool (*menu_held)());
 
   // Copy the bytes of the most recent FindWritten event into `out`, at most `cap`
   // of them, and return the length the central actually wrote — the same contract
   // as copyTimeWrite(), for the same reason: core::decodeFindWrite() rejects any
   // length but 4 before reading the buffer.
   size_t copyFindWrite(uint8_t* out, size_t cap) const;
+
+  // Publish `frame` — a FindMode frame, §3.3 — as the Find characteristic's value
+  // and notify the central. Returns whether a subscribed central was there; with
+  // none, NimBLE sends nothing and the answer is the FindSubscribed event that
+  // follows the phone's subscription.
+  bool notifyFind(const uint8_t* frame, size_t length);
 
   // Advertise again after a central dropped the link. advertiseOnDisconnect is
   // off for the sync window's sake (see the constructor), so a find session that
@@ -207,6 +215,13 @@ class Session {
   // nothing, and harmless outside a session, where nothing waits on the bit and
   // the next constructor clears it.
   static void requestAbort();
+
+  // ISR-safe: latch a rising edge on the Menu pin — §4.1's sound toggle. Only an
+  // edge: whether it was a press, or the contacts bouncing on the release of the
+  // press that started the search, is core::FindSession's to settle from the pin
+  // level kFindButtonSettleMs later. Wired like requestAbort(), for the length of
+  // a find session only.
+  static void requestSoundToggle();
 
   // Milliseconds since advertising started — the same reading findWait() hands
   // core::FindSession, exposed for the screen's elapsed counter so the two cannot

@@ -82,6 +82,9 @@ object WatchProtocol {
     /** §3.2 `msg_type` for a Status frame. */
     const val MSG_TYPE_SYNC_RESULT: Int = 0x81
 
+    /** §3.3 `msg_type` for a Find notify: FindMode, watch → phone. */
+    const val MSG_TYPE_FIND_MODE: Int = 0x83
+
     /** §3.1. Exactly this, never more, never less. */
     const val TIME_PAYLOAD_LENGTH: Int = 12
 
@@ -96,10 +99,20 @@ object WatchProtocol {
 
     /**
      * §3.2 `flags`, bit 0: the watch is running a find-phone session and asks the
-     * phone to make itself heard for as long as this link lasts (§4.1). The only
-     * defined bit; bits 1–7 are reserved and the decoder ignores them.
+     * phone to make itself felt — vibration and the alarm screen — for as long as
+     * this link lasts (§4.1).
      */
     const val STATUS_FLAG_FIND_PHONE: Int = 0x01
+
+    /**
+     * §3.2 `flags`, bit 1: the wearer has asked for the alarm tone as well.
+     * Meaningful only alongside [STATUS_FLAG_FIND_PHONE]. The two defined bits;
+     * bits 2–7 are reserved and the decoder ignores them.
+     */
+    const val STATUS_FLAG_FIND_SOUND: Int = 0x02
+
+    /** §3.3 FindMode `mode`, bit 0: tone and vibration when set, vibration only when clear. */
+    const val FIND_MODE_SOUND: Int = 0x01
 
     // ── §5.2 Timing — the load-bearing numbers ───────────────────────────────
     //
@@ -200,6 +213,8 @@ object WatchProtocol {
     private const val STATUS_OFFSET_FW_BUILD = 8
     private const val STATUS_OFFSET_FLAGS = 10
 
+    private const val FIND_OFFSET_MODE = 2
+
     /** Largest value a `u32` field can carry. */
     private const val MAX_U32: Long = 0xFFFF_FFFFL
 
@@ -274,6 +289,24 @@ object WatchProtocol {
     }
 
     /**
+     * Decode a §3.3 FindMode notify — how the watch wants the phone to make itself
+     * felt right now.
+     *
+     * Order of checks mirrors the firmware's Find decoder — length, version, type.
+     * **Null, not an exception, for anything that is not a FindMode frame**: §3.3
+     * says such a frame is ignored and the phone keeps doing what it was doing,
+     * and the same callback delivers Status frames, so a 12-byte Status arriving
+     * on a find link must come back as "not a mode" rather than as a crash. Only
+     * bit 0 of `mode` is read; the reserved bits cannot change the answer.
+     */
+    fun decodeFindMode(payload: ByteArray?): FindMode? {
+        if (payload == null || payload.size != FIND_PAYLOAD_LENGTH) return null
+        if ((payload[OFFSET_PROTO_VERSION].toInt() and 0xFF) != PROTO_VERSION) return null
+        if ((payload[OFFSET_MSG_TYPE].toInt() and 0xFF) != MSG_TYPE_FIND_MODE) return null
+        return FindMode(sound = (payload[FIND_OFFSET_MODE].toInt() and FIND_MODE_SOUND) != 0)
+    }
+
+    /**
      * Decode a §3.2 Status payload.
      *
      * Order of checks mirrors the firmware's decoder — length, version, type —
@@ -320,6 +353,8 @@ object WatchProtocol {
                 // react to them. The masked test is what makes that true.
                 findPhoneRequested =
                     (payload[STATUS_OFFSET_FLAGS].toInt() and STATUS_FLAG_FIND_PHONE) != 0,
+                findSoundRequested =
+                    (payload[STATUS_OFFSET_FLAGS].toInt() and STATUS_FLAG_FIND_SOUND) != 0,
             ),
         )
         // `reserved` (offset 11) is deliberately not read — §3 says the receiver
@@ -405,6 +440,12 @@ class WatchStatus(
      * reason to leave the phone lost — and the state machine reads the two apart.
      */
     val findPhoneRequested: Boolean = false,
+    /**
+     * §3.2 `flags.FIND_SOUND`: the wearer wants the alarm tone as well as the
+     * vibration (§4.1). Read only when [findPhoneRequested] is set; on its own it
+     * means nothing and the state machine never looks at it alone.
+     */
+    val findSoundRequested: Boolean = false,
 ) {
     /**
      * §4: a notify with `result == 0` is *the* definition of a successful
@@ -417,8 +458,15 @@ class WatchStatus(
         "WatchStatus(result=${result ?: "unknown"}($resultCode), " +
             "battery=${batteryPercent ?: "unknown"}, " +
             "applied=$appliedUtcEpochSeconds, fwBuild=$fwBuild" +
-            (if (findPhoneRequested) ", findPhone" else "") + ")"
+            (if (findPhoneRequested) ", findPhone" else "") +
+            (if (findSoundRequested) "+sound" else "") + ")"
 }
+
+/**
+ * A decoded §3.3 FindMode notify: how the watch wants the phone heard right now.
+ * [sound] true is tone and vibration, false is vibration only.
+ */
+data class FindMode(val sound: Boolean)
 
 /** Why a Status frame was thrown away without being interpreted. */
 enum class StatusRejection {

@@ -50,7 +50,28 @@ static FindSignals back() {
   return signals;
 }
 
-// Every combination of the five level signals, for the exhaustive sweeps.
+static FindSignals menuEdge(bool held) {
+  FindSignals signals;
+  signals.menu_edge = true;
+  signals.menu_held = held;
+  return signals;
+}
+
+static FindSignals held() {
+  FindSignals signals;
+  signals.menu_held = true;
+  return signals;
+}
+
+static FindSignals subscribed() {
+  FindSignals signals;
+  signals.find_subscribed = true;
+  return signals;
+}
+
+// Every combination of the eight signals, for the exhaustive sweeps.
+constexpr int kSignalCombinations = 256;
+
 static FindSignals signalsFromBits(int bits) {
   FindSignals signals;
   signals.connected = (bits & 1) != 0;
@@ -58,6 +79,9 @@ static FindSignals signalsFromBits(int bits) {
   signals.disconnected = (bits & 4) != 0;
   signals.find_written = (bits & 8) != 0;
   signals.back_pressed = (bits & 16) != 0;
+  signals.find_subscribed = (bits & 32) != 0;
+  signals.menu_edge = (bits & 64) != 0;
+  signals.menu_held = (bits & 128) != 0;
   return signals;
 }
 
@@ -109,9 +133,10 @@ void test_no_wait_ever_exceeds_a_round(void) {
   // that matters, with every combination of signals pending. A wait of 9.9 s
   // would be under the watchdog and still a contract violation, so the bound
   // asserted is the round, not 10 s.
-  const uint32_t probes[] = {0,      1,      4999,   5000,   5001,   6000,  11999,
-                             12000,  59999,  60000,  119999, 120000, 120001, 0xFFFFFFFFu};
-  for (int bits = 0; bits < 32; ++bits) {
+  const uint32_t probes[] = {0,      1,      39,     40,     41,     4999,  5000,
+                             5001,   6000,   11999,  12000,  59999,  60000, 119999,
+                             120000, 120001, 0xFFFFFFFFu};
+  for (int bits = 0; bits < kSignalCombinations; ++bits) {
     for (const uint32_t enter_at : probes) {
       FindSession session;
       session.classify(enter_at, signalsFromBits(bits));
@@ -298,7 +323,7 @@ void test_back_ends_the_search_in_any_phase(void) {
       TEST_ASSERT_EQUAL_UINT32(0, session.waitMs(5000 + static_cast<uint32_t>(again) * 250u));
       TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::Ended),
                             eventAsInt(session.classify(5000 + static_cast<uint32_t>(again) * 250u,
-                                                        signalsFromBits(again % 32))));
+                                                        signalsFromBits(again * 13 % kSignalCombinations))));
     }
   }
 }
@@ -372,9 +397,9 @@ void test_back_outranks_a_dismiss_in_the_same_instant(void) {
 }
 
 void test_the_cap_outranks_everything(void) {
-  // A Back press, a dismiss, a connect — none of them can be reported at or past
-  // the cap. §5.1 measures it "regardless of any activity".
-  for (int bits = 0; bits < 32; ++bits) {
+  // A Back press, a dismiss, a connect, a Menu press — none of them can be
+  // reported at or past the cap. §5.1 measures it "regardless of any activity".
+  for (int bits = 0; bits < kSignalCombinations; ++bits) {
     FindSession session;
     session.classify(100, connected());
     TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::Ended),
@@ -409,7 +434,7 @@ void test_a_dismiss_after_the_end_changes_nothing(void) {
 void test_a_session_that_never_ends_on_its_own_is_impossible(void) {
   // From a fresh session, feeding the same signals forever must reach Ended by
   // the cap — for every combination, including the ones nobody consumes.
-  for (int bits = 0; bits < 32; ++bits) {
+  for (int bits = 0; bits < kSignalCombinations; ++bits) {
     const FindSignals signals = signalsFromBits(bits);
     FindSession session;
     uint32_t now = 0;
@@ -428,7 +453,7 @@ void test_a_caller_that_wakes_early_every_time_still_ends_inside_the_cap(void) {
   // The worst caller: ignores waitMs() and comes back a millisecond later, every
   // time, with the same bits pending. StillWaiting must not turn that into a
   // search that never closes.
-  for (int bits = 0; bits < 32; ++bits) {
+  for (int bits = 0; bits < kSignalCombinations; ++bits) {
     const FindSignals signals = signalsFromBits(bits);
     FindSession session;
     uint32_t now = 0;
@@ -485,6 +510,172 @@ void test_an_elapsed_far_past_the_cap_ends_rather_than_wraps(void) {
   TEST_ASSERT_EQUAL_UINT32(0, session.waitMs(0xFFFFFFFFu));
   TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::Ended), eventAsInt(session.classify(0xFFFFFFFFu, connected())));
   TEST_ASSERT_EQUAL_INT(outcomeAsInt(FindOutcome::TimedOut), outcomeAsInt(session.outcome()));
+}
+
+// ── the Menu press: vibration by default, the tone on request (§4.1) ─────────
+
+void test_a_search_starts_vibration_only(void) {
+  const FindSession session;
+  TEST_ASSERT_FALSE(session.sound());
+  TEST_ASSERT_EQUAL_HEX8(core::kStatusFlagFindPhone, session.statusFlags());
+}
+
+void test_menu_is_ignored_while_nobody_is_connected(void) {
+  // §4.1: the mode changes only while a phone can hear it. No settle clock is
+  // even started, so the next wait is the rest of the round and not 40 ms.
+  FindSession session;
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::StillWaiting),
+                        eventAsInt(session.classify(1000, menuEdge(true))));
+  TEST_ASSERT_EQUAL_UINT32(core::kFindRoundMs - 1000, session.waitMs(1000));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::StillWaiting),
+                        eventAsInt(session.classify(1000 + core::kFindButtonSettleMs, held())));
+  TEST_ASSERT_FALSE(session.sound());
+  TEST_ASSERT_EQUAL_HEX8(core::kStatusFlagFindPhone, session.statusFlags());
+}
+
+void test_a_settled_menu_press_toggles_the_tone(void) {
+  FindSession session;
+  session.classify(900, connected());
+  session.classify(2400, wrote());
+  session.noteStatusNotified();
+
+  // The edge starts the clock and nothing else, and the wait is cut to it.
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::StillWaiting),
+                        eventAsInt(session.classify(3000, menuEdge(true))));
+  TEST_ASSERT_FALSE(session.sound());
+  TEST_ASSERT_EQUAL_UINT32(core::kFindButtonSettleMs, session.waitMs(3000));
+  TEST_ASSERT_EQUAL_UINT32(1, session.waitMs(3000 + core::kFindButtonSettleMs - 1));
+
+  // Still pressed once the contacts have settled: a press, and the tone is on.
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::SoundToggled),
+                        eventAsInt(session.classify(3000 + core::kFindButtonSettleMs, held())));
+  TEST_ASSERT_TRUE(session.sound());
+  TEST_ASSERT_EQUAL_HEX8(core::kStatusFlagFindPhone | core::kStatusFlagFindSound,
+                         session.statusFlags());
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(FindPhase::Ringing), phaseAsInt(session.phase()));
+
+  // The same press again turns it back off.
+  session.classify(6000, menuEdge(true));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::SoundToggled),
+                        eventAsInt(session.classify(6000 + core::kFindButtonSettleMs, held())));
+  TEST_ASSERT_FALSE(session.sound());
+  TEST_ASSERT_EQUAL_HEX8(core::kStatusFlagFindPhone, session.statusFlags());
+}
+
+void test_a_press_counts_in_the_connected_phase_too(void) {
+  // Between the connect and the Status the phone cannot hear a FindMode yet, but
+  // the Status it is about to get carries the flag — so the press is not lost.
+  FindSession session;
+  session.classify(900, connected());
+  session.classify(1000, menuEdge(true));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::SoundToggled),
+                        eventAsInt(session.classify(1000 + core::kFindButtonSettleMs, held())));
+  TEST_ASSERT_EQUAL_HEX8(core::kStatusFlagFindPhone | core::kStatusFlagFindSound,
+                         session.statusFlags());
+}
+
+void test_an_edge_that_does_not_stay_pressed_is_a_bounce(void) {
+  // The release of the press that started the search, bouncing on the way up.
+  // The pin is low when the clock runs out, so nothing changes — and the clock is
+  // cleared, so the next wait is the rest of the round.
+  FindSession session;
+  session.classify(900, connected());
+  session.classify(1000, menuEdge(false));
+  TEST_ASSERT_EQUAL_UINT32(core::kFindButtonSettleMs, session.waitMs(1000));
+  const uint32_t settled = 1000 + core::kFindButtonSettleMs;
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::StillWaiting),
+                        eventAsInt(session.classify(settled, nothing())));
+  TEST_ASSERT_FALSE(session.sound());
+  TEST_ASSERT_EQUAL_UINT32((900 + core::kFindRoundMs) - settled, session.waitMs(settled));
+}
+
+void test_edges_inside_the_settle_window_are_one_press(void) {
+  // Contacts bouncing on the way down: several edges, one clock, one toggle.
+  FindSession session;
+  session.classify(900, connected());
+  session.classify(3000, menuEdge(true));
+  session.classify(3005, menuEdge(true));
+  session.classify(3010, menuEdge(true));
+  // Not restarted by the later edges.
+  TEST_ASSERT_EQUAL_UINT32(core::kFindButtonSettleMs - 10, session.waitMs(3010));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::SoundToggled),
+                        eventAsInt(session.classify(3000 + core::kFindButtonSettleMs, held())));
+  TEST_ASSERT_TRUE(session.sound());
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::StillWaiting),
+                        eventAsInt(session.classify(3050, held())));
+  TEST_ASSERT_TRUE(session.sound());
+}
+
+void test_a_held_button_is_one_press_not_a_repeat(void) {
+  FindSession session;
+  session.classify(900, connected());
+  session.classify(3000, menuEdge(true));
+  session.classify(3000 + core::kFindButtonSettleMs, held());
+  TEST_ASSERT_TRUE(session.sound());
+  // Held for most of a second with no new edge: nothing toggles again.
+  for (uint32_t now = 3100; now < 3900; now += 20) {
+    TEST_ASSERT_TRUE(session.classify(now, held()) != FindEvent::SoundToggled);
+  }
+  TEST_ASSERT_TRUE(session.sound());
+}
+
+void test_a_lost_link_keeps_the_mode_but_drops_a_pending_press(void) {
+  FindSession session;
+  session.classify(900, connected());
+  session.classify(3000, menuEdge(true));
+  session.classify(3000 + core::kFindButtonSettleMs, held());
+  TEST_ASSERT_TRUE(session.sound());
+
+  // A press still settling when the link drops has nobody left to hear it...
+  session.classify(4000, menuEdge(true));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::Disconnected),
+                        eventAsInt(session.classify(4010, gone())));
+  TEST_ASSERT_TRUE(session.classify(4000 + core::kFindButtonSettleMs, held()) !=
+                   FindEvent::SoundToggled);
+  // ...but the mode survives for the phone that reconnects (§4.1).
+  TEST_ASSERT_TRUE(session.sound());
+  TEST_ASSERT_EQUAL_HEX8(core::kStatusFlagFindPhone | core::kStatusFlagFindSound,
+                         session.statusFlags());
+}
+
+void test_a_settle_wait_never_lengthens_a_round(void) {
+  // The settle deadline only ever brings a wait forward: an edge 10 ms before the
+  // round ends still gets the round, and then the rest of its own 40 ms.
+  FindSession session;
+  session.classify(900, connected());
+  const uint32_t edge_at = 900 + core::kFindRoundMs - 10;
+  session.classify(edge_at, menuEdge(true));
+  TEST_ASSERT_EQUAL_UINT32(10, session.waitMs(edge_at));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::RoundElapsed),
+                        eventAsInt(session.classify(edge_at + 10, held())));
+  TEST_ASSERT_EQUAL_UINT32(core::kFindButtonSettleMs - 10, session.waitMs(edge_at + 10));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::SoundToggled),
+                        eventAsInt(session.classify(edge_at + core::kFindButtonSettleMs, held())));
+}
+
+void test_back_outranks_a_pending_menu_press(void) {
+  FindSession session;
+  session.classify(900, connected());
+  session.classify(3000, menuEdge(true));
+  FindSignals both = held();
+  both.back_pressed = true;
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::Ended),
+                        eventAsInt(session.classify(3000 + core::kFindButtonSettleMs, both)));
+  TEST_ASSERT_FALSE(session.sound());
+}
+
+void test_the_phone_subscribing_is_reported_once(void) {
+  // §4.1: the caller answers the subscription with the current mode, so it has to
+  // be told about it — once, and without anything else moving.
+  FindSession session;
+  session.classify(900, connected());
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::FindSubscribed),
+                        eventAsInt(session.classify(2500, subscribed())));
+  TEST_ASSERT_EQUAL_INT(eventAsInt(FindEvent::StillWaiting),
+                        eventAsInt(session.classify(2510, nothing())));
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(FindPhase::Connected), phaseAsInt(session.phase()));
+  TEST_ASSERT_EQUAL_UINT8(1, session.attempts());
+  TEST_ASSERT_FALSE(session.ended());
 }
 
 // ── the screen's numbers ─────────────────────────────────────────────────────
@@ -604,6 +795,18 @@ int main(void) {
   RUN_TEST(test_still_waiting_always_leaves_time_to_wait_on);
   RUN_TEST(test_no_signal_short_of_the_round_is_a_round);
   RUN_TEST(test_an_elapsed_far_past_the_cap_ends_rather_than_wraps);
+
+  RUN_TEST(test_a_search_starts_vibration_only);
+  RUN_TEST(test_menu_is_ignored_while_nobody_is_connected);
+  RUN_TEST(test_a_settled_menu_press_toggles_the_tone);
+  RUN_TEST(test_a_press_counts_in_the_connected_phase_too);
+  RUN_TEST(test_an_edge_that_does_not_stay_pressed_is_a_bounce);
+  RUN_TEST(test_edges_inside_the_settle_window_are_one_press);
+  RUN_TEST(test_a_held_button_is_one_press_not_a_repeat);
+  RUN_TEST(test_a_lost_link_keeps_the_mode_but_drops_a_pending_press);
+  RUN_TEST(test_a_settle_wait_never_lengthens_a_round);
+  RUN_TEST(test_back_outranks_a_pending_menu_press);
+  RUN_TEST(test_the_phone_subscribing_is_reported_once);
 
   RUN_TEST(test_elapsed_seconds_for_the_screen);
 

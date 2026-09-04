@@ -326,12 +326,15 @@ class WatchLinkService : Service() {
             Action.CloseConnection -> runtime.link.close()
             Action.DiscoverServices -> runtime.link.discoverServices()
             Action.EnableStatusNotifications -> runtime.link.enableStatusNotifications()
+            Action.EnableFindNotifications -> runtime.link.enableFindNotifications()
             is Action.WriteTime -> runtime.link.writeTime(action.payload)
             is Action.WriteFindDismiss -> runtime.link.writeFindDismiss(action.payload)
 
-            // PROTOCOL.md §4.1. Sound, vibration and the Stop screen, started and
-            // stopped together; the machine pairs every start with a stop.
-            Action.StartFindAlarm -> runtime.alarm.start()
+            // PROTOCOL.md §4.1. Vibration and the Stop screen, the tone when asked
+            // for, started and stopped together; the machine pairs every start
+            // with a stop, and changes the mode only in between.
+            is Action.StartFindAlarm -> runtime.alarm.start(sound = action.sound)
+            is Action.SetFindAlarmSound -> runtime.alarm.setSound(action.sound)
             Action.StopFindAlarm -> runtime.alarm.stop()
 
             is Action.ArmOperationTimeout ->

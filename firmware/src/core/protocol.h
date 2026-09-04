@@ -99,16 +99,25 @@ constexpr uint8_t kProtocolVersion = 0x01;
 
 constexpr uint8_t kMsgTypeSetTime = 0x01;      // phone -> watch, on Time
 constexpr uint8_t kMsgTypeFindDismiss = 0x02;  // phone -> watch, on Find (§3.3)
-constexpr uint8_t kMsgTypeSyncResult = 0x81;   // watch -> phone
+constexpr uint8_t kMsgTypeSyncResult = 0x81;   // watch -> phone, on Status
+constexpr uint8_t kMsgTypeFindMode = 0x83;     // watch -> phone, on Find (§3.3)
 
 constexpr size_t kTimePayloadLength = 12;
 constexpr size_t kStatusPayloadLength = 12;
-constexpr size_t kFindPayloadLength = 4;
+constexpr size_t kFindPayloadLength = 4;  // both Find frames
 
-// §3.2 `flags`, bit 0: the watch is running a find-phone session and asks the
-// phone to make itself heard for as long as this link lasts (§4.1). The only
-// defined bit; encodeStatus() puts no other bit on the wire.
+// §3.2 `flags`. Bit 0: the watch is running a find-phone session and asks the
+// phone to make itself felt — vibration and its alarm screen — for as long as
+// this link lasts (§4.1). Bit 1: the wearer asked for the alarm tone as well;
+// meaningful only alongside bit 0. The only defined bits; encodeStatus() puts no
+// other bit on the wire.
 constexpr uint8_t kStatusFlagFindPhone = 0x01;
+constexpr uint8_t kStatusFlagFindSound = 0x02;
+
+// §3.3 FindMode `mode`, bit 0: tone and vibration when set, vibration only when
+// clear. The same fact kStatusFlagFindSound carries at the start of a link, on
+// the channel that can change it mid-link.
+constexpr uint8_t kFindModeSound = 0x01;
 
 // §3.1. UTC+14 and UTC-14 are the real-world extremes; 840 == 14 * 60.
 constexpr int16_t kMinUtcOffsetMinutes = -840;
@@ -220,5 +229,11 @@ bool encodeStatus(uint8_t* out, size_t cap, const Status& status);
 // meaning, and what the watch does about it — end the search, say the phone
 // stopped it — is core::FindSession::noteFindWrite()'s decision.
 SyncResult decodeFindWrite(const uint8_t* payload, size_t length);
+
+// Encode a FindMode frame (§3.3) into `out`: exactly kFindPayloadLength bytes,
+// the reserved ones zero, `mode` carrying kFindModeSound when `sound` is set.
+// Same buffer convention as encodeStatus(): false and nothing written when `cap`
+// is too small.
+bool encodeFindMode(uint8_t* out, size_t cap, bool sound);
 
 }  // namespace core

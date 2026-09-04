@@ -19,11 +19,11 @@
     <!-- The find-phone alarm (PROTOCOL.md §4.1): its own channel, its own
          notification, and the full-screen Stop screen. -->
     <string name="find_channel_name">Find phone</string>
-    <string name="find_channel_description">Sounds when you look for this phone from your Workaday watch. It rings like an alarm, so Do Not Disturb\'s usual quiet does not silence it.</string>
+    <string name="find_channel_description">Vibrates when you look for this phone from your Workaday watch, and rings like an alarm when you ask for sound from the watch, so Do Not Disturb\'s usual quiet does not silence it.</string>
     <string name="find_title">Your watch is looking for this phone</string>
     <string name="find_text">Tap Stop to silence it. The watch will show that the phone was found.</string>
     <string name="find_stop">Stop</string>
-    <string name="find_screen_hint">The alarm also stops on its own when the watch\'s search ends — press Back on the watch, or wait two minutes.</string>
+    <string name="find_screen_hint">Menu on the watch adds the alarm sound or takes it away. The alarm also stops on its own when the watch\'s search ends — press Back on the watch, or wait two minutes.</string>
 
     <!-- ServiceNotice.Waiting, which is the state the app is in almost all of the
          time. One per RestingSummary case, decided in core/RestingSummary.kt.

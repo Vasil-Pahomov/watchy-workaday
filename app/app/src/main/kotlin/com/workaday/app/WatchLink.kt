@@ -161,25 +161,39 @@ internal class WatchLink(
         if (!issued) failLocally { TransportEvent.ServicesDiscovered(it) }
     }
 
-    // ── Action.EnableStatusNotifications ─────────────────────────────────────
+    // ── Action.EnableStatusNotifications, Action.EnableFindNotifications ─────
 
     /**
      * PROTOCOL.md §4 op 2: subscribe to Status **before** writing Time. Writing
      * first races the notification and loses it.
      */
-    fun enableStatusNotifications() {
+    fun enableStatusNotifications() =
+        enableNotifications(WatchProtocol.STATUS_CHARACTERISTIC_UUID, "Status")
+
+    /**
+     * PROTOCOL.md §4.1: subscribe to Find after the flagged Status, so the watch
+     * can change the alarm's mode mid-link (§3.3 FindMode). Same write as Status's,
+     * answered by the same `onDescriptorWrite`; the machine tells the two apart by
+     * the state it is in. An older watch has no notify on Find and therefore no
+     * CCCD there — the `missing from the discovered profile` path, reported at
+     * once so the machine settles into ringing instead of waiting five seconds.
+     */
+    fun enableFindNotifications() =
+        enableNotifications(WatchProtocol.FIND_CHARACTERISTIC_UUID, "Find")
+
+    private fun enableNotifications(uuid: UUID, name: String) {
         val client = gatt ?: return failLocally { TransportEvent.DescriptorWritten(it) }
-        val status = characteristic(client, WatchProtocol.STATUS_CHARACTERISTIC_UUID)
-        val cccd = status?.getDescriptor(WatchProtocol.CCCD_UUID)
-        if (status == null || cccd == null) {
+        val target = characteristic(client, uuid)
+        val cccd = target?.getDescriptor(WatchProtocol.CCCD_UUID)
+        if (target == null || cccd == null) {
             // The peer is not the watch, or the platform handed back a cached
             // profile from before the firmware had this service. Nothing will
             // ever call back, so say so now rather than in five seconds.
-            Log.w(LOG_TAG, "Status characteristic or its CCCD missing from the discovered profile")
+            Log.w(LOG_TAG, "$name characteristic or its CCCD missing from the discovered profile")
             return failLocally { TransportEvent.DescriptorWritten(it) }
         }
         try {
-            if (!client.setCharacteristicNotification(status, true)) {
+            if (!client.setCharacteristicNotification(target, true)) {
                 return failLocally { TransportEvent.DescriptorWritten(it) }
             }
             val value = WatchProtocol.cccdEnableNotificationValue()
@@ -196,7 +210,7 @@ internal class WatchLink(
             }
             if (!issued) failLocally { TransportEvent.DescriptorWritten(it) }
         } catch (e: SecurityException) {
-            Log.w(LOG_TAG, "enabling Status notifications denied", e)
+            Log.w(LOG_TAG, "enabling $name notifications denied", e)
             dispatchLater(TransportEvent.PermissionRevoked)
         }
     }

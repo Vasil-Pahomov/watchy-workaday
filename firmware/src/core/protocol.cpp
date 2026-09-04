@@ -27,10 +27,13 @@ constexpr size_t kStatusOffsetFwBuild = 8;
 constexpr size_t kStatusOffsetFlags = 10;
 constexpr size_t kStatusOffsetReserved = 11;
 
-// ── PROTOCOL.md §3.3, the Find layout ────────────────────────────────────────
+// ── PROTOCOL.md §3.3, the Find layouts ───────────────────────────────────────
 constexpr size_t kFindOffsetProtoVersion = 0;
 constexpr size_t kFindOffsetMsgType = 1;
-// Offsets 2..3 are reserved and never read, for the same reason Time's are not.
+// FindDismiss: offsets 2..3 are reserved and never read, for the same reason
+// Time's are not. FindMode: offset 2 is `mode`, offset 3 reserved.
+constexpr size_t kFindOffsetMode = 2;
+constexpr size_t kFindOffsetReserved = 3;
 
 uint32_t readU32Le(const uint8_t* p) {
   return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -132,10 +135,11 @@ bool encodeStatus(uint8_t* out, size_t cap, const Status& status) {
   out[kStatusOffsetBattery] = battery;
   writeU32Le(out + kStatusOffsetAppliedEpoch, status.applied_utc_epoch_s);
   writeU16Le(out + kStatusOffsetFwBuild, status.fw_build);
-  // §3.2: only the defined flag bit goes on the wire. Bits 1..7 are reserved,
+  // §3.2: only the defined flag bits go on the wire. Bits 2..7 are reserved,
   // and a caller that set one — a garbled field, a future build's idea of a flag
   // — must not reach a receiver that has since given that bit a meaning.
-  out[kStatusOffsetFlags] = static_cast<uint8_t>(status.flags & kStatusFlagFindPhone);
+  out[kStatusOffsetFlags] =
+      static_cast<uint8_t>(status.flags & (kStatusFlagFindPhone | kStatusFlagFindSound));
   // §3.2: the sender writes the reserved byte as zero. Leaving whatever the
   // caller's buffer happened to hold would put stack contents on the air and
   // would make a future receiver that gives that byte meaning behave randomly
@@ -157,6 +161,18 @@ SyncResult decodeFindWrite(const uint8_t* payload, size_t length) {
     return SyncResult::BadType;
   }
   return SyncResult::Ok;
+}
+
+bool encodeFindMode(uint8_t* out, size_t cap, bool sound) {
+  if (out == nullptr || cap < kFindPayloadLength) {
+    return false;
+  }
+  out[kFindOffsetProtoVersion] = kProtocolVersion;
+  out[kFindOffsetMsgType] = kMsgTypeFindMode;
+  // Only the defined bit, for the reason encodeStatus() masks its flags.
+  out[kFindOffsetMode] = sound ? kFindModeSound : 0;
+  out[kFindOffsetReserved] = 0;
+  return true;
 }
 
 }  // namespace core

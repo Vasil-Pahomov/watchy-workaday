@@ -27,10 +27,12 @@ Workaday/
    actually stops the two implementations from drifting — the prose does not.
 
 Status: **v1**, defined 17 Aug 2026. **Find phone added 3 Sep 2026** as v1
-material: one `Status` reserved byte became `flags`, and one write-only
-characteristic was added. No `PROTO_VERSION` bump, under rule 2's exception — an
-old receiver that ignores both still performs a correct time sync (§3.2, §3.3).
-The find-phone half is **not yet verified on hardware**; `BRINGUP.md` stage 5.
+material: one `Status` reserved byte became `flags` (two bits so far), and one
+write + notify characteristic was added. No `PROTO_VERSION` bump, under rule 2's
+exception — an old receiver that ignores both still performs a correct time sync
+(§3.2, §3.3). The basic search — vibration, Stop on either side — was **verified
+on hardware the same day**; the sound toggle added afterwards (§4.1's `FIND_SOUND`
+and the `FindMode` frame) is not yet, see `BRINGUP.md` stage 5.
 
 **Verified on hardware 18 Aug 2026** — the watch's half only. A full §4 exchange
 completed against a third, independent implementation of this document (a PC BLE
@@ -93,17 +95,19 @@ arbitrary and permanent.
 | Service — Workaday Sync | `57444159-6461-4779-b0a3-1f4c7e25d908` |
 | Characteristic — **Time** (write) | `57444101-6461-4779-b0a3-1f4c7e25d908` |
 | Characteristic — **Status** (read + notify) | `57444102-6461-4779-b0a3-1f4c7e25d908` |
-| Characteristic — **Find** (write) | `57444103-6461-4779-b0a3-1f4c7e25d908` |
-| Descriptor — CCCD on Status | `00002902-0000-1000-8000-00805f9b34fb` (SIG standard) |
+| Characteristic — **Find** (write + notify) | `57444103-6461-4779-b0a3-1f4c7e25d908` |
+| Descriptor — CCCD on Status, and on Find | `00002902-0000-1000-8000-00805f9b34fb` (SIG standard) |
 
 `0x57444159` is `'WDAY'`; `0x57444101` / `…02` / `…03` continue the family. This
 is a mnemonic, not a mechanism — do not derive new UUIDs by incrementing without
 adding them to this table.
 
-`Find` was added 3 Sep 2026 for the find-phone feature (§4.1). Adding a
+`Find` was added 3 Sep 2026 for the find-phone feature (§4.1): the phone writes
+its dismissal on it, and the watch notifies the alarm mode on it. Adding a
 characteristic does not bump `PROTO_VERSION`: a phone that does not know it never
-touches it, and a watch that lacks it fails the phone's dismiss write locally
-(§6.2), leaving the time sync — the only thing v1 promised — intact either way.
+touches it, and a watch that lacks it fails the phone's dismiss write and its
+subscription locally (§6.2), leaving the time sync — the only thing v1 promised —
+intact either way.
 
 ### 2.2 Advertising
 
@@ -189,16 +193,19 @@ range check bites first and the overflow is unreachable. Stated so nobody
 | 3 | 1 | `battery_percent` | 0–100, or `0xFF` = unknown |
 | 4 | 4 | `applied_utc_epoch_s` | u32, what the watch actually committed; 0 if nothing was |
 | 8 | 2 | `fw_build` | u16, firmware build tag, diagnostic only |
-| 10 | 1 | `flags` | bit 0 = `FIND_PHONE` (§4.1); bits 1–7 reserved, sender writes 0, receiver ignores |
+| 10 | 1 | `flags` | bit 0 = `FIND_PHONE`, bit 1 = `FIND_SOUND` (§4.1); bits 2–7 reserved, sender writes 0, receiver ignores |
 | 11 | 1 | `reserved` | sender writes 0 |
 
 `flags` was `reserved` until 3 Sep 2026 and is the one byte given meaning under
 rule 2's exception: a receiver that ignores it still performs a correct time sync,
 so `PROTO_VERSION` stays at 1. `FIND_PHONE` set means **the watch is running a
-find-phone session and asks the phone to make itself heard** for as long as this
-link lasts — it says nothing about `result`, which keeps its own meaning. The
-sender puts only the defined bit on the wire; undefined bits are never set, so a
-future receiver that gives one meaning cannot be triggered by this build.
+find-phone session and asks the phone to make itself felt** — vibration and the
+alarm screen — for as long as this link lasts. `FIND_SOUND` set as well means the
+wearer has asked for the alarm tone too; it is meaningful only alongside
+`FIND_PHONE` and a receiver ignores it on its own. Neither says anything about
+`result`, which keeps its own meaning. The sender puts only the defined bits on
+the wire; undefined bits are never set, so a future receiver that gives one
+meaning cannot be triggered by this build.
 
 `result` codes:
 
@@ -224,7 +231,12 @@ The **sender normalises**: anything outside 0–100 is encoded as `0xFF`, so a
 garbled sample never reaches the wire as a fourth kind of value the reader has to
 guess at. The reader may therefore treat 0–100 and `0xFF` as the complete domain.
 
-### 3.3 `Find` — phone → watch, write **with response**, exactly 4 bytes
+### 3.3 `Find` — two 4-byte frames, one each way
+
+Both frames share the first two bytes with every other payload in this document
+and are exactly 4 bytes; a wrong length is rejected without being parsed.
+
+**FindDismiss** — phone → watch, write **with response**:
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
@@ -250,6 +262,27 @@ other channel back, so a malformed dismiss is logged on the watch and ignored �
 the search continues and the phone keeps ringing until it either writes a valid
 frame, hangs up, or the watch's own cap ends the session. Outside a find-phone
 session a `Find` write of any shape is ignored.
+
+**FindMode** — watch → phone, **notify**:
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 1 | `proto_version` | `0x01` |
+| 1 | 1 | `msg_type` | `0x83` = FindMode |
+| 2 | 1 | `mode` | bit 0 = `SOUND`: 1 = tone and vibration, 0 = vibration only; bits 1–7 reserved, sender writes 0, receiver ignores |
+| 3 | 1 | `reserved` | sender writes 0 |
+
+How the phone should make itself felt **right now**, sent while a find link is up
+(§4.1): once when the phone subscribes, and again every time the wearer changes
+the mode. The same information a `Status` frame's `FIND_SOUND` bit carries at the
+start of a link, on a channel that can change it mid-link — which `Status` cannot,
+because §4 forbids notifying it unprompted, and that rule is load-bearing.
+
+**Validation, performed by the phone:** length == 4, `proto_version` == 1,
+`msg_type` == 0x83, in that order. A frame that fails any of them is ignored: the
+phone keeps doing whatever it was doing, and the next valid frame sets the mode.
+A `FindMode` notify outside a find link cannot reach a phone — it never
+subscribes to `Find` anywhere else.
 
 ---
 
@@ -337,8 +370,14 @@ watch                                                     phone
   │ ◄──────────────────── connect ───────────────────────────┤
   │ ◄──── discover · CCCD(Status) · write Time ──────────────┤  §4, unchanged
   │ ─────────── notify Status, flags.FIND_PHONE = 1 ────────►│
-  │  (screen: "phone ringing")                               │  alarm starts: sound + vibration
-  │                                                          │  link stays OPEN
+  │  (screen: "phone vibrating")                             │  alarm starts: vibration
+  │                                                          │  (tone too if FIND_SOUND)
+  │ ◄──────────────── CCCD(Find) = 0x0001 ───────────────────┤  link stays OPEN
+  │ ─────────── notify Find (FindMode, current mode) ───────►│
+  │                                                          │
+  │  Menu pressed → mode toggles                             │
+  │ ─────────── notify Find (FindMode, SOUND = 1) ──────────►│  tone starts, rising
+  │  (screen: "phone ringing")                               │
   │            … ringing, both sides waiting …               │
   │                                                          │
   │  ending (a): Back pressed, or 120 s cap                  │
@@ -346,7 +385,7 @@ watch                                                     phone
   │                                                          │
   │  ending (b): the user silences it on the phone           │
   │ ◄──────────── write Find (4 B, FindDismiss) ─────────────┤  alarm already stopped
-  │  (screen: "phone found")                            │
+  │  (screen: "phone found")                                 │
   │ ─────────────────── disconnect ─────────────────────────►│  close, re-arm at once
 ```
 
@@ -360,9 +399,24 @@ Rules:
   like the Sync item (§5.1).
 - **`flags.FIND_PHONE` in a well-formed Status frame starts the alarm, whatever
   `result` says.** A clock that could not be set is no reason to leave the phone
-  lost. The phone keeps the link open instead of hanging up, and starts sound and
-  vibration on its alarm channel. A frame the phone cannot decode carries no
-  flag and is a failed exchange as before.
+  lost. The phone keeps the link open instead of hanging up and starts the alarm:
+  **vibration and the alarm screen by default, the tone as well only if
+  `FIND_SOUND` is set.** A frame the phone cannot decode carries no flag and is a
+  failed exchange as before.
+- **The wearer chooses the mode from the watch, and can change it mid-link.** A
+  search starts vibration-only. Pressing **Menu** on the search screen while a
+  phone is on the link toggles the alarm tone on and off; the watch redraws
+  ("phone vibrating" / "phone ringing") and notifies a `FindMode` frame (§3.3).
+  Pressing Menu while nobody is connected does nothing — there is no phone to
+  hear the change, and a mode that changed with nothing on screen to show it would
+  be a trap. The mode survives a lost link: the reconnecting phone learns it from
+  `FIND_SOUND` in the next Status frame.
+- **The phone subscribes to `Find` right after the flagged Status**, one CCCD
+  write with the ordinary per-operation timeout (§5.2), and the watch answers the
+  subscription with the current mode — so a Menu press that landed before the
+  subscription completed is delivered, not lost. If the subscription fails or
+  times out — an older watch, a stack that refused — the phone stays in its
+  current mode and rings on; only the mid-link change is unavailable.
 - **The alarm sounds exactly while the find link is up.** It stops when the link
   ends, for any reason: the watch hanging up because the wearer pressed Back or
   the cap expired, or the link being lost. The phone does not need to know which.
@@ -501,6 +555,7 @@ the watch's schedule.
 | Backoff reset | **on a Status notify with `result == 0`** | not on connect |
 | **Find ring backstop** | **135 s** | §4.1. Longer than the watch's 120 s find cap, so the watch's hang-up is the normal ending and this is the safety net behind a disconnect that never arrived. When it fires the phone closes and re-arms |
 | Find dismiss write | 5 s | the per-operation timeout above, applied to the `Find` write; the phone closes and re-arms when the write completes or times out |
+| Find subscription | 5 s | the per-operation timeout, applied to the CCCD write on `Find` after a flagged Status. Completes, fails or times out → the phone rings on in its current mode and the ring backstop takes over |
 | Re-arm after a find link | **immediate** | no settle, no backoff — see §4.1 for why the 12 s rule does not apply |
 
 ### 5.3 What this costs the watch — ⚠ estimates, not measurements
@@ -559,6 +614,8 @@ sync window is. `firmware/docs/power-budget.md` carries the row.
 | Find: nobody connects inside the cap | end the search, back to the watchface. **Not** a fault |
 | Find: link lost mid-search | re-advertise, count a new attempt, keep going until the cap |
 | Find: malformed `Find` write | ignore it, keep searching (§3.3) |
+| Find: Menu pressed with nobody on the link | ignored; the mode changes only while a phone can hear it (§4.1) |
+| Find: phone subscribes to `Find` | notify the current `FindMode` once. A notify with no subscriber is a no-op, never a fault |
 | Find: Back pressed, or the cap | hang up, wait ≤ 1 s for the drop, then sleep. Back returns to the menu, the cap to the watchface |
 | Find: battery Low/Critical, or Safe/Recovery mode | refused before the radio comes up; the screen says why. Same gates as a sync window |
 | Find: BLE stack fails to init | the screen says the radio failed; sleep normally |
@@ -578,6 +635,9 @@ sync window is. `firmware/docs/power-budget.md` carries the row.
 | Find: ring backstop fires | stop the alarm, `close()`, re-arm immediately |
 | Find: adapter off / permission revoked while ringing | stop the alarm, `close()`, park in the blocked state as for any other exchange |
 | Find: `Find` characteristic missing (an older watch) | the dismiss write fails locally; `close()`, re-arm. The alarm was already stopped by the user's tap |
+| Find: subscription to `Find` fails, or times out | ring on in the current mode with the backstop armed. Not a failed exchange — the exchange ended with the Status — and no backoff |
+| Find: malformed `FindMode` notify | ignored; the mode stays what it was (§3.3) |
+| Find: the user silences it while the subscription is outstanding | stop the alarm now; the `FindDismiss` write waits for the CCCD callback, one GATT operation at a time (Law 2), then closes and re-arms |
 | Find: the phone is in "Total silence" Do Not Disturb | **platform limit, not handled.** The alarm uses the ALARM audio usage, which the default "priority only" mode lets through; a mode that blocks alarms mutes it, and no app can override that without notification-policy access the user would have to grant separately |
 
 ---
@@ -637,6 +697,12 @@ The phone reads `findPhoneRequested = true`, and every other field exactly as in
 §7.2. A receiver that ignores byte 10 decodes it identically to §7.2 — which is
 what rule 2's exception requires.
 
+With the wearer having asked for the tone as well (`FIND_PHONE | FIND_SOUND`):
+
+```
+01 81 00 4E F0 FF 82 6A 01 00 03 00
+```
+
 ### 7.5 `Find`
 
 The one frame the phone sends on `Find` — FindDismiss, reserved bytes zero:
@@ -660,6 +726,29 @@ Decoded by the watch as a valid dismiss (`Ok`, 0).
 
 And one that must be **accepted**: `01 02 DE AD` — the reserved bytes are ignored,
 as everywhere else in this document.
+
+### 7.7 `FindMode`
+
+The two frames the watch notifies on `Find` (§3.3):
+
+```
+01 83 01 00      tone and vibration (SOUND = 1)
+01 83 00 00      vibration only
+```
+
+Decoded by the phone as `sound = true` and `sound = false`. `01 83 FF 00` also
+decodes as `sound = true`: bits 1–7 of `mode` are reserved and ignored.
+
+### 7.8 `FindMode` payloads the phone must ignore
+
+| Bytes | Why |
+|---|---|
+| *(empty)* | wrong length |
+| `01 83 01` (3 B) | wrong length |
+| `01 83 01 00 00` (5 B) | wrong length |
+| `02 83 01 00` | wrong version |
+| `01 81 00 4E F0 FF 82 6A 01 00 01 00` | a Status frame — wrong length for `FindMode`, and never a mode |
+| `01 02 00 00` | a FindDismiss `msg_type`, the phone's own frame echoed |
 
 ---
 

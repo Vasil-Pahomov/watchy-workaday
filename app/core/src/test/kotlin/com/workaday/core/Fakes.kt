@@ -22,6 +22,7 @@ enum class StateLabel {
     EnablingNotifications,
     WritingTime,
     AwaitingStatus,
+    SubscribingFind,
     Ringing,
     DismissingFind,
 }
@@ -36,6 +37,7 @@ fun ConnectionState.label(): StateLabel = when (this) {
     ConnectionState.EnablingNotifications -> StateLabel.EnablingNotifications
     ConnectionState.WritingTime -> StateLabel.WritingTime
     ConnectionState.AwaitingStatus -> StateLabel.AwaitingStatus
+    is ConnectionState.SubscribingFind -> StateLabel.SubscribingFind
     ConnectionState.Ringing -> StateLabel.Ringing
     ConnectionState.DismissingFind -> StateLabel.DismissingFind
 }
@@ -109,9 +111,10 @@ class FakeClock(
  * - which timer is pending, so "no operation outstanding without a timeout" is
  *   checkable rather than asserted in prose;
  * - how many Time writes happened in one connection (PROTOCOL.md §4 allows one);
- * - whether the find-phone alarm is sounding, refusing a second start or a stop
- *   with nothing sounding, and holding it to exactly the Ringing state — an
- *   alarm that outlives its link is the §4.1 failure nobody wants to hear.
+ * - whether the find-phone alarm is on, and in which mode: refusing a second
+ *   start, a stop with nothing on, or a mode change with nothing to change, and
+ *   holding it to exactly the ringing states — an alarm that outlives its link
+ *   is the §4.1 failure nobody wants to hear.
  */
 class FakeTransport(
     val machine: ConnectionStateMachine,
@@ -128,6 +131,10 @@ class FakeTransport(
 
     /** The find-phone alarm, as the Android layer would hold it: on or off. */
     var alarmOn: Boolean = false
+        private set
+
+    /** Whether the alarm is playing the tone as well as vibrating (§4.1). */
+    var alarmSound: Boolean = false
         private set
 
     var findWritesThisConnection: Int = 0
@@ -218,7 +225,7 @@ class FakeTransport(
                 linkOpen = false
             }
 
-            Action.DiscoverServices, Action.EnableStatusNotifications ->
+            Action.DiscoverServices, Action.EnableStatusNotifications, Action.EnableFindNotifications ->
                 expect(linkOpen) { "GATT operation issued with no open client" }
 
             is Action.WriteTime -> {
@@ -239,15 +246,22 @@ class FakeTransport(
                 }
             }
 
-            Action.StartFindAlarm -> {
+            is Action.StartFindAlarm -> {
                 expect(!alarmOn) { "the find-phone alarm was started while already sounding" }
                 expect(linkOpen) { "the find-phone alarm was started with no link to the watch" }
                 alarmOn = true
+                alarmSound = action.sound
+            }
+
+            is Action.SetFindAlarmSound -> {
+                expect(alarmOn) { "the find-phone alarm's mode was changed while it was not sounding" }
+                alarmSound = action.sound
             }
 
             Action.StopFindAlarm -> {
                 expect(alarmOn) { "the find-phone alarm was stopped while not sounding" }
                 alarmOn = false
+                alarmSound = false
             }
 
             is Action.ArmOperationTimeout -> {
@@ -276,11 +290,17 @@ class FakeTransport(
      */
     private fun assertInvariant() {
         coverage?.record(machine.state)
-        // PROTOCOL.md §4.1: the alarm sounds exactly while the find link is up and
-        // the machine is Ringing. Anywhere else, an alarm still going is an alarm
-        // that outlived its link.
-        expect(alarmOn == (machine.state == ConnectionState.Ringing)) {
-            if (alarmOn) "the find-phone alarm is sounding outside Ringing" else "Ringing with no alarm sounding"
+        // PROTOCOL.md §4.1: the alarm sounds exactly while the find link is up —
+        // Ringing, and the subscription round trip before it unless the user has
+        // already tapped Stop. Anywhere else, an alarm still going is an alarm that
+        // outlived its link.
+        val alarmDue = when (val state = machine.state) {
+            ConnectionState.Ringing -> true
+            is ConnectionState.SubscribingFind -> !state.dismissRequested
+            else -> false
+        }
+        expect(alarmOn == alarmDue) {
+            if (alarmOn) "the find-phone alarm is sounding outside a ringing state" else "ringing with no alarm sounding"
         }
         when (val state = machine.state) {
             ConnectionState.Idle -> {
@@ -327,6 +347,16 @@ class FakeTransport(
             -> {
                 expect(linkOpen) { "mid-exchange with no GATT client" }
                 expect(pendingTimerToken != null) { "GATT operation outstanding with no timeout armed" }
+            }
+
+            is ConnectionState.SubscribingFind -> {
+                // One GATT operation outstanding — the Find CCCD write — under the
+                // ordinary per-operation timeout, on a link held open on purpose.
+                expect(linkOpen) { "subscribing to Find with no link to the watch" }
+                expect(pendingTimerToken != null && !pendingTimerIsRetry) { "Find subscription outstanding with no timeout armed" }
+                expect(pendingTimerDelayMillis == com.workaday.core.protocol.WatchProtocol.OPERATION_TIMEOUT_MS) {
+                    "Find subscription timeout is $pendingTimerDelayMillis, not the section 5.2 per-operation value"
+                }
             }
 
             ConnectionState.Ringing -> {

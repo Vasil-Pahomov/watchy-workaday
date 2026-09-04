@@ -107,6 +107,7 @@ SMALL_LINES = ["yesterday " + DIGIT * 5, "clock write fail", "sync unfinished",
                # message. Hence "phone found", which is also the plainer thing to
                # say.
                "Find phone", "searching", "connected", "phone ringing",
+               "phone vibrating",
                "phone found", "no phone found", "battery too low", "radio failed",
                "not available", "interrupted", "stopped",
                "2:00  try 255"]

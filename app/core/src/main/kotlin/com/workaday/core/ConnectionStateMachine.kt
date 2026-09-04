@@ -138,9 +138,27 @@ sealed interface ConnectionState {
     data object AwaitingStatus : ConnectionState
 
     /**
+     * Connected, the §4 exchange finished, its Status carried `FIND_PHONE`
+     * (PROTOCOL.md §4.1), the alarm is on, and the CCCD write that subscribes the
+     * phone to `Find` — the channel the watch changes the alarm mode on — is
+     * outstanding with a §5.2 per-operation timeout.
+     *
+     * Lasts one GATT round trip. Completes, fails or times out into [Ringing];
+     * an older watch with no notify on `Find` simply leaves the phone in the mode
+     * the Status asked for. [dismissRequested] is the user's Stop landing inside
+     * that round trip: the alarm is already off, and the §3.3 dismiss write waits
+     * for the CCCD callback rather than being issued on top of it — Android
+     * silently drops a second outstanding operation (Law 2), and the callback is
+     * at most five seconds away.
+     */
+    data class SubscribingFind(val dismissRequested: Boolean = false) : ConnectionState
+
+    /**
      * Connected, the §4 exchange finished, and its Status carried `FIND_PHONE`
      * (PROTOCOL.md §4.1): the link is held **open** and the phone's alarm is
-     * sounding. A [Action.ArmOperationTimeout] for the §5.2 ring backstop is armed.
+     * on — vibration, and the tone if the watch asked for it. A
+     * [Action.ArmOperationTimeout] for the §5.2 ring backstop is armed, and a
+     * `FindMode` notify from the watch changes the mode in place.
      *
      * The one state in which a finished exchange does not end in `close()`, and
      * deliberately so: the alarm sounds exactly while the find link is up, and the
@@ -299,20 +317,35 @@ sealed interface Action {
     }
 
     /**
-     * Make the phone heard: sound on the alarm channel, vibration, and the
-     * full-screen alarm UI (PROTOCOL.md §4.1). Idempotent for the Android layer —
-     * the machine issues it once per [ConnectionState.Ringing] and always pairs it
-     * with a [StopFindAlarm] before the state is left.
+     * Make the phone felt: vibration and the full-screen alarm UI, plus the tone
+     * on the alarm channel when [sound] is set (PROTOCOL.md §4.1). Idempotent for
+     * the Android layer — the machine issues it once per find link and always
+     * pairs it with a [StopFindAlarm] before the link is left.
      */
-    data object StartFindAlarm : Action
+    data class StartFindAlarm(val sound: Boolean) : Action
+
+    /**
+     * Change the mode of an alarm that is already on: add the tone or take it
+     * away, vibration continuing throughout (§3.3 FindMode). Only ever emitted
+     * between a [StartFindAlarm] and its [StopFindAlarm].
+     */
+    data class SetFindAlarmSound(val sound: Boolean) : Action
 
     /**
      * Silence it and take the alarm UI down. Emitted on **every** exit from
-     * [ConnectionState.Ringing] — the watch hanging up, the backstop, the user's
-     * dismissal, the radio going away — so there is no path on which the alarm
-     * outlives the link.
+     * [ConnectionState.Ringing] and [ConnectionState.SubscribingFind] — the watch
+     * hanging up, the backstop, the user's dismissal, the radio going away — so
+     * there is no path on which the alarm outlives the link.
      */
     data object StopFindAlarm : Action
+
+    /**
+     * `setCharacteristicNotification` on Find plus a CCCD write of
+     * [WatchProtocol.cccdEnableNotificationValue] — the phone's subscription to
+     * the watch's `FindMode` notifies (§4.1). Issued once per find link, right
+     * after the flagged Status, with a §5.2 per-operation timeout.
+     */
+    data object EnableFindNotifications : Action
 
     /**
      * Post a single delayed callback that will deliver
@@ -512,11 +545,22 @@ class ConnectionStateMachine(
         if (!started || !isBlocked()) return
         cancelTimer(actions)
         // The alarm sounds exactly while the find link is up (§4.1), and the link
-        // is about to be closed under it. Every exit from Ringing silences it.
-        if (state == ConnectionState.Ringing) actions += Action.StopFindAlarm
+        // is about to be closed under it. Every exit from a ringing state silences it.
+        if (alarmOn()) actions += Action.StopFindAlarm
         closeLink(actions)
         state = blockedState()
     }
+
+    /** Whether the find-phone alarm is on: Ringing, or subscribing with no Stop tapped yet. */
+    private fun alarmOn(): Boolean = when (val current = state) {
+        ConnectionState.Ringing -> true
+        is ConnectionState.SubscribingFind -> !current.dismissRequested
+        else -> false
+    }
+
+    /** Whether the user's Stop has already landed on the current Find subscription. */
+    private fun findDismissRequested(): Boolean =
+        (state as? ConnectionState.SubscribingFind)?.dismissRequested == true
 
     private fun leaveBlockedIfPossible(actions: MutableList<Action>) {
         if (!started) return
@@ -562,7 +606,16 @@ class ConnectionStateMachine(
     }
 
     private fun onDescriptorWritten(gattStatus: Int, actions: MutableList<Action>) {
-        if (state != ConnectionState.EnablingNotifications) return
+        val current = state
+        if (current is ConnectionState.SubscribingFind) {
+            // The Find subscription is done, one way or another (§4.1). A failure —
+            // an older watch with no notify on Find, a stack that refused — costs
+            // only the mid-link mode change; the alarm is already on in the mode
+            // the Status asked for, so it rings on. Not a failed exchange.
+            afterFindSubscription(current, actions)
+            return
+        }
+        if (current != ConnectionState.EnablingNotifications) return
         if (gattStatus != GATT_SUCCESS) {
             failExchange(ExchangeOutcome.GattOperationFailed, actions)
             return
@@ -608,6 +661,21 @@ class ConnectionStateMachine(
     }
 
     private fun onNotification(payload: ByteArray?, actions: MutableList<Action>) {
+        // On a find link the only notify the watch sends is a FindMode on Find
+        // (§3.3): §4 forbids an unprompted Status, and the phone wrote Time once.
+        // Anything that does not decode as a mode — a stray 12-byte frame, a
+        // truncated one — is ignored, and the mode stays what it was. Accepted in
+        // SubscribingFind as well as Ringing, because the watch answers the
+        // subscription with the current mode and that notify can beat the CCCD
+        // callback, exactly as a Status can beat its write callback below.
+        if (alarmOn() || state is ConnectionState.SubscribingFind) {
+            val mode = WatchProtocol.decodeFindMode(payload) ?: return
+            // With the user's Stop already tapped the alarm is off, and a mode for
+            // an alarm that is off is nothing to perform.
+            if (alarmOn()) actions += Action.SetFindAlarmSound(mode.sound)
+            return
+        }
+
         // Accepted in WritingTime as well as AwaitingStatus. Android's write
         // callback and an incoming notification are separate deliveries and can
         // arrive in either order; if the notify wins the race, consuming it here
@@ -679,6 +747,11 @@ class ConnectionStateMachine(
             // Status arrived.
             ConnectionState.Ringing -> endRinging(actions)
 
+            // The same, one round trip earlier. With the user's Stop already
+            // tapped the alarm is off and there is nothing left to silence.
+            is ConnectionState.SubscribingFind ->
+                if (findDismissRequested()) finishDismiss(actions) else endRinging(actions)
+
             // The watch hung up before the dismiss write completed — it processed
             // the frame and ended its search, or the link dropped. Either way the
             // alarm is already off and the link is gone; re-arm.
@@ -728,6 +801,16 @@ class ConnectionStateMachine(
                 endRinging(actions)
             }
 
+            // The Find subscription never completed inside its §5.2 timeout. The
+            // alarm rings on in the mode it started in, under the backstop; a
+            // dismiss that was waiting on the callback closes instead — the user
+            // already silenced the phone, and a link whose last operation timed out
+            // is not one to issue another write on.
+            is ConnectionState.SubscribingFind -> {
+                armedTimer = TimerKind.None
+                if (findDismissRequested()) finishDismiss(actions) else settleIntoRinging(actions)
+            }
+
             // The dismiss write never completed inside its §5.2 timeout. The alarm
             // is already off; close and re-arm.
             ConnectionState.DismissingFind -> {
@@ -751,13 +834,18 @@ class ConnectionStateMachine(
 
     /**
      * The Status carried `FIND_PHONE`: record the exchange as any other, then
-     * keep the link and make the phone heard.
+     * keep the link, make the phone felt, and subscribe to the mode channel.
      *
      * Recording comes first and is unconditional on the flag, so the counters and
      * the diagnostic record see exactly what a plain sync would have produced —
      * a find session that also set the clock is a success, one whose Time write
      * the watch refused is a failure, and neither is changed by the ringing that
      * follows. What the flag changes is only what happens to the link.
+     *
+     * The alarm starts before the subscription is issued, not after it completes:
+     * the phone is lost, and a round trip is a round trip of silence. Its mode is
+     * the Status's `FIND_SOUND` — the wearer may have pressed Menu before the
+     * phone connected — and a `FindMode` notify changes it from then on.
      */
     private fun ring(status: WatchStatus, actions: MutableList<Action>) {
         cancelTimer(actions)
@@ -771,11 +859,49 @@ class ConnectionStateMachine(
             actions += Action.PersistHealth(health)
             actions += Action.ReportExchange(ExchangeOutcome.WatchReportedFailure, status, now)
         }
-        actions += Action.StartFindAlarm
+        actions += Action.StartFindAlarm(sound = status.findSoundRequested)
+        // One GATT operation, one per-operation timeout — the plain one, because
+        // the §5.2 exchange budget is spent and this is not an exchange.
+        armTimer(WatchProtocol.OPERATION_TIMEOUT_MS, actions)
+        actions += Action.EnableFindNotifications
+        state = ConnectionState.SubscribingFind()
+    }
+
+    /**
+     * The Find subscription's callback arrived. Either into the ring proper, or —
+     * if the user tapped Stop while it was outstanding — straight into the dismiss
+     * write that was waiting its turn on the link.
+     */
+    private fun afterFindSubscription(
+        subscribing: ConnectionState.SubscribingFind,
+        actions: MutableList<Action>,
+    ) {
+        if (subscribing.dismissRequested) {
+            cancelTimer(actions)
+            writeDismiss(actions)
+        } else {
+            settleIntoRinging(actions)
+        }
+    }
+
+    /** Ringing, with the §5.2 backstop as the only timer on the link. */
+    private fun settleIntoRinging(actions: MutableList<Action>) {
+        cancelTimer(actions)
         // The backstop, not a per-operation timeout: nothing is outstanding on the
         // link, and this is the whole of how long the phone will ring unasked.
         armTimer(WatchProtocol.FIND_RING_BACKSTOP_MS, actions)
         state = ConnectionState.Ringing
+    }
+
+    /** The §3.3 FindDismiss write, with its own timeout, and the state that waits on it. */
+    private fun writeDismiss(actions: MutableList<Action>) {
+        state = ConnectionState.DismissingFind
+        // The plain per-operation timeout, not armOperationTimeout(): that one is
+        // clamped to what is left of the §5.2 exchange budget, and the exchange
+        // budget ran out long ago — a ring lasts minutes. Nothing here is an
+        // exchange; it is one write on a link that has outlived its exchange.
+        armTimer(WatchProtocol.OPERATION_TIMEOUT_MS, actions)
+        actions += Action.WriteFindDismiss(WatchProtocol.encodeFindDismiss())
     }
 
     /**
@@ -803,18 +929,30 @@ class ConnectionStateMachine(
      * five seconds to fail must not keep them listening to it. Then the §3.3
      * frame goes out with a per-operation timeout, and the link closes on the
      * reply.
+     *
+     * If the Find subscription is still outstanding the write waits for its
+     * callback — one operation at a time on the link (Law 2) — and only the alarm
+     * stops now. The tap is remembered in the state, so the callback knows where
+     * to go next.
      */
     private fun onFindDismissedOnPhone(actions: MutableList<Action>) {
-        if (state != ConnectionState.Ringing) return
-        cancelTimer(actions)
-        actions += Action.StopFindAlarm
-        state = ConnectionState.DismissingFind
-        // The plain per-operation timeout, not armOperationTimeout(): that one is
-        // clamped to what is left of the §5.2 exchange budget, and the exchange
-        // budget ran out long ago — a ring lasts minutes. Nothing here is an
-        // exchange; it is one write on a link that has outlived its exchange.
-        armTimer(WatchProtocol.OPERATION_TIMEOUT_MS, actions)
-        actions += Action.WriteFindDismiss(WatchProtocol.encodeFindDismiss())
+        when (val current = state) {
+            ConnectionState.Ringing -> {
+                cancelTimer(actions)
+                actions += Action.StopFindAlarm
+                writeDismiss(actions)
+            }
+
+            is ConnectionState.SubscribingFind -> {
+                if (current.dismissRequested) return
+                actions += Action.StopFindAlarm
+                // The CCCD write and its timeout stay as they are; the tap only
+                // decides what its callback leads to.
+                state = ConnectionState.SubscribingFind(dismissRequested = true)
+            }
+
+            else -> Unit
+        }
     }
 
     /** The dismiss write is over, one way or another. Close and re-arm at once. */

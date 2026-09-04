@@ -49,12 +49,15 @@ its keep.
       **not** treated as a fault: no backoff escalation, no error notification,
       no health counter increment.
 - [ ] **The find-phone alarm never outlives its link.** Every exit from
-      `Ringing` — the watch hanging up, the ring backstop, the user's Stop, the
-      adapter or the permission going away, service shutdown — emits
-      `StopFindAlarm` before the link closes, and `FakeTransport` refuses an alarm
-      sounding in any other state. A ring that is not bounded by a timer, or a
-      dismiss that settles or backs off instead of re-arming at once, is a
-      `PROTOCOL.md` §4.1 violation.
+      `Ringing` or `SubscribingFind` — the watch hanging up, the ring backstop,
+      the user's Stop, the adapter or the permission going away, service
+      shutdown — emits `StopFindAlarm` before the link closes, and
+      `FakeTransport` refuses an alarm sounding in any other state. A ring that
+      is not bounded by a timer, a dismiss that settles or backs off instead of
+      re-arming at once, or a `SetFindAlarmSound` outside a start/stop pair, is
+      a `PROTOCOL.md` §4.1 violation. The subscription to `Find` is one more
+      GATT operation on a link that already has the dismiss write to issue: the
+      user's Stop during it must wait for the CCCD callback, not go out on top.
 - [ ] No `catch (e: Exception) {}` that keeps a structurally broken process
       alive. Catch what is genuinely handleable; let the rest restart the process.
 - [ ] Health counters persist across process death and escalate to longer

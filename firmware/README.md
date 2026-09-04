@@ -79,7 +79,7 @@ Five non-negotiable rules, spelled out in [CLAUDE.md](CLAUDE.md):
    Safe and Recovery modes so a crash loop degrades instead of flattening the
    battery in five hours.
 3. **Logic is host-tested.** `src/core/**` is pure C++17 with no hardware headers,
-   covered by 384 Unity tests running on the developer's machine.
+   covered by 399 Unity tests running on the developer's machine.
 4. **VS Code + PlatformIO out of the box.** Pinned platform, pinned dependencies.
 5. **Watchy 2.0 only.** No revision `#if`s, no abstraction for hypothetical
    hardware.

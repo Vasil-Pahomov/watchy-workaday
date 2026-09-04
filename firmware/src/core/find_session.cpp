@@ -11,7 +11,13 @@ uint32_t FindSession::waitMs(uint32_t elapsed_ms) const {
   // ever stamped from it — so the sum cannot overflow before the cap ends the
   // session, and both operands are far below UINT32_MAX anyway.
   const uint32_t round_deadline = round_started_ms_ + kFindRoundMs;
-  const uint32_t deadline = round_deadline < kFindPhoneTimeoutMs ? round_deadline : kFindPhoneTimeoutMs;
+  uint32_t deadline = round_deadline < kFindPhoneTimeoutMs ? round_deadline : kFindPhoneTimeoutMs;
+  // A Menu press waiting to be confirmed brings the deadline forward, never back:
+  // its settle time is at most kFindButtonSettleMs past the edge, and the edge
+  // was inside the current round.
+  if (menu_settles_at_ms_ < deadline) {
+    deadline = menu_settles_at_ms_;
+  }
   return elapsed_ms >= deadline ? 0u : deadline - elapsed_ms;
 }
 
@@ -38,6 +44,10 @@ void FindSession::noteStatusNotified() {
   }
 }
 
+uint8_t FindSession::statusFlags() const {
+  return static_cast<uint8_t>(kStatusFlagFindPhone | (sound_ ? kStatusFlagFindSound : 0));
+}
+
 uint16_t FindSession::elapsedSeconds(uint32_t elapsed_ms) {
   const uint32_t seconds = elapsed_ms / 1000u;
   return seconds > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(seconds);
@@ -58,11 +68,39 @@ FindEvent FindSession::classify(uint32_t elapsed_ms, const FindSignals& signals)
     return finish(FindOutcome::TimedOut);
   }
 
+  // A Menu edge is recorded here, before anything is reported, because it is
+  // always consumed — the caller clears its bit after every call in which it was
+  // set, whatever this function returned. §4.1: it counts only while a phone is
+  // on the link, and only once the pin has been seen still pressed after the
+  // contacts settled (kFindButtonSettleMs); a second edge inside that window is
+  // the same press bouncing and does not restart the clock.
+  if (signals.menu_edge && menu_settles_at_ms_ == kNoPendingPress &&
+      phase_ != FindPhase::Searching) {
+    menu_settles_at_ms_ = elapsed_ms + kFindButtonSettleMs;
+  }
+
   // The wearer outranks the phone. If both ended the search in the same instant
   // the wearer is standing at the watch and pressed Back to get the menu; the
   // phone's message would be shown to nobody.
   if (signals.back_pressed) {
     return finish(FindOutcome::BackPressed);
+  }
+
+  // A Menu press whose settle time has come. The pin decides: still pressed is a
+  // press and flips the mode; released is the bounce it was taken for, and
+  // nothing changes. Either way the clock is cleared and the next edge starts a
+  // new one. This sits ahead of every level signal below on purpose: waitMs()
+  // brought the caller here for the clock, and a clock that a pending write or
+  // subscription could keep pre-empting would hand out zero waits until the
+  // signal was consumed — a spin, for a caller that is slow to consume. The
+  // signal it outranks is still set and is reported on the very next pass.
+  if (menu_settles_at_ms_ != kNoPendingPress && elapsed_ms >= menu_settles_at_ms_) {
+    menu_settles_at_ms_ = kNoPendingPress;
+    if (signals.menu_held && phase_ != FindPhase::Searching) {
+      sound_ = !sound_;
+      round_started_ms_ = elapsed_ms;
+      return FindEvent::SoundToggled;
+    }
   }
 
   // A Find write is reported before the link events so a dismissal that arrived
@@ -85,9 +123,18 @@ FindEvent FindSession::classify(uint32_t elapsed_ms, const FindSignals& signals)
   }
 
   if (phase_ != FindPhase::Searching && signals.time_written) {
-    // §4 unchanged: the caller answers with Status, which now carries the flag.
+    // §4 unchanged: the caller answers with Status, which now carries the flags.
     round_started_ms_ = elapsed_ms;
     return FindEvent::TimeWritten;
+  }
+
+  // The phone subscribed to Find (§4.1): the caller tells it the current mode, so
+  // a Menu press that landed before the subscription is delivered rather than
+  // lost. Before the disconnect below only for promptness — if both are pending
+  // the notify goes to a link that is gone, which is a no-op.
+  if (signals.find_subscribed) {
+    round_started_ms_ = elapsed_ms;
+    return FindEvent::FindSubscribed;
   }
 
   if (signals.disconnected) {
@@ -99,6 +146,9 @@ FindEvent FindSession::classify(uint32_t elapsed_ms, const FindSignals& signals)
     if (was_connected && attempts_ < UINT8_MAX) {
       ++attempts_;
     }
+    // A press still waiting to be confirmed has nobody left to hear it. The mode
+    // itself is kept: the phone that reconnects learns it from the Status flags.
+    menu_settles_at_ms_ = kNoPendingPress;
     round_started_ms_ = elapsed_ms;
     return FindEvent::Disconnected;
   }

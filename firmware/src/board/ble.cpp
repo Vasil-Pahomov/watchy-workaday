@@ -60,14 +60,16 @@ constexpr EventBits_t kBitTimeWritten = 1u << 1;
 constexpr EventBits_t kBitDisconnected = 1u << 2;
 constexpr EventBits_t kBitFindWritten = 1u << 3;
 constexpr EventBits_t kBitAbort = 1u << 4;
+constexpr EventBits_t kBitFindSubscribed = 1u << 5;
+constexpr EventBits_t kBitMenu = 1u << 6;
 // What a sync window waits on, and what a find session waits on. Two masks
 // because a wait that wakes on a bit its classifier never consumes returns
 // instantly on every later call — the defect wait() describes below — and
-// core::SyncWindow has no signal for a Find write or a Back press. A Find write
-// during a sync window is therefore latched, ignored, and cleared by the next
-// constructor; PROTOCOL.md §3.3 says exactly that.
+// core::SyncWindow has no signal for a Find write, a Find subscription or a
+// button. Any of those during a sync window is therefore latched, ignored, and
+// cleared by the next constructor; PROTOCOL.md §3.3 says exactly that.
 constexpr EventBits_t kBitSync = kBitConnected | kBitTimeWritten | kBitDisconnected;
-constexpr EventBits_t kBitFind = kBitSync | kBitFindWritten | kBitAbort;
+constexpr EventBits_t kBitFind = kBitSync | kBitFindWritten | kBitAbort | kBitFindSubscribed | kBitMenu;
 constexpr EventBits_t kBitAny = kBitFind;
 
 // One window's worth of state, in static storage.
@@ -97,6 +99,8 @@ struct Window {
   // The live link, for hangUp(). BLE_HS_CONN_HANDLE_NONE when nothing is up.
   volatile uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
   NimBLECharacteristic* status = nullptr;
+  // The Find characteristic, for notifyFind() — the watch's side of §3.3.
+  NimBLECharacteristic* find = nullptr;
 };
 
 Window g_window;
@@ -134,6 +138,19 @@ class FindCallbacks final : public NimBLECharacteristicCallbacks {
     g_window.find_payload_length = length;
     xEventGroupSetBits(g_window.events, kBitFindWritten);
   }
+
+  // §4.1: the phone subscribes to Find after the flagged Status, and the watch
+  // answers with the current mode — from the wake's task, on the FindSubscribed
+  // event, never from here. Bit 0 of subValue is "notifications on"; an
+  // unsubscribe (0) is nothing the session needs to hear about.
+  void onSubscribe(NimBLECharacteristic* characteristic, ble_gap_conn_desc* desc,
+                   uint16_t subValue) override {
+    static_cast<void>(characteristic);
+    static_cast<void>(desc);
+    if ((subValue & 0x01) != 0) {
+      xEventGroupSetBits(g_window.events, kBitFindSubscribed);
+    }
+  }
 };
 
 class TimeCallbacks final : public NimBLECharacteristicCallbacks {
@@ -169,6 +186,7 @@ Session::Session(const uint8_t* status, size_t status_length) {
   g_window.find_payload_length = 0;
   g_window.conn_handle = BLE_HS_CONN_HANDLE_NONE;
   g_window.status = nullptr;
+  g_window.find = nullptr;
   if (g_window.events == nullptr) {
     g_window.events = xEventGroupCreateStatic(&g_window.event_storage);
   }
@@ -254,15 +272,17 @@ Session::Session(const uint8_t* status, size_t status_length) {
 
   // §3.3, present in every window and not only in a find session: the service's
   // shape is the contract, and a phone that discovers it once and caches the
-  // profile must find the same characteristics next time. A write that arrives
-  // outside a find session is latched and ignored — see kBitSync.
-  NimBLECharacteristic* find_chr = service->createCharacteristic(
-      core::kFindCharacteristicUuid, NIMBLE_PROPERTY::WRITE, kMaxPayloadLength);
-  if (find_chr == nullptr) {
+  // profile must find the same characteristics next time. Write for the phone's
+  // dismissal, notify for the watch's mode. A write or a subscription that
+  // arrives outside a find session is latched and ignored — see kBitSync.
+  g_window.find = service->createCharacteristic(
+      core::kFindCharacteristicUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY,
+      kMaxPayloadLength);
+  if (g_window.find == nullptr) {
     WD_LOG("ble: Find characteristic failed");
     return;
   }
-  find_chr->setCallbacks(&g_find_callbacks);
+  g_window.find->setCallbacks(&g_find_callbacks);
 
   if (!service->start()) {
     WD_LOG("ble: service start failed");
@@ -402,6 +422,7 @@ Session::~Session() {
   }
 
   g_window.status = nullptr;
+  g_window.find = nullptr;
   // The event group is deliberately NOT deleted, and that follows directly from
   // leaving the stack up. The NimBLE callbacks are still live and every one of them
   // ends in xEventGroupSetBits(g_window.events, ...) — a disconnect arriving after
@@ -532,7 +553,7 @@ bool Session::notify(const uint8_t* status, size_t length) {
 
 uint32_t Session::elapsedMs() const { return millis() - opened_ms_; }
 
-core::FindEvent Session::findWait(core::FindSession& session) {
+core::FindEvent Session::findWait(core::FindSession& session, bool (*menu_held)()) {
   if (!ok_ || g_window.events == nullptr) {
     // No window ever opened. The caller checked ok() and never gets here; if it
     // did, the honest answer is that the session is over before it started.
@@ -540,9 +561,9 @@ core::FindEvent Session::findWait(core::FindSession& session) {
   }
 
   // The same shape as wait(), with core::FindSession owning the arithmetic: how
-  // long this round may block, and what the pending bits mean. All five bits this
-  // time — the two the sync wait deliberately ignores are exactly the two that
-  // end a search.
+  // long this round may block, and what the pending bits mean. All seven bits
+  // this time — the ones the sync wait deliberately ignores are exactly the ones
+  // that end or steer a search.
   const uint32_t wait_ms = session.waitMs(elapsedMs());
   const EventBits_t bits = xEventGroupWaitBits(g_window.events, kBitFind, /*clearOnExit=*/pdFALSE,
                                                /*waitForAll=*/pdFALSE, pdMS_TO_TICKS(wait_ms));
@@ -553,6 +574,13 @@ core::FindEvent Session::findWait(core::FindSession& session) {
   signals.disconnected = (bits & kBitDisconnected) != 0;
   signals.find_written = (bits & kBitFindWritten) != 0;
   signals.back_pressed = (bits & kBitAbort) != 0;
+  signals.find_subscribed = (bits & kBitFindSubscribed) != 0;
+  signals.menu_edge = (bits & kBitMenu) != 0;
+  // Sampled now, after the wait, which is the only moment it means anything: a
+  // press is confirmed kFindButtonSettleMs after its edge by the pin still being
+  // high, and the wait was cut to exactly that deadline. One GPIO read per wake
+  // of this loop, not a poll — the loop wakes on events and deadlines.
+  signals.menu_held = menu_held != nullptr && menu_held();
 
   const core::FindEvent event = session.classify(elapsedMs(), signals);
 
@@ -574,12 +602,38 @@ core::FindEvent Session::findWait(core::FindSession& session) {
     case core::FindEvent::Disconnected:
       xEventGroupClearBits(g_window.events, kBitDisconnected);
       break;
+    case core::FindEvent::FindSubscribed:
+      xEventGroupClearBits(g_window.events, kBitFindSubscribed);
+      break;
+    case core::FindEvent::SoundToggled:
     case core::FindEvent::RoundElapsed:
     case core::FindEvent::Ended:
     case core::FindEvent::StillWaiting:
       break;
   }
+  // The Menu edge is the one bit not tied to an event: core::FindSession records
+  // it whatever it returns — it only starts a settle clock, or is dropped as a
+  // bounce or as a press with nobody on the link — so it is spent on every call
+  // that saw it. Left set it would be the instant-return spin above.
+  if (signals.menu_edge) {
+    xEventGroupClearBits(g_window.events, kBitMenu);
+  }
   return event;
+}
+
+bool Session::notifyFind(const uint8_t* frame, size_t length) {
+  if (!ok_ || g_window.find == nullptr || frame == nullptr || length == 0 ||
+      length > kMaxPayloadLength) {
+    return false;
+  }
+  // setValue as well as notify, as for Status: a phone that reads Find gets the
+  // current mode rather than whatever the characteristic held at creation.
+  g_window.find->setValue(frame, length);
+  const bool subscribed = g_window.find->getSubscribedCount() != 0;
+  // With no subscriber NimBLE sends nothing, which is the §6.1 no-op — a mode
+  // change before the phone subscribed is delivered on FindSubscribed instead.
+  g_window.find->notify(frame, length);
+  return subscribed;
 }
 
 size_t Session::copyFindWrite(uint8_t* out, size_t cap) const {
@@ -643,6 +697,20 @@ IRAM_ATTR void Session::requestAbort() {
   }
   BaseType_t woken = pdFALSE;
   xEventGroupSetBitsFromISR(g_window.events, kBitAbort, &woken);
+  if (woken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+// Same shape and the same IRAM reasoning as requestAbort(). This one only reports
+// an edge; whether it was a press is core::FindSession's to decide from the pin
+// level kFindButtonSettleMs later, which is why bouncing here costs nothing.
+IRAM_ATTR void Session::requestSoundToggle() {
+  if (g_window.events == nullptr) {
+    return;
+  }
+  BaseType_t woken = pdFALSE;
+  xEventGroupSetBitsFromISR(g_window.events, kBitMenu, &woken);
   if (woken == pdTRUE) {
     portYIELD_FROM_ISR();
   }

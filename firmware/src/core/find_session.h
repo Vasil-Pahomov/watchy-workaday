@@ -64,6 +64,19 @@ static_assert(kFindRoundMs <= kAdvertiseTimeoutMs,
               "a find round is an un-fed interval and must fit under PROTOCOL.md §5.1's bound");
 static_assert(kFindRoundMs > 0, "a zero-length round is a spin");
 
+// How long after a Menu edge the pin is looked at again before the press counts
+// (§4.1's sound toggle). The Menu button is read by a GPIO interrupt during a
+// search, and a tactile switch bounces: several edges on the way down, and —
+// worse — a burst of them on the way *up*, including the release of the very
+// press that started the search. Counting edges would toggle the tone on a
+// release. So an edge only starts a clock, and the press counts when the pin is
+// still high once the contacts have settled. Well past any bounce and well short
+// of any human press, and a bounded wait rather than a delay: waitMs() hands it
+// out like any other deadline, and the round bound still holds.
+constexpr uint32_t kFindButtonSettleMs = 40;
+static_assert(kFindButtonSettleMs > 0 && kFindButtonSettleMs < kFindRoundMs,
+              "the settle wait must be a real wait and must not lengthen a round");
+
 // How a find session ended, or why it never started. Persisted in the caller's
 // RTC-backed block so the Find phone screen can say it on the wakes after the
 // session — "phone found" has to survive the deep sleep between the search
@@ -96,34 +109,51 @@ enum class FindPhase : uint8_t {
 // completed step the caller may feed the watchdog after — see runFindSession() in
 // main.cpp for which ones it does.
 enum class FindEvent : uint8_t {
-  Connected,     // a central arrived. Caller: feed, redraw.
-  TimeWritten,   // twelve bytes arrived on Time. Caller: answer them as §4 requires, then feed.
-  FindWritten,   // a frame arrived on Find. Caller: decode it and call noteFindWrite().
-  RoundElapsed,  // kFindRoundMs passed with nothing else to report. Caller: redraw, feed.
-  Disconnected,  // the link dropped. Caller: restart advertising, redraw, feed.
-  Ended,         // terminal. outcome() says how.
-  StillWaiting,  // the wait came back early; wait again, and do NOT feed.
+  Connected,       // a central arrived. Caller: feed, redraw.
+  TimeWritten,     // twelve bytes arrived on Time. Caller: answer them as §4 requires, then feed.
+  FindWritten,     // a frame arrived on Find. Caller: decode it and call noteFindWrite().
+  RoundElapsed,    // kFindRoundMs passed with nothing else to report. Caller: redraw, feed.
+  Disconnected,    // the link dropped. Caller: restart advertising, redraw, feed.
+  Ended,           // terminal. outcome() says how.
+  StillWaiting,    // the wait came back early; wait again, and do NOT feed.
+  FindSubscribed,  // the phone subscribed to Find. Caller: notify the current mode (§4.1), feed.
+  SoundToggled,    // a confirmed Menu press flipped sound(). Caller: notify the mode, redraw, feed.
 };
 
-// What the radio saw since the last question, plus the one signal that is not
-// the radio's: the wearer's Back press, delivered from a GPIO interrupt.
+// What the radio saw since the last question, plus the signals that are not the
+// radio's: the wearer's Back press and Menu edge, delivered from GPIO interrupts,
+// and the Menu pin's level, sampled by the caller when the wait returns.
 struct FindSignals {
   bool connected = false;
   bool time_written = false;
   bool disconnected = false;
   bool find_written = false;
   bool back_pressed = false;
+  // The phone wrote the CCCD on Find (§4.1). Level, cleared once reported.
+  bool find_subscribed = false;
+  // A rising edge on the Menu pin since the last question. Level, and always
+  // consumed: classify() records it whatever else it reports, so the caller
+  // clears it after every call in which it was set.
+  bool menu_edge = false;
+  // Whether the Menu pin reads pressed right now. Not latched — the caller
+  // samples it after each wait — and only ever consulted when a press is being
+  // confirmed, kFindButtonSettleMs after its edge.
+  bool menu_held = false;
 };
 
 class FindSession {
  public:
   // How long the caller may block before asking again. Never more than
-  // kFindRoundMs, never past the cap, zero once the session has ended.
+  // kFindRoundMs, never past the cap, no later than a pending Menu press's settle
+  // deadline, zero once the session has ended.
   uint32_t waitMs(uint32_t elapsed_ms) const;
 
   // What the pending signals mean, in priority order: the cap, then Back, then a
-  // Find write, then the link events, then the round clock. Non-const: this is
-  // where the phase and the attempt counter advance.
+  // settled Menu press, then a Find write, then the link events, then the phone's
+  // subscription, then the round clock. The settled press sits ahead of the level
+  // signals because waitMs() wakes the caller for it: a signal left pending could
+  // otherwise pre-empt it on every pass and turn the wait into zero. Non-const:
+  // this is where the phase, the attempt counter and the mode advance.
   FindEvent classify(uint32_t elapsed_ms, const FindSignals& signals);
 
   // The Find write classify() last reported, once it has been through
@@ -142,6 +172,17 @@ class FindSession {
   FindOutcome outcome() const { return outcome_; }
   FindPhase phase() const { return phase_; }
 
+  // Whether the wearer has asked for the alarm tone as well as vibration (§4.1).
+  // Off when a search starts; flipped by each Menu press that settles while a
+  // phone is on the link; kept across a lost link so the phone that reconnects
+  // resumes the same way.
+  bool sound() const { return sound_; }
+
+  // §3.2's `flags` for every Status this session answers with: FIND_PHONE always,
+  // FIND_SOUND while sound() is on. One place, so the flag and the mode the
+  // FindMode frames carry cannot disagree.
+  uint8_t statusFlags() const;
+
   // How many times the watch has started listening: 1 while the first round runs,
   // +1 for every round that ends with nobody connected, +1 for every link that
   // drops. Saturates at 255 rather than wrapping back to a hopeful "try 1".
@@ -156,11 +197,16 @@ class FindSession {
   bool ended_ = false;
   FindOutcome outcome_ = FindOutcome::InProgress;
   FindPhase phase_ = FindPhase::Searching;
+  bool sound_ = false;
   uint8_t attempts_ = 1;
   // Milliseconds since the session opened at which the current round began:
   // re-stamped at every event the caller feeds after, so each round is a fresh
   // un-fed interval measured from a feed.
   uint32_t round_started_ms_ = 0;
+  // When a Menu edge that arrived while a phone was on the link is due to be
+  // confirmed against the pin, or kNoPendingPress. See kFindButtonSettleMs.
+  static constexpr uint32_t kNoPendingPress = UINT32_MAX;
+  uint32_t menu_settles_at_ms_ = kNoPendingPress;
 };
 
 // The outcome a refused gate reads as. Open is InProgress — the session runs —

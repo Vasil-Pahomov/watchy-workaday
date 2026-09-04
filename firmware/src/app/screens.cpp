@@ -91,15 +91,17 @@ const char* menuLabel(uint8_t index, bool inverted) {
   return kMenuLabels[index];
 }
 
-// What the search is doing, while it runs. Presentation, like syncLabel().
-const char* findPhaseLabel(core::FindPhase phase) {
+// What the search is doing, while it runs. Presentation, like syncLabel(). The
+// ringing line names the mode the wearer chose, because Menu flips it (§4.1) and
+// the line changing is how they see the press land.
+const char* findPhaseLabel(core::FindPhase phase, bool sound) {
   switch (phase) {
     case core::FindPhase::Searching:
       return "searching";
     case core::FindPhase::Connected:
       return "connected";
     case core::FindPhase::Ringing:
-      return "phone ringing";
+      return sound ? "phone ringing" : "phone vibrating";
   }
   return "";
 }
@@ -226,7 +228,7 @@ uint32_t compose(const Snapshot& snapshot) {
 
   if (snapshot.find_live) {
     snprintf(g_composed.find_status, sizeof(g_composed.find_status), "%s",
-             findPhaseLabel(snapshot.find_phase));
+             findPhaseLabel(snapshot.find_phase, snapshot.find_sound));
     // Elapsed as m:ss and the attempt counter, the two numbers the wearer asked
     // to see while the search runs. Widest reachable: "2:00  try 255", 13 chars.
     snprintf(g_composed.find_progress, sizeof(g_composed.find_progress), "%u:%02u  try %u",
