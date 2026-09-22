@@ -41,11 +41,16 @@ struct Composed {
   core::Screen screen;
   uint8_t menu_index;
   uint8_t battery_percent;
+  // Whether the gauge carries the low-battery mark. Stored as the answer rather
+  // than as the level behind it, because the answer is what is drawn and what is
+  // hashed: Low and Critical paint the same mark, and a hash keyed on the level
+  // would pay for a panel refresh every time the cell crossed between them.
+  bool battery_warning;
   bool inverted;
 };
 
 Composed g_composed = {"--:--", "", "", "", "", "", "", "", "",
-                       core::Screen::Watchface, 0, 0, false};
+                       core::Screen::Watchface, 0, 0, false, false};
 
 constexpr uint8_t kStepsMenuIndex = 0;  // must track kMenuLabels below
 
@@ -191,6 +196,7 @@ uint32_t compose(const Snapshot& snapshot) {
 
   snprintf(g_composed.status, sizeof(g_composed.status), "%s", modeTag(snapshot.mode));
   g_composed.battery_percent = snapshot.battery_percent;
+  g_composed.battery_warning = core::batterySaving(snapshot.battery_level);
 
   switch (snapshot.steps_display) {
     case core::StepsDisplay::Live:
@@ -253,6 +259,12 @@ uint32_t compose(const Snapshot& snapshot) {
   const uint16_t battery_fill =
       core::gaugeFillPixels(g_composed.battery_percent, board::display::kBatteryTrackPixels);
   hash = core::hashCombine(hash, &battery_fill, sizeof(battery_fill));
+  // Separately from the fill, and it has to be: the tracker's hysteresis puts the
+  // same percentage — so the same fill — on either side of the threshold, so a
+  // hash keyed on the fill alone would compose an identical screen for a watch
+  // that had just entered saving mode and leave the mark unpainted.
+  const uint8_t battery_warning_byte = g_composed.battery_warning ? 1u : 0u;
+  hash = core::hashCombine(hash, &battery_warning_byte, sizeof(battery_warning_byte));
   hash = core::hashCombine(hash, g_composed.steps_face);
   // Outside every screen-specific branch below, because this one is not specific
   // to a screen: it swaps all 40 000 pixels of whichever screen is up, and of the
@@ -303,7 +315,7 @@ void draw() {
 
     case core::Screen::App: {
       board::display::drawStatusLine(g_composed.status);
-      board::display::drawBatteryGauge(g_composed.battery_percent);
+      board::display::drawBatteryGauge(g_composed.battery_percent, g_composed.battery_warning);
       const uint8_t index =
           g_composed.menu_index < core::kMenuItemCount ? g_composed.menu_index : 0;
       if (index == kStepsMenuIndex && g_composed.steps[0] != '\0') {
@@ -341,7 +353,7 @@ void draw() {
   }
 
   board::display::drawStatusLine(g_composed.status);
-  board::display::drawBatteryGauge(g_composed.battery_percent);
+  board::display::drawBatteryGauge(g_composed.battery_percent, g_composed.battery_warning);
   board::display::drawTimeLarge(g_composed.time);
   board::display::drawDateLine(g_composed.date);
   board::display::drawStepsLine(g_composed.steps_face);

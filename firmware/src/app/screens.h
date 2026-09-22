@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 
+#include "core/battery_model.h"
 #include "core/find_session.h"
 #include "core/health.h"
 #include "core/protocol.h"
@@ -21,10 +22,16 @@ struct Snapshot {
   core::DateTime time;
   bool time_valid = false;
   bool use_24h = true;
-  // The gauge in the top-right corner is the whole battery display, so this is
-  // the whole battery input: the level the tracker is in decides the tick rate
-  // and whether the radio may come up, but nothing about the picture.
+  // The two halves of the battery display, and they are not the same reading.
+  // `battery_percent` fills the gauge in the top-right corner. `battery_level` is
+  // where the tracker's hysteresis has left the watch, which decides the tick
+  // rate and whether the radio may come up — behaviour the wearer would otherwise
+  // have no way to see, so core::batterySaving() turns it into the mark beside
+  // the gauge. Deriving one from the other is exactly what cannot be done: the
+  // same percentage sits on either side of the threshold depending on which way
+  // the cell was going.
   uint8_t battery_percent = 0;
+  core::BatteryLevel battery_level = core::BatteryLevel::Normal;
   core::RunMode mode = core::RunMode::Normal;
   core::Screen screen = core::Screen::Watchface;
   uint8_t menu_index = 0;

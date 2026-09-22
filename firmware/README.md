@@ -12,7 +12,13 @@ Gilroy ExtraBold throughout, white on black — or black on white, from the thir
 menu item, which states which way round it currently is rather than what pressing
 it would do. The charge is a gauge in the top-right corner rather than a
 percentage, the step count is digits alone in the bottom-left, and neither the
-hour nor the day carries a leading zero. The fourth menu item, **Find phone**,
+hour nor the day carries a leading zero. A **`!` to the left of the gauge** means
+the cell has taken the watch into its saving mode — a five-minute tick instead of
+a one-minute one, and the radio refused — which is otherwise invisible: the watch
+simply becomes slow to answer a button and turns down a sync, and that looks
+exactly like a fault. It is not a second reading of the percentage; the level
+tracker's hysteresis decides it, so the same percentage can be marked or not
+depending on which way the cell was going. The fourth menu item, **Find phone**,
 makes the paired phone ring: the watch advertises for up to two minutes, counting
 the seconds and the attempts on screen, the phone rings until the link ends or
 someone silences it, and the watch says "phone found" if that someone was on the
@@ -24,8 +30,8 @@ of the day, 20:00, it inks 198 of the 200 columns. That is the largest whole-pix
 size that does not run off the glass — the next one up overshoots by three columns.
 
 Every state the panel can be put into, including the ones that are awkward to
-reach on a wrist — a flat cell, a clock that has never been set, a step sensor
-that has stopped answering, Recovery mode:
+reach on a wrist — a flat cell, a watch in saving mode, a clock that has never
+been set, a step sensor that has stopped answering, Recovery mode:
 
 ![Every screen the firmware can draw](docs/preview/screens.png)
 

@@ -42,7 +42,7 @@ The boundary is mechanically enforced: the `native` environment compiles only
 | Module | Owns | Energy/reliability role |
 |---|---|---|
 | `time_model` | calendar/clock arithmetic, validity, formatting | next-alarm computation; rejects garbage RTC time (P0) |
-| `battery_model` | mV → %, smoothing, hysteresis, level state | triggers low-battery 5-minute mode |
+| `battery_model` | mV → %, smoothing, hysteresis, level state | triggers low-battery 5-minute mode; `batterySaving()` is that mode stated on the face, so the wearer can tell it from a fault |
 | `refresh_policy` | partial vs full vs **skip** | skipping a refresh removes ~85 % of a wake's cost |
 | `wake_router` | wake reason → what to power up | the module that decides what *not* to do |
 | `health` | boots, faults, run mode across resets | crash-loop escalation to Safe/Recovery |

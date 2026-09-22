@@ -29,7 +29,7 @@ Run from firmware/:
     python tools/preview_face.py --all                 # rebuild docs/preview/
     python tools/preview_face.py --hero                # the face, framed
     python tools/preview_face.py --sheet               # every screen and state
-    python tools/preview_face.py --battery 8 --steps 412 --time 9:05
+    python tools/preview_face.py --battery 8 --low --steps 412 --time 9:05
 Requires PIL.
 """
 import argparse
@@ -61,7 +61,7 @@ NEEDED = {
     DISPLAY_CPP: ["kMargin", "kStatusBaseline", "kDateBaseline", "kTimeBaseline",
                   "kStepsLeft", "kStepsBottom", "kGaugeHeight", "kGaugeBorder",
                   "kGaugeBodyWidth", "kGaugeCapWidth", "kGaugeCapHeight", "kGaugeTop",
-                  "kGaugeLeft"],
+                  "kGaugeLeft", "kGaugeWarnGap"],
 }
 
 INK, PAPER = 1, 0
@@ -210,7 +210,31 @@ def gauge_fill_pixels(percent, track):
     return 1 if filled == 0 else filled
 
 
-def draw_gauge(fb, k, percent):
+# display.cpp's kWarnMark. A string rather than a shape because the firmware draws
+# a glyph out of the small face, and mirroring it any other way would be drawing a
+# different watch.
+WARN_MARK = "!"
+
+
+def warn_box(k, f):
+    """Where drawBatteryGauge() puts the low-battery mark: (x, baseline, left).
+
+    Right-aligned against the cell across `kGaugeWarnGap` columns and centred in
+    the cell's band, both measured off the glyph exactly as the firmware measures
+    them - so a regenerated font moves the mark here too instead of leaving this
+    tool drawing the previous one."""
+    font = f["WorkadaySmall"]
+    x1, y1, w, h = text_bounds(font, WARN_MARK)
+    x = k["kGaugeLeft"] - k["kGaugeWarnGap"] - (x1 + w)
+    # Truncating division, like C++.
+    baseline = k["kGaugeTop"] + int((k["kGaugeHeight"] - h) / 2) - y1
+    return x, baseline, x + x1
+
+
+def draw_gauge(fb, k, f, percent, warn=False):
+    if warn:
+        x, baseline, _ = warn_box(k, f)
+        draw_text(fb, f["WorkadaySmall"], WARN_MARK, x, baseline, label="low-battery mark")
     fill_rect(fb, k["kGaugeLeft"], k["kGaugeTop"], k["kGaugeBodyWidth"], k["kGaugeHeight"], INK)
     fill_rect(fb, k["kGaugeLeft"] + k["kGaugeBorder"], k["kGaugeTop"] + k["kGaugeBorder"],
               k["kBatteryTrackPixels"], k["kGaugeHeight"] - 2 * k["kGaugeBorder"], PAPER)
@@ -233,12 +257,12 @@ def clock(text):
     return hour + ":" + minute if minute else text
 
 
-def face(k, f, time="14:32", date="Wed 12 Aug", steps="8432", battery=76, mode=""):
+def face(k, f, time="14:32", date="Wed 12 Aug", steps="8432", battery=76, mode="", warn=False):
     time = clock(time)
     fb = blank(k)
     if mode:
         draw_text(fb, f["WorkadaySmall"], mode, k["kMargin"], k["kStatusBaseline"], label="mode")
-    draw_gauge(fb, k, battery)
+    draw_gauge(fb, k, f, battery, warn)
     draw_centred(fb, f["WorkadayTime"], time, k["kTimeBaseline"], k["kDisplayWidth"], "time")
     draw_centred(fb, f["WorkadayLabel"], date, k["kDateBaseline"], k["kDisplayWidth"], "date")
     if steps:
@@ -269,12 +293,12 @@ def inverted(fb):
     return [[PAPER if v else INK for v in row] for row in fb]
 
 
-def banner(k, f, line1, line2, line3=None, battery=76):
+def banner(k, f, line1, line2, line3=None, battery=76, warn=False):
     """drawBanner(): up to three lines of the small face, baselines 95, 120, 145.
     The third is the Find phone screen's progress line and is blank everywhere
     else, exactly as the firmware leaves that row."""
     fb = blank(k)
-    draw_gauge(fb, k, battery)
+    draw_gauge(fb, k, f, battery, warn)
     draw_text(fb, f["WorkadaySmall"], line1, 10, 95, label="banner:" + line1)
     draw_text(fb, f["WorkadaySmall"], line2, 10, 120, label="banner:" + line2)
     if line3:
@@ -333,27 +357,39 @@ def sheet(shots, scale):
     return out
 
 
-def gauge_crop(k, percent, scale):
+def gauge_crop(k, f, percent, scale, warn=False):
     """Just the corner the gauge lives in, blown up.
 
     The padding is clamped to the panel rather than assumed to exist. The gauge
     is flush with the top-right corner, so on two of its four sides there is no
-    panel to pad with - and the crop showing that is the point, not a defect."""
+    panel to pad with - and the crop showing that is the point, not a defect.
+
+    The left edge is the mark's column whether or not the mark is drawn, so a
+    strip of these is the same width all the way across and the cells line up
+    under each other instead of shifting by the width of a glyph."""
     fb = blank(k)
-    draw_gauge(fb, k, percent)
+    draw_gauge(fb, k, f, percent, warn)
     pad = 3
-    x0, y0 = max(0, k["kGaugeLeft"] - pad), max(0, k["kGaugeTop"] - pad)
+    x0 = max(0, warn_box(k, f)[2] - pad)
+    y0 = max(0, k["kGaugeTop"] - pad)
     x1 = min(k["kDisplayWidth"],
              k["kGaugeLeft"] + k["kGaugeBodyWidth"] + k["kGaugeCapWidth"] + pad)
     y1 = min(k["kDisplayHeight"], k["kGaugeTop"] + k["kGaugeHeight"] + pad)
     return to_image([row[x0:x1] for row in fb[y0:y1]], scale).convert("RGB")
 
 
-def hero(k, f, scale=3, levels=(100, 75, 50, 25, 5, 0)):
+# The gauge sweep under the hero face. The flag is the mode rather than a
+# function of the percentage, because on the watch it is: the tracker's hysteresis
+# decides it, and 25 % can be either way round. 18 % and below are shown in saving
+# mode, which is where a cell that got there by draining actually sits.
+HERO_LEVELS = ((100, False), (75, False), (50, False), (25, False), (18, True), (4, True))
+
+
+def hero(k, f, scale=3, levels=HERO_LEVELS):
     """The face in something that reads as a watch, over the gauge full to flat.
     This is the one README.md opens with."""
     face_img = to_image(face(k, f, "9:03", "Wed 9 Sep", "8432", 76), scale).convert("RGB")
-    gauges = [(p, gauge_crop(k, p, scale)) for p in levels]
+    gauges = [(p, gauge_crop(k, f, p, scale, warn)) for p, warn in levels]
     gw, gh = gauges[0][1].size
     side = 200 * scale
     strip_w = len(gauges) * gw + (len(gauges) - 1) * 22
@@ -372,7 +408,8 @@ def hero(k, f, scale=3, levels=(100, 75, 50, 25, 5, 0)):
     out.paste(face_img, (bx + bezel, by + bezel))
 
     sy = by + side + 2 * bezel + 60
-    pen.text((width // 2, sy - 16), "battery gauge, top-right corner",
+    pen.text((width // 2, sy - 16),
+             "battery gauge, top-right corner · “!” is saving mode",
              font=caption_font(24), fill=DIM, anchor="mm")
     sx = (width - strip_w) // 2
     for percent, img in gauges:
@@ -387,14 +424,20 @@ def every_screen(k, f):
     """Every state the firmware can put on the panel, including the ones that are
     awkward to reach on a wrist: a flat cell, an unset clock, a dead step sensor,
     Recovery mode. Reaching them here is the point - nobody drains a battery to
-    check that 0 % draws."""
+    check that 0 % draws.
+
+    The three low cells carry the saving-mode mark, because that is where a cell
+    that got there by draining actually sits. It is passed rather than derived:
+    the watch takes it from the level tracker's hysteresis, and nothing here has
+    a level tracker."""
     return [
         ("watchface", face(k, f, "14:32", "Wed 12 Aug", "8432", 76)),
         ("single-digit hour and day", face(k, f, "9:03", "Wed 9 Sep", "77", 88)),
         ("battery 100%", face(k, f, "9:41", "Mon 3 Nov", "142", 100)),
         ("battery 50%", face(k, f, "12:00", "Tue 4 Nov", "6015", 50)),
-        ("battery 4%, critical", face(k, f, "23:58", "Wed 5 Nov", "11207", 4)),
-        ("battery 0%, flat", face(k, f, "6:30", "Thu 6 Nov", "0", 0)),
+        ("battery 18%, saving mode", face(k, f, "7:45", "Tue 4 Nov", "319", 18, warn=True)),
+        ("battery 4%, critical", face(k, f, "23:58", "Wed 5 Nov", "11207", 4, warn=True)),
+        ("battery 0%, flat", face(k, f, "6:30", "Thu 6 Nov", "0", 0, warn=True)),
         ("clock never set", face(k, f, "--:--", "set time", "--", 61)),
         ("step sensor stopped", face(k, f, "17:20", "Fri 7 Nov", "--", 61)),
         ("recovery mode", face(k, f, "8:15", "Sat 8 Nov", "930", 33, "RECOV")),
@@ -414,7 +457,8 @@ def every_screen(k, f):
         ("Find phone, vibrating", banner(k, f, "Find phone", "phone vibrating", "0:52  try 8")),
         ("Find phone, ringing", banner(k, f, "Find phone", "phone ringing", "2:00  try 255")),
         ("Find phone, found on the phone", banner(k, f, "Find phone", "phone found")),
-        ("Find phone, refused", banner(k, f, "Find phone", "battery too low", battery=4)),
+        ("Find phone, refused",
+         banner(k, f, "Find phone", "battery too low", battery=4, warn=True)),
         # The same two screens the other way round. The label states what the
         # watch is doing now rather than what the press will do, so it reads
         # "Black on white" here and "White on black" above.
@@ -434,6 +478,9 @@ def main():
     ap.add_argument("--steps", default="8432")
     ap.add_argument("--battery", type=int, default=76)
     ap.add_argument("--mode", default="", help='"SAFE" or "RECOV"; empty is Normal')
+    ap.add_argument("--low", action="store_true",
+                    help="saving mode: the \"!\" beside the gauge. Not implied by --battery, "
+                         "because on the watch the level tracker's hysteresis decides it")
     ap.add_argument("--sheet", action="store_true", help="every screen and state")
     ap.add_argument("--hero", action="store_true", help="the face framed, over the gauge sweep")
     ap.add_argument("--all", action="store_true",
@@ -451,7 +498,8 @@ def main():
         save(sheet(every_screen(k, f), max(1, args.scale // 2)),
              args.out or os.path.join(OUT_DIR, "screens.png"))
     else:
-        save(to_image(face(k, f, args.time, args.date, args.steps, args.battery, args.mode),
+        save(to_image(face(k, f, args.time, args.date, args.steps, args.battery, args.mode,
+                           args.low),
                       args.scale),
              args.out or os.path.join(SCRATCH, "watchface.png"))
 

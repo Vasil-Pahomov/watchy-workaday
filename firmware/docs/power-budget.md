@@ -261,7 +261,13 @@ These follow from the numbers, and are why the code looks the way it does:
    makes button wakes nearly free. `core::refresh_policy` owns this decision.
 4. **Low-battery mode drops to 5-minute resolution** — 288 wakes/day instead of
    1440, cutting tick cost to ~0.9 mAh/day and roughly tripling the remaining
-   runtime. Owned by `core::battery_model` + `core::wake_router`.
+   runtime. Owned by `core::battery_model` + `core::wake_router`. It is also the
+   one saving the wearer can feel — a button can take five minutes to show, and a
+   sync is refused — so `core::batterySaving()` puts a `!` beside the gauge to say
+   so. That costs nothing per wake: the mark is drawn inside refreshes that were
+   already happening, and the hysteresis means crossing the threshold, which is
+   the only thing that can force a refresh of its own, happens about twice per
+   discharge.
 5. **The battery ADC is sampled on a schedule, not per wake.** The reading is
    slow-moving; sampling it every minute buys nothing.
 6. **Step counting adds sensor current, not wakes.** The BMA423 accumulates steps

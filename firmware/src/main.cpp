@@ -173,6 +173,9 @@ app::Snapshot snapshotFrom(const PersistedState& persist, const core::DateTime& 
   snapshot.time_valid = time_valid;
   snapshot.use_24h = persist.use_24h;
   snapshot.battery_percent = persist.battery_percent;
+  // Read after this wake's battery section, like the percentage beside it, so the
+  // gauge and its mark are always the same wake old.
+  snapshot.battery_level = persist.battery_level.level();
   snapshot.mode = mode;
   snapshot.screen = persist.ui.screen;
   snapshot.menu_index = persist.ui.menu_index;

@@ -180,6 +180,57 @@ void test_radio_blocked_when_low(void) {
   TEST_ASSERT_FALSE(core::radioPermitted(BatteryLevel::Critical));
 }
 
+// ── what the face says about the two rules above ─────────────────────────────
+
+void test_saving_mode_is_the_low_two_levels(void) {
+  TEST_ASSERT_FALSE(core::batterySaving(BatteryLevel::Full));
+  TEST_ASSERT_FALSE(core::batterySaving(BatteryLevel::Normal));
+  TEST_ASSERT_TRUE(core::batterySaving(BatteryLevel::Low));
+  TEST_ASSERT_TRUE(core::batterySaving(BatteryLevel::Critical));
+}
+
+void test_saving_mode_agrees_with_the_behaviour_it_reports(void) {
+  // The mark beside the gauge claims two things to the wearer: that the watch has
+  // gone to the slow tick, and that it will refuse the radio. This is what holds
+  // the claim to the behaviour. Split the tick rate from the radio gate later and
+  // this fails here, at the gate, rather than on a wrist showing a warning for
+  // something that is no longer happening.
+  const BatteryLevel levels[] = {BatteryLevel::Critical, BatteryLevel::Low,
+                                 BatteryLevel::Normal, BatteryLevel::Full};
+  for (BatteryLevel level : levels) {
+    const bool saving = core::batterySaving(level);
+    TEST_ASSERT_EQUAL_INT(saving ? core::kSavingTickSeconds : core::kNormalTickSeconds,
+                          core::tickIntervalSeconds(level));
+    TEST_ASSERT_EQUAL_INT(saving, !core::radioPermitted(level));
+  }
+}
+
+void test_saving_mode_follows_the_tracker_through_the_hysteresis(void) {
+  // The mark is not a function of the percentage, which is exactly why it cannot
+  // be read off the gauge: the same 24 % is Normal on the way down and still Low
+  // on the way back up, and it draws the same eight pixels of ink either way.
+  constexpr uint8_t kBoth = 24;
+
+  BatteryLevelTracker falling;
+  falling.update(50);
+  falling.update(kBoth);  // above kLowEnterPercent, so still Normal
+  TEST_ASSERT_FALSE(core::batterySaving(falling.level()));
+
+  BatteryLevelTracker climbing;
+  climbing.update(50);
+  climbing.update(core::kLowEnterPercent);  // into Low
+  climbing.update(kBoth);                   // not out again until kLowExitPercent
+  TEST_ASSERT_TRUE(core::batterySaving(climbing.level()));
+
+  // Same picture, different mode — so the gauge's fill cannot stand in for the
+  // mark, and app/screens.cpp has to hash the two separately.
+  TEST_ASSERT_EQUAL_UINT16(8, core::gaugeFillPixels(kBoth, 34));
+
+  // And out at the exit threshold, where the mark clears.
+  climbing.update(core::kLowExitPercent);
+  TEST_ASSERT_FALSE(core::batterySaving(climbing.level()));
+}
+
 // ── the gauge ────────────────────────────────────────────────────────────────
 
 void test_gauge_endpoints(void) {
@@ -255,6 +306,10 @@ int main(void) {
 
   RUN_TEST(test_tick_interval_stretches_when_low);
   RUN_TEST(test_radio_blocked_when_low);
+
+  RUN_TEST(test_saving_mode_is_the_low_two_levels);
+  RUN_TEST(test_saving_mode_agrees_with_the_behaviour_it_reports);
+  RUN_TEST(test_saving_mode_follows_the_tracker_through_the_hysteresis);
 
   RUN_TEST(test_gauge_endpoints);
   RUN_TEST(test_gauge_clamps_above_full);

@@ -78,4 +78,22 @@ uint16_t gaugeFillPixels(uint8_t percent, uint16_t track_pixels);
 // True when the radio must stay off regardless of what the user asked for.
 bool radioPermitted(BatteryLevel level);
 
+// True when the two rules above have both bitten: the tick has stretched to five
+// minutes and the radio is refused. This is the watch behaving differently, and
+// until now nothing on the panel said so — the wearer saw a watch that had gone
+// quiet, took up to five minutes to show a button press, and turned down a sync,
+// with no way to tell that from a fault.
+//
+// The gauge cannot carry it. The gauge draws a percentage, and which side of the
+// hysteresis the tracker sits on is not a function of the percentage: 24 % is
+// Normal on the way down and Low on the way back up, and both paint the same
+// eight pixels of ink. So the mark beside it is a second reading, not a louder
+// version of the first one.
+//
+// Here rather than in app/ because it is the same decision `tickIntervalSeconds`
+// and `radioPermitted` make, phrased for the wearer — a test holds all three to
+// the same answer, so a level that later stretches the tick without lighting the
+// mark fails the gate instead of shipping.
+bool batterySaving(BatteryLevel level);
+
 }  // namespace core

@@ -133,4 +133,18 @@ bool radioPermitted(BatteryLevel level) {
   return level == BatteryLevel::Normal || level == BatteryLevel::Full;
 }
 
+bool batterySaving(BatteryLevel level) {
+  // Switched rather than `!radioPermitted(level)`, so adding a level to the enum
+  // is a compiler warning here instead of a silent default.
+  switch (level) {
+    case BatteryLevel::Low:
+    case BatteryLevel::Critical:
+      return true;
+    case BatteryLevel::Normal:
+    case BatteryLevel::Full:
+      break;
+  }
+  return false;
+}
+
 }  // namespace core

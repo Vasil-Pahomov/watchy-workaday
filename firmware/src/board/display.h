@@ -66,7 +66,15 @@ void drawStepsLine(const char* text);
 void drawStatusLine(const char* text);
 // The charge, top-right: a horizontal cell with its electrode on the right,
 // filled from the left in proportion to `percent`.
-void drawBatteryGauge(uint8_t percent);
+//
+// `warning` adds a "!" just left of the cell — the watch is in its battery-saving
+// mode, on the five-minute tick with the radio refused. It is a second reading
+// rather than a decoration on the first: core::batterySaving() decides it, and it
+// is not recoverable from `percent`, because the tracker's hysteresis puts the
+// same percentage on either side of the threshold. One argument rather than a
+// drawBatteryWarning() of its own, because the mark is placed against the cell's
+// left edge and the two would otherwise be one drawing split across two callers.
+void drawBatteryGauge(uint8_t percent, bool warning);
 void drawMenu(const char* const* items, uint8_t count, uint8_t selected);
 // Up to three lines of the small face down the left of the panel. A null or
 // empty line draws nothing and leaves its row blank; the Find phone screen is the
