@@ -107,33 +107,49 @@ void test_tracker_starts_normal(void) {
 
 void test_tracker_enters_low_and_critical(void) {
   BatteryLevelTracker tracker;
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Normal), levelAsInt(tracker.update(21)));
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low), levelAsInt(tracker.update(20)));
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Critical), levelAsInt(tracker.update(5)));
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Normal),
+                        levelAsInt(tracker.update(core::kLowEnterPercent + 1)));
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low),
+                        levelAsInt(tracker.update(core::kLowEnterPercent)));
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Critical),
+                        levelAsInt(tracker.update(core::kCriticalEnterPercent)));
 }
 
 void test_tracker_holds_low_until_well_clear(void) {
   BatteryLevelTracker tracker;
-  tracker.update(20);
+  tracker.update(core::kLowEnterPercent);
   TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low), levelAsInt(tracker.level()));
 
   // Still Low inside the dead band — this is the whole point: without it the
   // level flaps, the tick interval flaps with it, and the load change moves the
   // voltage back across the threshold.
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low), levelAsInt(tracker.update(21)));
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low), levelAsInt(tracker.update(27)));
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Normal), levelAsInt(tracker.update(28)));
+  //
+  // Written against the constants rather than the numbers they hold today. The
+  // band moved once already — 20/28 to 10/15 — and a test spelled in literals
+  // says nothing about the rule after a move like that; it just fails.
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low),
+                        levelAsInt(tracker.update(core::kLowEnterPercent + 1)));
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low),
+                        levelAsInt(tracker.update(core::kLowExitPercent - 1)));
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Normal),
+                        levelAsInt(tracker.update(core::kLowExitPercent)));
 }
 
 void test_tracker_holds_critical_until_well_clear(void) {
   BatteryLevelTracker tracker;
-  tracker.update(3);
+  tracker.update(core::kCriticalEnterPercent - 2);
   TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Critical), levelAsInt(tracker.level()));
 
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Critical), levelAsInt(tracker.update(6)));
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Critical), levelAsInt(tracker.update(11)));
-  // Leaves via Low, not straight to Normal.
-  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low), levelAsInt(tracker.update(12)));
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Critical),
+                        levelAsInt(tracker.update(core::kCriticalEnterPercent + 1)));
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Critical),
+                        levelAsInt(tracker.update(core::kCriticalExitPercent - 1)));
+  // Leaves via Low, not straight to Normal — and note that the exit sits *inside*
+  // the Low band now (12 is above kLowEnterPercent), so this cell is still in
+  // saving mode when it gets here. The ladder, not an inversion.
+  TEST_ASSERT_EQUAL_INT(levelAsInt(BatteryLevel::Low),
+                        levelAsInt(tracker.update(core::kCriticalExitPercent)));
+  TEST_ASSERT_TRUE(core::batterySaving(tracker.level()));
 }
 
 void test_tracker_full_band(void) {
@@ -145,13 +161,13 @@ void test_tracker_full_band(void) {
 }
 
 void test_tracker_does_not_oscillate_on_a_threshold(void) {
-  // 20 % is exactly the Low entry point. Dithering around it must produce one
-  // transition, not one per sample.
+  // kLowEnterPercent is exactly the Low entry point. Dithering around it must
+  // produce one transition, not one per sample.
   BatteryLevelTracker tracker;
-  tracker.update(20);
+  tracker.update(core::kLowEnterPercent);
   const int settled = levelAsInt(tracker.level());
   for (int i = 0; i < 20; ++i) {
-    tracker.update(i % 2 == 0 ? 20 : 21);
+    tracker.update(i % 2 == 0 ? core::kLowEnterPercent : core::kLowEnterPercent + 1);
     TEST_ASSERT_EQUAL_INT(settled, levelAsInt(tracker.level()));
   }
 }
@@ -207,9 +223,12 @@ void test_saving_mode_agrees_with_the_behaviour_it_reports(void) {
 
 void test_saving_mode_follows_the_tracker_through_the_hysteresis(void) {
   // The mark is not a function of the percentage, which is exactly why it cannot
-  // be read off the gauge: the same 24 % is Normal on the way down and still Low
-  // on the way back up, and it draws the same eight pixels of ink either way.
-  constexpr uint8_t kBoth = 24;
+  // be read off the gauge: the same percentage inside the dead band is Normal on
+  // the way down and still Low on the way back up, and it draws the same ink
+  // either way.
+  constexpr uint8_t kBoth = core::kLowEnterPercent + 2;
+  static_assert(kBoth > core::kLowEnterPercent && kBoth < core::kLowExitPercent,
+                "the whole test is that this percentage is reachable from both sides");
 
   BatteryLevelTracker falling;
   falling.update(50);
@@ -223,8 +242,9 @@ void test_saving_mode_follows_the_tracker_through_the_hysteresis(void) {
   TEST_ASSERT_TRUE(core::batterySaving(climbing.level()));
 
   // Same picture, different mode — so the gauge's fill cannot stand in for the
-  // mark, and app/screens.cpp has to hash the two separately.
-  TEST_ASSERT_EQUAL_UINT16(8, core::gaugeFillPixels(kBoth, 34));
+  // mark, and app/screens.cpp has to hash the two separately. 12 % of a 34 px
+  // track rounds to 4 px.
+  TEST_ASSERT_EQUAL_UINT16(4, core::gaugeFillPixels(kBoth, 34));
 
   // And out at the exit threshold, where the mark clears.
   climbing.update(core::kLowExitPercent);

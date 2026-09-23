@@ -187,9 +187,10 @@ full-screen Stop button by default, the alarm tone as well when the wearer
 presses Menu on the watch, which arrives as a `FindMode` notify on `Find` — until
 the watch hangs up or the user silences it, which writes one `Find` frame back
 (`PROTOCOL.md` §4.1). Nothing else — step counts, notifications and calendar data
-are explicitly out of scope (`PROTOCOL.md` §9). The watch opens a BLE window
-hourly, plus on demand from its own menu; it is absent from the air the rest of
-the time.
+are explicitly out of scope (`PROTOCOL.md` §9). The watch opens a BLE window on
+the hour, plus on demand from its own menu; it is absent from the air the rest of
+the time. The phone must not schedule against that — it waits on a pending
+`autoConnect` and has no view of the watch's clock.
 
 The find-phone alarm bends one habit and it is worth naming: it is the one
 exchange after which the link is **not** closed. Every exit from that state

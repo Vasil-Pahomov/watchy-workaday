@@ -49,7 +49,7 @@ The failure we refuse to ship: a frozen watch needing a manual reset.
       `RTC_DATA_ATTR`. `.rtc.data` is a loadable segment the bootloader refills on
       every boot that is not a deep-sleep wake, so a panic or watchdog reset
       erases it — which is exactly the case fault counters, retry budgets and the
-      sync window's hourly timer exist for. Check the attribute, and check that
+      sync window's schedule exist for. Check the attribute, and check that
       the struct has no user-declared constructor (a dynamic initialiser would
       overwrite noinit memory at boot and reintroduce the same defect).
 - [ ] That state is version-tagged and validated before use. Noinit RTC RAM is

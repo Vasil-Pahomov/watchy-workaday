@@ -395,8 +395,9 @@ Rules:
   Time once, wait for Status. A find session that reaches a phone therefore also
   sets the watch's clock, and the outcome is recorded on the phone exactly as any
   other exchange would be — health, backoff and the diagnostic record all see an
-  ordinary sync. The find session **spends the hourly timer** when it opens,
-  like the Sync item (§5.1).
+  ordinary sync. The find session **records the hour** when it opens, like the
+  Sync item (§5.1), so it costs the watch the next scheduled window rather than
+  being free.
 - **`flags.FIND_PHONE` in a well-formed Status frame starts the alarm, whatever
   `result` says.** A clock that could not be set is no reason to leave the phone
   lost. The phone keeps the link open instead of hanging up and starts the alarm:
@@ -449,12 +450,13 @@ Rules:
 
 | Constant | Value | Why exactly this |
 |---|---|---|
-| Sync window interval | **60 min** | hourly; see the power budget below |
+| Sync window schedule | **on the hour** | the wake at which the wall clock's hour differs from the hour the last window opened in. 24 a day; see the power budget below |
+| Sync window interval, fallback | **60 min** | what the schedule degrades to when the RTC cannot be read — there is no hour boundary to sit on. Same cadence, unpredictable phase |
 | Advertise-with-no-connection timeout | **6 s** | must be under the 10 s task watchdog, because nothing feeds it while the watch is merely advertising |
 | Idle-after-connect timeout | **4 s** | connected but no valid write → tear down. The watchdog was fed on connect, so this is a fresh un-fed interval |
 | Absolute session cap | **12 s** | measured from session open to teardown, regardless of any activity. Belt to the two braces above |
-| User-initiated window | same limits | the Sync menu item opens a window immediately and resets the hourly timer |
-| **Find session cap** | **120 s** | §4.1. Measured from the session opening; ends the search whatever the link is doing, then the watch returns to the watchface. Also resets the hourly timer when it opens |
+| User-initiated window | same limits | the Sync menu item opens a window immediately and records the hour, exactly as a scheduled one does |
+| **Find session cap** | **120 s** | §4.1. Measured from the session opening; ends the search whatever the link is doing, then the watch returns to the watchface. Also records the hour when it opens |
 | Find hang-up wait | ≤ 1 s | after requesting termination the watch waits for the link to drop, so the phone hears a disconnect and stops ringing at once. Watch-side only; not mirrored |
 
 The find session is **not** one long un-fed interval. It is a sequence of bounded
@@ -472,11 +474,19 @@ looks like. The resolution:
 > **No un-fed interval may exceed 6 s of window time, plus a teardown tail
 > measured at ~13 ms. Worst case ~6.05 s against the 10 s watchdog.**
 >
-> The watchdog is fed at three genuine progress points and nowhere else:
+> The watchdog is fed at genuine progress points and nowhere else:
 > (a) the NimBLE stack came up and the controller synced, (b) a central
-> connected, (c) a valid Time write was processed through to the RTC. Each is a
-> completed step, not a moment inside a wait — that distinction is the whole of
-> Law 2's rule.
+> connected, (c) a valid Time write was processed through to the RTC, (d) a frame
+> narrating (b) or (c) finished driving the panel, and (e) the window closed and
+> the radio came down. Each is a completed step, not a moment inside a wait — that
+> distinction is the whole of Law 2's rule.
+>
+> (d) and (e) exist because the Sync screen shows the window as it runs, and a
+> panel refresh is ~0.3 s, or ~2 s on the round the ghosting cadence turns into a
+> full one. Each redraw sits **between** two feeds — fed at the progress point,
+> paint, feed again — so the next 6 s wait starts a fresh interval instead of
+> extending the one that carried the refresh. Without (d) and (e) the worst case
+> would be 6 s + 2 s = 8 s, which fits but spends the whole margin below.
 
 **This paragraph has been wrong twice, in opposite directions.** The first draft
 omitted the teardown tail entirely. The second bounded it at ~2.05 s, from
@@ -496,6 +506,7 @@ So there is no host-stop wait any more, and the tail is the teardown's own work:
 | Connected but idle → timeout | 4.00 s + ~13 ms ≈ 4.05 s |
 | Write → notify → hang-up wait | 4.00 s + ~13 ms ≈ 4.05 s |
 | Advertising expires as a central connects | no longer distinct — nothing waits on the link |
+| A Sync-screen redraw (feed (d) / (e) above) | ~0.3 s, or ~2 s on a ghosting-cadence full refresh — its own interval, not added to the wait before it |
 
 Measured on hardware, advertise-timeout path: window closed at 9807 ms, teardown
 done at 9820 ms, `deepSleep()` entered in the same millisecond.
@@ -516,18 +527,47 @@ is also no longer hung up, so the phone sees a supervision timeout rather than a
 clean disconnect; §6.2's "disconnect mid-exchange" row already covers it, but it
 is slower for the phone than §6.1's normal ending.
 
-A window that opens must reset the hourly timer **when it opens**, not when it
-succeeds. Otherwise a watch whose phone is out of range spends every wake
-advertising, which is the "unbounded retry" failure Law 2 exists to prevent.
+A window that opens must record the hour — and reset the fallback counter —
+**when it opens**, not when it succeeds. Otherwise a watch whose phone is out of
+range spends every wake advertising, which is the "unbounded retry" failure Law 2
+exists to prevent. A window opened on a wake whose clock could not be read records
+no hour, because an hour taken from an unreadable clock would schedule the next
+window against fiction; it resets the counter, which is what the gate is using
+anyway on that wake.
 
 Gating — a window does **not** open when:
 
 - run mode is `Safe` or `Recovery` (Firmware Law 1: no radio in degraded modes);
-- battery level is `Low` or `Critical`;
-- fewer than 60 minutes have elapsed since the last window **opened**.
+- battery level is `Low` or `Critical` **and nobody asked for this window**;
+- the hour has not turned since the last window **opened**.
 
-That last gate applies **whether or not the clock is trustworthy**, and the
-wording matters in both directions:
+**The battery gate stops the schedule, not the radio.** Below the saving-mode
+threshold the watch stops reaching for the phone on its own — a standing guess
+that a phone is nearby is not worth ~0.9 mAh/day on a cell that is nearly out.
+A Sync or Find phone press is not a guess: the wearer is standing there, refusing
+them saves ~0.03 mAh, and a watch that will not help find the phone it is paired
+to has lost the feature at the one moment it exists for. So a user request
+overrides this gate. It does **not** override the mode gate: `Safe` and `Recovery`
+are faults rather than a flat cell, and a wearer cannot consent their way out of a
+watch that is already failing.
+
+**The hour boundary, and the clock it needs.** "On the hour" is a fact about the
+wall clock, not about when the watch was switched on. The free-running form —
+60 minutes since the last window — met the phone at :23 past every hour for the
+rest of the charge if that is where the first window happened to land, which is
+the same cadence at a time nobody chose and nobody can predict. The boundary is
+compared on a **monotonic hour count**, not on the hour field: 23:xx and 23:xx the
+next day are the same hour number and a different hour, and a watch that spent a
+day in a drawer has to sync when it comes back.
+
+A window is therefore never opened twice in one hour by the schedule, but a
+request can add one: a press at 10:59 records hour 10 and the scheduled window at
+11:00 still opens. That is the intended reading of "the wearer asked", and it is
+bounded — one extra window per press — so the schedule's 24 a day stays a ceiling.
+
+A clock that cannot be read has no boundary to sit on, so the gate falls back to
+elapsed minutes since the last window opened, and the wording matters in both
+directions:
 
 - If an unreadable RTC made the gate *inapplicable*, a watch with a dead clock
   would advertise on every wake — 1440 windows a day, roughly 26 mAh/day against
@@ -539,9 +579,20 @@ wording matters in both directions:
   never ask for it.
 
 So elapsed time is measured from the clock when it is trustworthy and from the
-tick interval when it is not. The cadence stays hourly either way. The phone
-cannot observe this: it only waits on a pending `autoConnect` and has no view of
-the watch's schedule.
+tick interval when it is not, and the counter is advanced on every wake even while
+the boundary is deciding — a clock can stop being readable between two wakes, and
+the counter has to already be right when it does. **The fallback is not a rare
+path:** it is what a brand new watch runs on, because nothing has ever set its
+clock and there is nothing to align to. The cadence stays hourly either way. The
+phone cannot observe any of this: it only waits on a pending `autoConnect` and has
+no view of the watch's schedule.
+
+**The tick has to reach the boundary.** In low-battery saving mode the watch wakes
+every five minutes, and those wakes are aligned to wall-clock minutes divisible by
+five (which is also why the face reads 14:35 and never 14:33). Minute 0 is one of
+them, so the window is still reachable. Every tick interval this firmware uses —
+1, 5 and 15 minutes — divides 60; one that did not would put the boundary out of
+reach on the wakes that used it.
 
 ### 5.2 Phone
 
@@ -593,9 +644,10 @@ than scheduled:
 | The realistic search — found and stopped in 20–30 s | ~0.1–0.3 mAh |
 
 The worst case is about 14 % of a day's allowance, for one search. It is not in
-the daily ledger: it is bounded by the cap, it never opens on its own, and it is
-refused on a Low or Critical battery and in the degraded run modes exactly as a
-sync window is. `firmware/docs/power-budget.md` carries the row.
+the daily ledger: it is bounded by the cap and it never opens on its own. A low
+battery does **not** refuse it — §5.1 gates the schedule rather than the radio, and
+this is the case that gate was never about — but the degraded run modes do.
+`firmware/docs/power-budget.md` carries the row.
 
 ---
 
@@ -605,11 +657,11 @@ sync window is. `firmware/docs/power-budget.md` carries the row.
 
 | Situation | Required behaviour |
 |---|---|
-| Nobody connects | tear down at 6 s, sleep, try again next hour. **Not** a fault; does not touch `core::health` |
+| Nobody connects | tear down at 6 s, sleep, try again next hour. **Not** a fault; does not touch `core::health`. If the Sync screen is up — the wearer opened this window — it says so rather than leaving the previous window's result showing |
 | Connected, no write | tear down at 4 s idle, sleep |
 | Bad payload | notify Status with the failure code, then let the phone disconnect or time out. Do **not** hang up mid-notification |
 | `board::rtc::write()` fails | `RtcWriteFailed` (4). The clock keeps its old value; nothing is half-written |
-| BLE stack fails to init | log, skip the window, sleep normally. A radio that will not start must never cost a tick |
+| BLE stack fails to init | log, skip the window, sleep normally. A radio that will not start must never cost a tick. The hour is already recorded, so it costs one window and not a retry storm; the Sync screen, if up, says the radio failed rather than blaming the phone |
 | Anything at all | the path still ends in `board::power::deepSleep()`. The RAII session guard tears the radio down on **every** exit including an early return |
 | Find: nobody connects inside the cap | end the search, back to the watchface. **Not** a fault |
 | Find: link lost mid-search | re-advertise, count a new attempt, keep going until the cap |
@@ -617,7 +669,7 @@ sync window is. `firmware/docs/power-budget.md` carries the row.
 | Find: Menu pressed with nobody on the link | ignored; the mode changes only while a phone can hear it (§4.1) |
 | Find: phone subscribes to `Find` | notify the current `FindMode` once. A notify with no subscriber is a no-op, never a fault |
 | Find: Back pressed, or the cap | hang up, wait ≤ 1 s for the drop, then sleep. Back returns to the menu, the cap to the watchface |
-| Find: battery Low/Critical, or Safe/Recovery mode | refused before the radio comes up; the screen says why. Same gates as a sync window |
+| Find: Safe/Recovery mode | refused before the radio comes up; the screen says why. Same gates as a user-requested sync window, and a low battery is not one of them (§5.1) |
 | Find: BLE stack fails to init | the screen says the radio failed; sleep normally |
 
 ### 6.2 Phone

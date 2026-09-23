@@ -31,7 +31,8 @@ sleep is actually entered.
 **The trap named in the backlog is still the first thing to check:** if the watch
 updates every 90 s instead of 60 s, the PCF8563 countdown timer is not firing and
 the ESP32 timer backstop is masking it. `ext0` is not working. Everything about
-the sync window's hourly cadence rides on that tick.
+the sync window's hourly cadence rides on that tick — §5.1 puts the window on the
+top of the hour, and it can only ride a wake that happens there.
 
 Then fill in the ⚠ estimates in `docs/power-budget.md`. Until one real
 measurement exists, every energy number on both sides is an engineering estimate —
@@ -57,11 +58,18 @@ Press Menu → Sync on the watch and look for:
 | The watch is still alive afterwards | If it resets, the un-fed watchdog interval overran. §5.1's margin is ~1.95 s and has never been measured |
 
 Then let it sit for an hour and confirm the window opens **once**, on its own,
-without a button press. That is `core::sync_policy`'s hourly gate doing its job.
+without a button press — and, once the clock has been set, **on the minute the
+hour turns**. That is `core::sync_policy`'s hour boundary doing its job.
 
-If instead it advertises on every minute tick, the elapsed-minutes counter is not
-surviving — check `RTC_NOINIT_ATTR` is intact and that nothing gave
-`PersistedState` a user-declared constructor (see below).
+Two distinct failures to tell apart here:
+
+- **It advertises on every minute tick.** The elapsed-minutes counter is not
+  surviving — check `RTC_NOINIT_ATTR` is intact and that nothing gave
+  `PersistedState` a user-declared constructor (see below).
+- **It opens once an hour but at some arbitrary minute, and keeps drifting.** The
+  boundary is not being reached: the watch is running on §5.1's fallback, which
+  means `board::rtc::read()` is not returning `valid`. Expected on a watch whose
+  clock has never been set, and a bug on one whose face shows the right time.
 
 **A reset loop here is the expensive failure.** ~10 s at radio current every ~70 s
 is ~130 mAh/day against a 200 mAh cell — flat in under two days. If the watch is

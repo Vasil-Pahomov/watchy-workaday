@@ -37,15 +37,6 @@ struct WakeContext {
   uint32_t minutes_since_battery_sample = kBatterySampleIntervalMinutes;
   bool accel_features_enabled = false;
   bool ui_active = false;  // a screen other than the watchface is up
-
-  // core::SyncState::minutes_since_window, straight through. Kept flat here rather
-  // than as an embedded SyncContext because mode and battery would then exist
-  // twice in this struct, and a caller that set one copy and not the other would
-  // be deciding the radio's fate from stale state.
-  uint16_t minutes_since_sync_window = 0;
-  // The user picked the Sync menu item on this wake (PROTOCOL.md §5.1). Defaults
-  // to false, so the radio is never granted a window by an omission.
-  bool sync_requested = false;
 };
 
 struct WakePlan {
@@ -61,21 +52,32 @@ struct WakePlan {
   bool run_ui = false;        // dispatch a button press through ui_state
   bool force_full_refresh = false;
 
-  // A BLE sync window is GRANTED on this wake (PROTOCOL.md §5.1).
+  // This wake is the KIND a BLE sync window may ride on (PROTOCOL.md §5.3).
   //
-  // Read the note on need_i2c above and then read this one, because the same trap
-  // is here and it is more expensive: the name is narrower than it looks. It does
-  // not mean "the radio is on", it does not mean a phone is there, and it does not
-  // survive being ignored. It means every §5.1 gate passed and the caller may open
-  // **one** window.
+  // Not a grant, and the difference is the whole contract. §5.1's gates — the run
+  // mode, the battery, the hour boundary — are core::evaluateSyncWindow()'s answer
+  // and the caller asks it separately. This field answers only the question this
+  // router is in a position to answer: whether the §5.3 budget, which prices a
+  // window as an extension of a wake the watch was already taking, covers *this*
+  // wake at all.
   //
-  // What comes with the grant: the caller must call core::noteSyncWindowOpened()
-  // *before* the radio comes up. The hourly timer is spent when the window opens,
+  // **It used to be the grant, and it could not stay one.** §5.1 now schedules the
+  // window on the hour boundary, so the decision reads the wall clock — and this
+  // router runs before the I2C bus is open, because it is what decides whether the
+  // clock is worth reading. A grant made here would have had to be made without
+  // the input it now depends on. Moving it out also retired a documented trap: the
+  // grant was evaluated twice, once here from top-of-wake state and once after the
+  // button dispatch, because which menu item a press activates is not knowable
+  // until the press has been dispatched. There is one evaluation now, after the
+  // clock read and after the dispatch, against state that is current.
+  //
+  // What has not moved: the caller must still call core::noteSyncWindowOpened()
+  // *before* the radio comes up. The schedule is spent when the window opens,
   // never when it succeeds — a window that reached nobody, or one that died to a
   // watchdog reset, must still cost the full hour, or a watch whose phone is out
   // of range advertises on every wake for the rest of the charge. See
   // core/sync_policy.h.
-  bool need_ble = false;
+  bool may_carry_sync_window = false;
 
   uint16_t next_tick_seconds = kNormalTickSeconds;
 };

@@ -1,6 +1,8 @@
 #include <unity.h>
 
+#include "core/battery_model.h"
 #include "core/time_model.h"
+#include "core/wake_router.h"
 
 using core::DateTime;
 
@@ -512,6 +514,140 @@ void test_elapsed_minutes_never_returns_zero_from_the_fallback(void) {
   }
 }
 
+// ── the hour count, and the tick that lands on the grid ────────────────────
+
+void test_hours_since_epoch_counts_from_the_same_origin_as_days(void) {
+  TEST_ASSERT_EQUAL_UINT32(0, core::hoursSinceEpoch(at(2000, 1, 1, 0, 0)));
+  TEST_ASSERT_EQUAL_UINT32(23, core::hoursSinceEpoch(at(2000, 1, 1, 23, 59)));
+  TEST_ASSERT_EQUAL_UINT32(24, core::hoursSinceEpoch(at(2000, 1, 2, 0, 0)));
+}
+
+void test_hours_since_epoch_is_monotonic_across_midnight(void) {
+  // The property core::sync_policy's hour boundary is built on, and the reason a
+  // bare dt.hour would not do: 23:xx and 23:xx the next day are different hours.
+  const uint32_t late = core::hoursSinceEpoch(at(2026, 8, 17, 23, 30));
+  const uint32_t just_after = core::hoursSinceEpoch(at(2026, 8, 18, 0, 5));
+  const uint32_t a_day_later = core::hoursSinceEpoch(at(2026, 8, 18, 23, 30));
+
+  TEST_ASSERT_EQUAL_UINT32(late + 1u, just_after);
+  TEST_ASSERT_EQUAL_UINT32(late + 24u, a_day_later);
+  TEST_ASSERT_EQUAL_UINT8(23, at(2026, 8, 18, 23, 30).hour);  // the same hour number
+}
+
+void test_hours_since_epoch_advances_once_an_hour_for_a_whole_day(void) {
+  DateTime dt = at(2026, 2, 28, 0, 0);
+  uint32_t previous = core::hoursSinceEpoch(dt);
+  for (int hour = 1; hour < 48; ++hour) {
+    dt.hour = static_cast<uint8_t>(hour % 24);
+    if (hour == 24) {
+      dt.month = 3;
+      dt.day = 1;
+    }
+    const uint32_t now = core::hoursSinceEpoch(dt);
+    TEST_ASSERT_EQUAL_UINT32(previous + 1u, now);
+    previous = now;
+  }
+}
+
+void test_hours_since_epoch_floors_a_pre_origin_date_at_zero(void) {
+  // Unreachable through isValid(), which has kMinYear at 2020. Zero rather than a
+  // wrapped u32 so a caller that skipped the check gets a value that compares
+  // equal to its neighbours instead of one that looks like a fresh hour every wake.
+  TEST_ASSERT_EQUAL_UINT32(0, core::hoursSinceEpoch(at(1999, 12, 31, 23, 0)));
+}
+
+void test_a_one_minute_tick_is_always_one(void) {
+  // Every minute is already on the grid. The overwhelmingly common case, and it
+  // must not depend on the clock being readable.
+  for (uint8_t minute = 0; minute < 60; ++minute) {
+    TEST_ASSERT_EQUAL_UINT8(
+        1, core::alignedTickMinutes(at(2026, 8, 17, 12, minute), true, core::kNormalTickSeconds));
+  }
+  TEST_ASSERT_EQUAL_UINT8(
+      1, core::alignedTickMinutes(DateTime{}, /*now_valid=*/false, core::kNormalTickSeconds));
+}
+
+void test_a_five_minute_tick_lands_on_a_multiple_of_five(void) {
+  // The face reads 14:35 and never 14:33. Checked by taking the wake this returns
+  // and asserting the minute it arrives at is on the grid — which is the property,
+  // rather than the count, and it holds from every starting minute.
+  for (uint8_t minute = 0; minute < 60; ++minute) {
+    const uint8_t count =
+        core::alignedTickMinutes(at(2026, 8, 17, 12, minute), true, core::kSavingTickSeconds);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT8(1, count);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT8(5, count);
+    TEST_ASSERT_EQUAL_UINT8(0, (minute + count) % 5);
+  }
+}
+
+void test_an_aligned_tick_never_asks_for_zero_minutes(void) {
+  // A PCF8563 countdown loaded with 0 auto-reloads immediately: a wake that never
+  // sleeps. Every interval, every minute, every clock state.
+  const uint16_t intervals[] = {0, 1, 30, 59, 60, 61, 300, core::kRecoveryTickSeconds, 65535};
+  for (const uint16_t seconds : intervals) {
+    for (uint8_t minute = 0; minute < 60; ++minute) {
+      TEST_ASSERT_GREATER_THAN_UINT8(
+          0, core::alignedTickMinutes(at(2026, 8, 17, 12, minute), true, seconds));
+      TEST_ASSERT_GREATER_THAN_UINT8(
+          0, core::alignedTickMinutes(at(2026, 8, 17, 12, minute), false, seconds));
+    }
+  }
+}
+
+void test_an_unreadable_clock_still_gets_the_plain_interval(void) {
+  // There is nothing to align to, and a clock the firmware cannot read must never
+  // be able to stop the wakes — the same rule elapsedMinutes() applies.
+  TEST_ASSERT_EQUAL_UINT8(
+      5, core::alignedTickMinutes(DateTime{}, /*now_valid=*/false, core::kSavingTickSeconds));
+  TEST_ASSERT_EQUAL_UINT8(15, core::alignedTickMinutes(DateTime{}, false, 15u * 60u));
+}
+
+void test_an_aligned_tick_is_clamped_to_the_countdown_register(void) {
+  // The PCF8563's timer value is one byte.
+  TEST_ASSERT_EQUAL_UINT8(255, core::alignedTickMinutes(DateTime{}, false, 65535));
+  TEST_ASSERT_LESS_OR_EQUAL_UINT8(
+      255, core::alignedTickMinutes(at(2026, 8, 17, 12, 37), true, 65535));
+}
+
+void test_the_alignment_pulls_a_drifted_tick_back_onto_the_grid(void) {
+  // The self-correcting property, which is what makes a PCF8563 countdown drifting
+  // against its own seconds register survivable: the count is recomputed from the
+  // wall clock every wake, so one tick that fires off the grid costs one short
+  // interval and not a phase that walks away over a day.
+  uint8_t minute = 3;  // off the grid, as if the level had just changed here
+  for (int tick = 0; tick < 12; ++tick) {
+    const uint8_t count =
+        core::alignedTickMinutes(at(2026, 8, 17, 12, minute), true, core::kSavingTickSeconds);
+    minute = static_cast<uint8_t>((minute + count) % 60);
+    TEST_ASSERT_EQUAL_UINT8(0, minute % 5);
+  }
+}
+
+void test_the_hour_boundary_is_always_a_tick(void) {
+  // core::sync_policy schedules the window on minute 0, so minute 0 has to be a
+  // wake at every interval this firmware uses. That is true because they all
+  // divide 60, and this is where that stops being a coincidence nobody checked:
+  // from any starting minute, the sequence of aligned ticks reaches minute 0.
+  const uint16_t intervals[] = {core::kNormalTickSeconds, core::kSavingTickSeconds,
+                                core::kRecoveryTickSeconds};
+  for (const uint16_t seconds : intervals) {
+    for (uint8_t start = 0; start < 60; ++start) {
+      uint8_t minute = start;
+      bool reached_the_hour = false;
+      // One tick to get onto the grid, then a full hour's worth of them.
+      for (int tick = 0; tick <= 60; ++tick) {
+        minute = static_cast<uint8_t>(
+            (minute + core::alignedTickMinutes(at(2026, 8, 17, 12, minute), true, seconds)) % 60);
+        if (minute == 0) {
+          reached_the_hour = true;
+          break;
+        }
+      }
+      TEST_ASSERT_TRUE(reached_the_hour);
+    }
+  }
+}
+
 int main(void) {
   UNITY_BEGIN();
 
@@ -553,6 +689,19 @@ int main(void) {
   RUN_TEST(test_elapsed_minutes_refuses_to_run_backwards);
   RUN_TEST(test_elapsed_minutes_clamps_an_absurd_gap);
   RUN_TEST(test_elapsed_minutes_never_returns_zero_from_the_fallback);
+
+  RUN_TEST(test_hours_since_epoch_counts_from_the_same_origin_as_days);
+  RUN_TEST(test_hours_since_epoch_is_monotonic_across_midnight);
+  RUN_TEST(test_hours_since_epoch_advances_once_an_hour_for_a_whole_day);
+  RUN_TEST(test_hours_since_epoch_floors_a_pre_origin_date_at_zero);
+
+  RUN_TEST(test_a_one_minute_tick_is_always_one);
+  RUN_TEST(test_a_five_minute_tick_lands_on_a_multiple_of_five);
+  RUN_TEST(test_an_aligned_tick_never_asks_for_zero_minutes);
+  RUN_TEST(test_an_unreadable_clock_still_gets_the_plain_interval);
+  RUN_TEST(test_an_aligned_tick_is_clamped_to_the_countdown_register);
+  RUN_TEST(test_the_alignment_pulls_a_drifted_tick_back_onto_the_grid);
+  RUN_TEST(test_the_hour_boundary_is_always_a_tick);
 
   RUN_TEST(test_to_12_hour);
 

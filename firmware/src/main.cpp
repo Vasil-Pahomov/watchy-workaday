@@ -42,10 +42,12 @@ constexpr uint32_t kPersistMagic = 0x57444159u;  // 'WDAY'
 // and the last sync result; 6 -> 7 added the display theme, and the menu it is
 // chosen from grew a third item, which changes what an already-persisted
 // menu_index of 2 would mean; 7 -> 8 added the find-phone outcome, and the menu
-// grew a fourth item. An old block is discarded rather than reinterpreted, which
-// is the whole point of carrying a version at all — including for a version that
-// only ever existed on a bench.
-constexpr uint8_t kPersistVersion = 8;
+// grew a fourth item; 8 -> 9 put the sync window on the hour boundary, which added
+// the hour it last opened in to core::SyncState, and gave the Sync screen a live
+// phase to remember across the sleep. An old block is discarded rather than
+// reinterpreted, which is the whole point of carrying a version at all — including
+// for a version that only ever existed on a bench.
+constexpr uint8_t kPersistVersion = 9;
 
 // Everything that must survive deep sleep **and every kind of reset**. It lives
 // in `.rtc_noinit` (see the definition of g_persist below for why that is not the
@@ -67,10 +69,18 @@ struct PersistedState {
   // counter in RAM would be zeroed by that reset and the watch would retry the
   // 6 KB upload for ever.
   core::AccelState accel;
-  // The BLE sync window's hourly timer, plus what the last window achieved so that
-  // PROTOCOL.md §3.2's read path can be answered from here rather than from a
-  // fresh clock or ADC read.
+  // The BLE sync window's schedule — the hour one last opened in, and the elapsed
+  // counter that stands in for it on a watch whose clock cannot be read — plus what
+  // the last window achieved so that PROTOCOL.md §3.2's read path can be answered
+  // from here rather than from a fresh clock or ADC read.
   core::SyncState sync;
+  // How the last window the wearer watched went (core::SyncPhase), for the Sync
+  // screen on the wakes after it. Here for the reason find_outcome is: the screen
+  // has to say "no phone found" across the deep sleep that follows, and UiState is
+  // reset by exactly the two things — Back and the idle timeout — that should
+  // clear it. Idle until a window runs, which is what makes the §3.2 last-sync
+  // line the first thing a freshly booted watch shows there.
+  core::SyncPhase sync_phase = core::SyncPhase::Idle;
   uint8_t battery_percent = 0;
   uint32_t minutes_since_battery_sample = core::kBatterySampleIntervalMinutes;
   bool use_24h = true;
@@ -116,14 +126,6 @@ void persistInit(PersistedState& state) {
   state = PersistedState{};
   state.magic = kPersistMagic;
   state.version = kPersistVersion;
-}
-
-uint8_t tickMinutes(uint16_t tick_seconds) {
-  const uint32_t minutes = tick_seconds / 60u;
-  if (minutes == 0) {
-    return 1;
-  }
-  return minutes > 255u ? 255u : static_cast<uint8_t>(minutes);
 }
 
 // **A property held by the compiler, not by a comment.**
@@ -191,9 +193,36 @@ app::Snapshot snapshotFrom(const PersistedState& persist, const core::DateTime& 
   // and it costs nothing to show.
   snapshot.sync_result = persist.sync.last_result;
   snapshot.sync_applied = persist.sync.last_applied_epoch_s != 0;
+  // And how the window the wearer last watched went. Idle on a watch that has not
+  // opened one since it booted, which is what leaves the line above showing.
+  snapshot.sync_phase = persist.sync_phase;
   snapshot.inverted = persist.inverted;
   snapshot.find_outcome = persist.find_outcome;
   return snapshot;
+}
+
+// Everything PROTOCOL.md §5.1's gates need, assembled from this wake's state.
+//
+// One builder, three callers — the scheduled window, a Sync press and a Find phone
+// press — because they must differ in exactly one field, and a second copy of this
+// is how they would quietly stop differing in only one. The clock is passed in
+// rather than read here: §5.1's hour boundary has to be judged against the same
+// reading the rest of the wake used, and a second read would cost an I2C session
+// to get an answer that is already in hand.
+core::SyncContext syncContextFrom(const PersistedState& persist, core::RunMode mode,
+                                  const core::DateTime& now, bool time_valid,
+                                  bool user_requested) {
+  core::SyncContext context;
+  context.mode = mode;
+  // As it stands *now*, after any sample this wake took — not the level routeWake()
+  // saw at the top of the wake.
+  context.battery = persist.battery_level.level();
+  context.minutes_since_window = persist.sync.minutes_since_window;
+  context.clock_valid = time_valid;
+  context.hour = time_valid ? core::hoursSinceEpoch(now) : 0;
+  context.last_window = persist.sync.last_window;
+  context.user_requested = user_requested;
+  return context;
 }
 
 // Compose, decide, and — only if the pixels would differ — drive the panel.
@@ -305,7 +334,7 @@ core::SyncResult answerTimeWrite(board::ble::Session& radio, PersistedState& per
 // One BLE sync window — PROTOCOL.md §4, end to end.
 //
 // Called only after core::sync_policy has granted the window and
-// core::noteSyncWindowOpened() has already spent the hour. Nothing in here asks
+// core::noteSyncWindowOpened() has already recorded the hour. Nothing in here asks
 // whether a window may open; by this point that is settled.
 //
 // A function rather than another section of setup() because of the guard. The
@@ -313,7 +342,25 @@ core::SyncResult answerTimeWrite(board::ble::Session& radio, PersistedState& per
 // that bounds its lifetime is easier to see — and harder to accidentally extend
 // with a later edit — as a function body than as a brace pair in the middle of a
 // long one.
-void runSyncWindow(PersistedState& persist) {
+core::SyncPhase runSyncWindow(PersistedState& persist, const app::Snapshot& base) {
+  // Where the window's narration is put on the panel. `base` is the frame the wake
+  // would otherwise have drawn — the Sync screen when the wearer pressed the item,
+  // the watchface when the schedule opened this window on its own — so a scheduled
+  // window composes a frame whose Sync line is not on screen, paint() hashes it to
+  // the same value as the frame already showing, and the panel is never touched.
+  // That is the property that keeps 24 windows a day free: the redraws below are
+  // paid for only by the screen that is actually watching.
+  const auto show = [&persist, &base](core::SyncPhase phase) {
+    app::Snapshot frame = base;
+    frame.sync_phase = phase;
+    // Re-read rather than inherited from `base`: answerTimeWrite() has already
+    // recorded this window's result by the time the Failed frame is drawn, and the
+    // label the wearer gets has to be that result and not the previous window's.
+    frame.sync_result = persist.sync.last_result;
+    frame.sync_applied = persist.sync.last_applied_epoch_s != 0;
+    paint(persist, frame, /*elapsed_minutes=*/0, /*force_full=*/false, /*first_boot=*/false);
+  };
+
   // §3.2's read path, assembled from RTC-backed state alone: no ADC read, no
   // clock read. It is what a phone that reads Status before writing anything
   // gets, which is what makes the app's diagnostic screen work.
@@ -322,7 +369,10 @@ void runSyncWindow(PersistedState& persist) {
       core::statusFromSyncState(persist.sync, persist.battery_percent,
                                 persist.battery_filter.primed(), kFirmwareBuild);
   if (!core::encodeStatus(status_payload, sizeof(status_payload), previous)) {
-    return;
+    // Nothing was tried, so it is not "no phone found". The same words the find
+    // session gives a stack that would not come up, for a fault the wearer can act
+    // on the same way: this one is not about the phone.
+    return core::SyncPhase::RadioFailed;
   }
 
   // From here the radio is up, and the destructor at the end of this scope is
@@ -335,7 +385,7 @@ void runSyncWindow(PersistedState& persist) {
     // spent, so a stack that never starts costs one window an hour and not a
     // retry storm.
     WD_LOG("ble: window did not open");
-    return;
+    return core::SyncPhase::RadioFailed;
   }
 
   // Bringing the stack up is itself forward progress, and Law 2 permits a feed
@@ -372,11 +422,21 @@ void runSyncWindow(PersistedState& persist) {
   // nothing a peer does — writing forever, connecting late, saying nothing at all
   // — reaches this loop as anything but a terminal event by then; test_sync_window
   // drives that exhaustively, including from a caller that wakes early on every
-  // pass. The two feeds inside are Law 2-legal for the same reason the one above
-  // is: each follows a completed §5.1 progress point, never a wait. StillWaiting
-  // is not one, gets no feed, and so is covered twice over — by the cap, and by
-  // the watchdog behind it.
+  // pass. The four feeds inside are Law 2-legal for the same reason the one above
+  // is: each follows a completed step, never a wait. Two of them are §5.1's
+  // progress points (a central connected, a Time write processed); the other two
+  // follow the panel refresh that narrates each of those to the wearer, which is a
+  // completed refresh exactly as an ordinary wake's is. Pairing them that way —
+  // fed, paint, fed — is what keeps the refresh out of the 6 s wait that follows
+  // it rather than on the end of it. StillWaiting is not a progress point, gets no
+  // feed, and so is covered twice over — by the cap, and by the watchdog behind
+  // it.
   uint8_t writes = 0;
+  // What the wearer is watching, if the Sync screen is the one that is up. It
+  // starts at Searching rather than Idle because the radio is advertising by the
+  // time this line runs — the frame that said "searching" was painted before the
+  // stack came up, by the wake that granted this window.
+  core::SyncPhase phase = core::SyncPhase::Searching;
   core::SyncWindowEvent event = radio.wait();
 
   for (;;) {
@@ -394,6 +454,17 @@ void runSyncWindow(PersistedState& persist) {
       // rather than looping internally: this feed is genuine forward progress — a
       // central is actually on the link — and it must happen on the task the
       // watchdog is subscribed to, which is this one and not NimBLE's host task.
+      board::power::feedWatchdog();
+      phase = core::syncPhaseOnConnect(phase);
+      // The redraw goes *between* two feeds, never before the next wait on its
+      // own, and that ordering is the whole of its watchdog story. Fed at the
+      // progress point above, then the panel is driven — a completed refresh, the
+      // same step an ordinary wake feeds after — then fed again, so the interval
+      // the next 6 s wait belongs to starts empty. Paint after the wait instead
+      // and the two would add: 6.00 s of advertising plus a refresh that is ~2 s
+      // on the round core::refresh_policy turns into a full one, against a 10 s
+      // watchdog. §5.1's margin is ~3.95 s and it is not there to be spent here.
+      show(phase);
       board::power::feedWatchdog();
       event = radio.wait();
       continue;
@@ -420,6 +491,14 @@ void runSyncWindow(PersistedState& persist) {
     // without having reported the outcome.
     radio.noteWriteResult(result);
 
+    // And the wearer's half of the same fact. answerTimeWrite() fed the watchdog
+    // at §5.1's second progress point on its way through, so this redraw sits in
+    // the same sandwich the connect's does — fed, paint, fed — and the wait below
+    // starts a fresh interval rather than extending this one.
+    phase = core::syncPhaseOnResult(phase, result);
+    show(phase);
+    board::power::feedWatchdog();
+
     // And then the rest of §6.1's sentence: "then let the phone disconnect or time
     // out. Do not hang up mid-notification."
     //
@@ -445,8 +524,15 @@ void runSyncWindow(PersistedState& persist) {
   // nobody wrote, the central left, a phase timed out, the cap expired. None of
   // them touches core::health, and a window that reached no one records nothing —
   // §3.2's read path wants the last *sync*, and that was not one.
-  WD_LOG("ble: window closed after %u write(s) (event %d)", writes, static_cast<int>(event));
+  phase = core::syncPhaseOnEnd(phase);
+  WD_LOG("ble: window closed after %u write(s) (event %d, phase %d)", writes,
+         static_cast<int>(event), static_cast<int>(phase));
   static_cast<void>(writes);
+  // Not painted here. The frame that shows how this ended is the caller's, drawn
+  // once the radio scope has closed — board/ble.h prices a refresh taken with the
+  // controller still enabled, and there is no reason to pay it on the one frame
+  // that can just as well wait three lines.
+  return phase;
 }
 
 // ── the find-phone session ──────────────────────────────────────────────────
@@ -458,8 +544,8 @@ void runSyncWindow(PersistedState& persist) {
 //
 // Called only after core::sync_policy has granted the radio — the same gates as
 // a sync window, evaluated with user_requested set — and after
-// core::noteSyncWindowOpened() has spent the hour. Nothing here asks whether the
-// radio may come up.
+// core::noteSyncWindowOpened() has recorded the hour. Nothing here asks whether
+// the radio may come up.
 //
 // ── The watchdog, which is where this could go wrong ────────────────────────
 //
@@ -741,16 +827,12 @@ void setup() {
   context.minutes_since_battery_sample = g_persist.minutes_since_battery_sample;
   context.accel_features_enabled = kStepCounterEnabled;
   context.ui_active = g_persist.ui.screen != core::Screen::Watchface;
-  context.minutes_since_sync_window = g_persist.sync.minutes_since_window;
-  // Always false here, and that is the ordering trap rather than an oversight.
-  // board::power::wakeButton() is available this early, but *which menu item the
-  // press activates* is not: it depends on g_persist.ui, and the press has not
-  // been dispatched yet — core::handleButton() runs a long way below. So this
-  // call decides the scheduled window only, and a request made on this wake is
-  // put through core::evaluateSyncWindow() a second time after the dispatch. See
-  // the radio section near the end of setup().
-  context.sync_requested = false;
 
+  // Note what is *not* here: anything about the sync window's schedule. The router
+  // answers whether this kind of wake may carry a window (§5.3's budget) and
+  // nothing else; §5.1's gates are asked once, in the radio section below, where
+  // the clock has been read and the button press has been dispatched. Both are
+  // inputs the decision needs and neither exists yet at this line.
   const core::WakePlan plan = core::routeWake(source, context);
 
   // ── the bus ───────────────────────────────────────────────────────────────
@@ -812,7 +894,13 @@ void setup() {
         }
       }
 
-      tick_armed = board::rtc::armTick(tickMinutes(tick_seconds));
+      // Armed from the clock this wake just read, not from the interval alone.
+      // At a one-minute tick the two are the same number; at the five-minute
+      // saving tick the alignment is what puts the face on :00, :05, :10 instead
+      // of wherever the cell happened to cross the threshold — and what keeps a
+      // tick at the top of the hour, which is where §5.1's window is due.
+      tick_armed = board::rtc::armTick(
+          core::alignedTickMinutes(now, time_valid, tick_seconds));
     }
     // The bus closes here, on every path out of this scope.
   }
@@ -840,12 +928,17 @@ void setup() {
       core::elapsedMinutes(g_persist.last_time, now, time_valid, tick_seconds);
   g_persist.minutes_since_battery_sample += elapsed;
 
-  // The sync window's hourly timer, advanced from the same measured-or-inferred
+  // The sync window's fallback timer, advanced from the same measured-or-inferred
   // elapsed as the battery schedule above. Sharing that number is the point: an
   // untrustworthy clock degrades this counter exactly the way it degrades every
   // other one — it keeps advancing at the tick rate instead of freezing, so a
   // watch with a dead PCF8563 can still reach the window that would set it.
   // Saturating, so a month in a drawer cannot wrap it back to "just synced".
+  //
+  // Advanced on every wake even though §5.1's schedule is the hour boundary and
+  // normally ignores it. A clock can stop being readable between two wakes, and
+  // the counter has to already be right when it does — a counter started at the
+  // moment the clock failed would read zero and lock the watch out for an hour.
   core::advanceSyncTimer(g_persist.sync, elapsed);
 
   // Freshness first, and on every wake — including the ones that got nothing.
@@ -910,16 +1003,13 @@ void setup() {
   // what the frame shows. It is the sync window's gate — core::evaluateSyncWindow()
   // with user_requested set, the same function the Sync item goes through — so no
   // rule is weakened for the more expensive of the two: Safe and Recovery refuse,
-  // a Low or Critical battery refuses, and the interval is the one gate a request
-  // overrides. Evaluated against the battery as it stands now, after any sample
-  // this wake took.
+  // and the interval and the battery are the two gates a request overrides.
+  // Evaluated against the battery as it stands now, after any sample this wake
+  // took.
   bool find_session = false;
   if (find_requested) {
-    core::SyncContext request;
-    request.mode = mode;
-    request.battery = g_persist.battery_level.level();
-    request.minutes_since_window = g_persist.sync.minutes_since_window;
-    request.user_requested = true;
+    const core::SyncContext request =
+        syncContextFrom(g_persist, mode, now, time_valid, /*user_requested=*/true);
 
     const core::SyncDecision decision = core::evaluateSyncWindow(request);
     find_session = decision.open;
@@ -931,9 +1021,49 @@ void setup() {
     }
   }
 
+  // The sync window's gate, decided here and nowhere else, and decided before the
+  // frame for the same reason the find session's is: what the window is doing is
+  // what the Sync screen shows, and the first thing it is doing is searching.
+  //
+  // The find session outranks it (§4.1): a search that reaches the phone performs
+  // the §4 exchange anyway, so a window on the same wake would be redundant — and
+  // the radio must not be brought up twice in one wake under any circumstances.
+  //
+  // `sync_requested` widens the condition past plan.may_carry_sync_window on
+  // purpose. The two agree today — the router refuses a degraded mode and a
+  // degraded mode also strips run_ui, so a press cannot exist there — but the
+  // refusal path stays reachable rather than resting on that pair of facts
+  // agreeing forever.
+  bool sync_window = false;
+  if (!find_session && (plan.may_carry_sync_window || sync_requested)) {
+    const core::SyncContext request =
+        syncContextFrom(g_persist, mode, now, time_valid, sync_requested);
+    const core::SyncDecision decision = core::evaluateSyncWindow(request);
+    sync_window = decision.open;
+
+    if (sync_window) {
+      // Read by the frame below, which is the "searching" the wearer sees before
+      // the stack has even started coming up.
+      g_persist.sync_phase = core::SyncPhase::Searching;
+    } else if (sync_requested) {
+      // Only worth a line when somebody was waiting for it. A scheduled window
+      // that is simply not due is the state the watch is in for 1439 of 1440
+      // wakes, and logging that is logging nothing.
+      WD_LOG("ble: sync refused (gate %d)", static_cast<int>(decision.gate));
+    }
+  }
+
   // ── draw, but only if the pixels would actually differ ─────────────────────
   if (plan.need_display) {
     app::Snapshot snapshot = snapshotFrom(g_persist, now, time_valid, mode);
+    if (sync_window) {
+      // The first frame of a window — "searching" — painted before the radio comes
+      // up, so a wearer who pressed Sync sees the press land instead of watching a
+      // stale screen for six seconds. On a scheduled window this changes nothing
+      // on the panel: the Sync screen is not up, so the frame composes to the one
+      // already showing and paint() skips it.
+      snapshot.sync_live = true;
+    }
     if (find_session) {
       // The first frame of a search — "searching, 0:00, try 1" — painted before
       // the radio comes up, so the wearer sees the press land at once rather
@@ -972,21 +1102,23 @@ void setup() {
   // against a 9.5 mAh/day allowance, and a find session up to forty times that —
   // and the only place the radio is ever touched.
   //
-  // Three grants, because of the ordering trap noted at routeWake() above:
+  // **Both grants were settled above, before the frame**, because the frame is
+  // what tells the wearer which one is happening — a find session's phases, a
+  // window's "searching", or a refusal. Nothing is decided here; this is the
+  // effect.
   //
-  //   * plan.need_ble is the scheduled window. routeWake() evaluated §5.1's gates
-  //     from the state at the top of the wake, which is the same staleness every
-  //     other flag in the plan carries.
-  //   * a Sync press is evaluated here, after the UI dispatch, because the press
-  //     had not been dispatched when routeWake() ran and the item it selected was
-  //     therefore unknowable. It goes through core::evaluateSyncWindow() — the
-  //     same function routeWake() uses, not a copy of it — so no gate is
-  //     bypassed, weakened or duplicated. It is also evaluated against the
-  //     battery level as it stands *now*, after any sample this wake took.
-  //   * a Find phone press was evaluated above, before the frame, through the
-  //     same function again. It outranks a scheduled window that happens to be
-  //     due on the same wake: a find session that reaches the phone performs the
-  //     §4 exchange anyway (§4.1), so the window would be redundant.
+  // Each went through core::evaluateSyncWindow() exactly once, from
+  // syncContextFrom(), against state that is current in all three respects the
+  // decision needs: the clock has been read, so §5.1's hour boundary can be
+  // judged; the button press has been dispatched, so which item it selected is
+  // known; and the battery level is this wake's, after any sample it took.
+  //
+  // The sync window used to be decided three times — once inside routeWake() from
+  // top-of-wake state, once here for a Sync press, once more for a Find phone
+  // press — because the router ran before the press was dispatched and could not
+  // know about it. Three evaluations of one rule is three places for a gate to be
+  // weakened by accident, and the hour boundary made the first of them impossible
+  // anyway: it reads a clock the router runs too early to have.
   //
   // The alternative — latching the request into SyncState and honouring it on the
   // next wake — was rejected. §5.1 says the Sync item "opens a window
@@ -996,10 +1128,10 @@ void setup() {
   // wake it arrived on.
   if (find_session) {
     // Before the radio, never after — the same rule as the sync window's, for the
-    // same reason. A find session spends the hour (§4.1): it performs the sync
+    // same reason. A find session records the hour (§4.1): it performs the sync
     // exchange if a phone turns up, and a wearer pressing Find phone every minute
     // must not be able to run the radio more than the schedule would.
-    core::noteSyncWindowOpened(g_persist.sync);
+    core::noteSyncWindowOpened(g_persist.sync, core::hoursSinceEpoch(now), time_valid);
 
     const core::FindOutcome outcome =
         runFindSession(g_persist, snapshotFrom(g_persist, now, time_valid, mode));
@@ -1025,7 +1157,7 @@ void setup() {
           now = reading.time;
           time_valid = true;
         }
-        if (!board::rtc::armTick(tickMinutes(tick_seconds))) {
+        if (!board::rtc::armTick(core::alignedTickMinutes(now, time_valid, tick_seconds))) {
           WD_LOG("rtc: tick not re-armed after the find session");
         }
       }
@@ -1039,31 +1171,43 @@ void setup() {
     // session ended, so it cannot be painted before the session.
     paint(g_persist, snapshotFrom(g_persist, now, time_valid, mode), /*elapsed_minutes=*/0,
           /*force_full=*/false, /*first_boot=*/false);
-  } else {
-    bool open_window = plan.need_ble;
-    if (!open_window && sync_requested) {
-      core::SyncContext request;
-      request.mode = mode;
-      request.battery = g_persist.battery_level.level();
-      request.minutes_since_window = g_persist.sync.minutes_since_window;
-      request.user_requested = true;
+  } else if (sync_window) {
+    // Before the radio, never after. The hour is recorded when the window is
+    // granted, so a window that reaches nobody — or one that dies to a watchdog
+    // reset partway through — still costs the full hour. Deferring this to a
+    // success path is the unbounded retry core::sync_policy exists to prevent:
+    // 1440 windows a day instead of 24.
+    //
+    // The clock is the same reading the gate was judged against before the frame —
+    // nothing between there and here touches `now`, and the find session, which
+    // does re-read it, cannot reach this branch — so the hour recorded is the hour
+    // the decision was made in.
+    core::noteSyncWindowOpened(g_persist.sync, core::hoursSinceEpoch(now), time_valid);
 
-      const core::SyncDecision decision = core::evaluateSyncWindow(request);
-      open_window = decision.open;
-      if (!open_window) {
-        WD_LOG("ble: sync refused (gate %d)", static_cast<int>(decision.gate));
-      }
-    }
+    // The frame the window narrates over: whatever this wake drew, with sync_live
+    // set so a Searching or Connected phase reads as live rather than as a wake
+    // that died inside a window.
+    app::Snapshot base = snapshotFrom(g_persist, now, time_valid, mode);
+    base.sync_live = true;
+    g_persist.sync_phase = runSyncWindow(g_persist, base);
 
-    if (open_window) {
-      // Before the radio, never after. The hour is spent when the window is
-      // granted, so a window that reaches nobody — or one that dies to a watchdog
-      // reset partway through — still costs the full hour. Deferring this to a
-      // success path is the unbounded retry core::sync_policy exists to prevent:
-      // 1440 windows a day instead of 24.
-      core::noteSyncWindowOpened(g_persist.sync);
-      runSyncWindow(g_persist);
-    }
+    // The window is over and the radio is down: a completed step, and the feed
+    // Law 2 allows at one. It is here because of what follows it. The loop inside
+    // breaks on a terminal event **without** feeding — there is nothing left to
+    // make progress on — so the interval that ends here already carries §5.1's
+    // 6 s advertising phase, and hanging a panel refresh off the end of it would
+    // make the worst case ~6 s + ~2 s for the round core::refresh_policy turns
+    // into a full one. That is 8 s against a 10 s watchdog, and §5.1's ~3.95 s
+    // margin is not there to be spent on a frame.
+    board::power::feedWatchdog();
+
+    // How it ended, painted with the radio scope closed and without sync_live, so
+    // the phase this leaves in RTC memory is read as a finished window on the
+    // wakes after it. Same reasoning as the find session's closing frame: the
+    // outcome is not knowable before the window, so it cannot be folded into the
+    // frame above.
+    paint(g_persist, snapshotFrom(g_persist, now, time_valid, mode),
+          /*elapsed_minutes=*/0, /*force_full=*/false, /*first_boot=*/false);
   }
 
   // Marks the run a success. Nothing else clears the fault counter, so a crash

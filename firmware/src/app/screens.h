@@ -13,6 +13,7 @@
 #include "core/health.h"
 #include "core/protocol.h"
 #include "core/step_counter.h"
+#include "core/sync_window.h"
 #include "core/time_model.h"
 #include "core/ui_state.h"
 
@@ -59,6 +60,28 @@ struct Snapshot {
   // Whether an epoch has ever actually reached the PCF8563. Busy is both "never
   // synced" and "a window did not finish", and only this distinguishes them.
   bool sync_applied = false;
+
+  // How the window the wearer is watching is going — the Sync item opens one on
+  // the press that selects it, and this is that window narrated (core::SyncPhase).
+  //
+  // `Idle` means no window has run since the watch booted, and only then does the
+  // screen fall back to the §3.2 line above. Every other value replaces it: after
+  // a search the wearer wants "no phone found", not the hour-old "last sync ok"
+  // that is still perfectly true.
+  //
+  // `sync_live` is true only for frames drawn from inside a running window, and it
+  // exists for one case: a persisted Searching or Connected with no live window is
+  // a wake that **died inside one**, and it must read as "interrupted" rather than
+  // as a search that has been going for an hour. Same rule, same reason, as
+  // find_live and a persisted FindOutcome::InProgress.
+  //
+  // There is no elapsed counter beside it, where the Find phone screen has one. A
+  // window is 12 s at the most, so a second-by-second number would buy a repaint
+  // per second (~0.003 mAh each) to animate something that is over before it is
+  // read — where a search runs for two minutes and the counter is what the wearer
+  // is watching.
+  core::SyncPhase sync_phase = core::SyncPhase::Idle;
+  bool sync_live = false;
 
   // The Find phone screen (core::kFindPhoneMenuIndex, PROTOCOL.md §4.1). Only
   // that screen renders any of it and only that screen hashes it, so a search

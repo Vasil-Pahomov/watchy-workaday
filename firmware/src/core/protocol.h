@@ -72,6 +72,13 @@ constexpr const char* kCccdUuid = "00002902-0000-1000-8000-00805f9b34fb";
 // teardown begins, so 6 s of window is followed by a teardown that must now
 // terminate a live link. §5.1 carries the full table. Raising
 // kAdvertiseTimeoutMs without re-deriving it walks that race into a reset.
+// §5.1's schedule is the **hour boundary**, not this number: a window opens on the
+// wake at which the wall clock's hour differs from the hour the last one opened
+// in. This is the fallback the gate uses when the RTC cannot be read and there is
+// therefore no boundary to sit on — same cadence, unpredictable phase. It stays in
+// this file because it is still a §5.1 number and §8 allows exactly one file per
+// side to hold one; the app mirrors it as SYNC_WINDOW_INTERVAL_SECONDS, where it
+// is the scale for "that sync looks too old" rather than a schedule.
 constexpr uint16_t kSyncWindowIntervalMinutes = 60;
 constexpr uint16_t kAdvertiseTimeoutMs = 6000;
 constexpr uint16_t kIdleAfterConnectTimeoutMs = 4000;

@@ -702,6 +702,95 @@ void test_an_elapsed_far_past_the_cap_ends_rather_than_wraps(void) {
                         eventAsInt(window.classify(0xFFFFFFFFu, connectedAndWrote())));
 }
 
+// ── what the wearer is shown while the window runs ──────────────────────
+
+static int phaseAsInt(core::SyncPhase phase) { return static_cast<int>(phase); }
+
+void test_the_phase_walks_searching_connected_synced(void) {
+  // The three lines the Sync screen shows in order, which is the whole feature:
+  // the wearer asked whether syncing works and gets this window's answer.
+  core::SyncPhase phase = core::SyncPhase::Searching;
+  phase = core::syncPhaseOnConnect(phase);
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::Connected), phaseAsInt(phase));
+
+  phase = core::syncPhaseOnResult(phase, core::SyncResult::Ok);
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::Synced), phaseAsInt(phase));
+
+  phase = core::syncPhaseOnEnd(phase);
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::Synced), phaseAsInt(phase));
+}
+
+void test_a_rejected_write_is_shown_as_a_failure(void) {
+  const core::SyncResult failures[] = {
+      core::SyncResult::BadLength,      core::SyncResult::BadVersion,
+      core::SyncResult::OutOfRange,     core::SyncResult::RtcWriteFailed,
+      core::SyncResult::BadType,        core::SyncResult::Busy};
+  for (const core::SyncResult result : failures) {
+    const core::SyncPhase phase =
+        core::syncPhaseOnResult(core::SyncPhase::Connected, result);
+    TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::Failed), phaseAsInt(phase));
+    // And it survives the ending, so the screen still names it afterwards.
+    TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::Failed),
+                          phaseAsInt(core::syncPhaseOnEnd(phase)));
+  }
+}
+
+void test_a_success_cannot_be_turned_back_into_a_failure(void) {
+  // §4 licenses a second push in one connection **only if the first failed**, so a
+  // later write cannot un-sync a finished exchange. Without the latch a phone that
+  // pushes twice would leave the wearer looking at an error for a sync that worked.
+  core::SyncPhase phase =
+      core::syncPhaseOnResult(core::SyncPhase::Connected, core::SyncResult::Ok);
+  phase = core::syncPhaseOnResult(phase, core::SyncResult::BadVersion);
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::Synced), phaseAsInt(phase));
+
+  // A reconnect inside the same window does not either.
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::Synced),
+                        phaseAsInt(core::syncPhaseOnConnect(phase)));
+}
+
+void test_every_ending_without_an_exchange_reads_as_no_phone(void) {
+  // TimedOut, Capped and a Disconnected with nothing written are four §5.1 endings
+  // and one fact to a wearer, who cannot act on the difference between them.
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::NoPhone),
+                        phaseAsInt(core::syncPhaseOnEnd(core::SyncPhase::Searching)));
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::NoPhone),
+                        phaseAsInt(core::syncPhaseOnEnd(core::SyncPhase::Connected)));
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::NoPhone),
+                        phaseAsInt(core::syncPhaseOnEnd(core::SyncPhase::Idle)));
+}
+
+void test_a_radio_that_would_not_start_keeps_its_own_word(void) {
+  // §6.1's "a radio that will not start must never cost a tick". Distinct from
+  // NoPhone because the wearer can act on the difference.
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::RadioFailed),
+                        phaseAsInt(core::syncPhaseOnEnd(core::SyncPhase::RadioFailed)));
+  TEST_ASSERT_EQUAL_INT(phaseAsInt(core::SyncPhase::RadioFailed),
+                        phaseAsInt(core::syncPhaseOnConnect(core::SyncPhase::RadioFailed)));
+}
+
+void test_the_window_reports_whether_the_exchange_completed(void) {
+  // The caller settles the screen's last line from this rather than from the
+  // ending, because §6.1 makes Disconnected the normal end of both a successful
+  // exchange and a phone that connected and said nothing.
+  SyncWindow quiet;
+  quiet.classify(0, connected());
+  quiet.classify(100, connectedAndGone());
+  TEST_ASSERT_FALSE(quiet.exchangeComplete());
+
+  SyncWindow synced;
+  synced.classify(0, connected());
+  synced.classify(100, connectedAndWrote());
+  synced.noteWriteResult(core::SyncResult::Ok);
+  TEST_ASSERT_TRUE(synced.exchangeComplete());
+
+  SyncWindow refused;
+  refused.classify(0, connected());
+  refused.classify(100, connectedAndWrote());
+  refused.noteWriteResult(core::SyncResult::BadVersion);
+  TEST_ASSERT_FALSE(refused.exchangeComplete());
+}
+
 int main(void) {
   UNITY_BEGIN();
 
@@ -739,6 +828,13 @@ int main(void) {
   RUN_TEST(test_the_cap_boundary_is_exact);
   RUN_TEST(test_a_fresh_window_is_advertising_and_not_ended);
   RUN_TEST(test_an_elapsed_far_past_the_cap_ends_rather_than_wraps);
+
+  RUN_TEST(test_the_phase_walks_searching_connected_synced);
+  RUN_TEST(test_a_rejected_write_is_shown_as_a_failure);
+  RUN_TEST(test_a_success_cannot_be_turned_back_into_a_failure);
+  RUN_TEST(test_every_ending_without_an_exchange_reads_as_no_phone);
+  RUN_TEST(test_a_radio_that_would_not_start_keeps_its_own_word);
+  RUN_TEST(test_the_window_reports_whether_the_exchange_completed);
 
   return UNITY_END();
 }

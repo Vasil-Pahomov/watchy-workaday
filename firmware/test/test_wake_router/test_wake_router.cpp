@@ -12,9 +12,8 @@ using core::WakeSource;
 void setUp(void) {}
 void tearDown(void) {}
 
-// A context where the battery sample is NOT due and no sync window is due either,
-// so tests that care about other peripherals are not confused by an incidental ADC
-// power-up or by the radio.
+// A context where the battery sample is NOT due, so tests that care about other
+// peripherals are not confused by an incidental ADC power-up.
 static WakeContext freshContext(void) {
   WakeContext context;
   context.mode = RunMode::Normal;
@@ -22,17 +21,13 @@ static WakeContext freshContext(void) {
   context.minutes_since_battery_sample = 0;
   context.accel_features_enabled = false;
   context.ui_active = false;
-  context.minutes_since_sync_window = 0;
-  context.sync_requested = false;
   return context;
 }
 
-// The same context an hour later: a sync window is due.
-static WakeContext syncDueContext(void) {
-  WakeContext context = freshContext();
-  context.minutes_since_sync_window = core::kSyncWindowIntervalMinutes;
-  return context;
-}
+// Every wake source, for the sweeps below.
+static const WakeSource kAllSources[] = {WakeSource::PowerOn,        WakeSource::RtcAlarm,
+                                         WakeSource::Button,         WakeSource::Accelerometer,
+                                         WakeSource::Timer,          WakeSource::Unknown};
 
 // ── the common case: a minute tick ───────────────────────────────────────────
 
@@ -255,43 +250,33 @@ void test_tick_interval_precedence(void) {
   TEST_ASSERT_EQUAL_UINT16(core::kRecoveryTickSeconds, core::tickIntervalFor(context));
 }
 
-// ── the radio: which wakes may carry a sync window ───────────────────────────
+// ── the radio: which wakes may carry a sync window ────────────────────────
 
-void test_no_wake_carries_a_sync_window_before_the_hour(void) {
-  // Law 1: never on a routine wake. The overwhelmingly common case is 1440 ticks a
-  // day and 1416 of them must not touch the radio.
-  const WakeSource sources[] = {WakeSource::PowerOn, WakeSource::RtcAlarm, WakeSource::Button,
-                                WakeSource::Accelerometer, WakeSource::Timer,
-                                WakeSource::Unknown};
-  WakeContext context = freshContext();
-  context.minutes_since_sync_window =
-      static_cast<uint16_t>(core::kSyncWindowIntervalMinutes - 1);
+// This router answers eligibility and nothing else: is this the KIND of wake
+// PROTOCOL.md §5.3 budgets a window onto. Whether a window is actually due is
+// core::evaluateSyncWindow()'s answer and test_sync_policy's subject — including
+// the hour boundary, which needs a wall clock this router runs too early to have.
 
-  for (const WakeSource source : sources) {
-    TEST_ASSERT_FALSE(core::routeWake(source, context).need_ble);
-  }
-}
-
-void test_a_due_window_rides_on_the_tick_it_was_budgeted_to_extend(void) {
-  // PROTOCOL.md §5.3 budgets the window as an extension of a wake the watch was
-  // already taking, not as a wake of its own.
+void test_a_wake_the_watch_was_taking_anyway_may_carry_a_window(void) {
+  // §5.3 prices the window as an extension of a wake already happening, not as a
+  // wake of its own. These four are the wakes that happen anyway.
   const WakeSource carriers[] = {WakeSource::RtcAlarm, WakeSource::Timer, WakeSource::PowerOn,
                                  WakeSource::Button};
   for (const WakeSource source : carriers) {
-    TEST_ASSERT_TRUE(core::routeWake(source, syncDueContext()).need_ble);
+    TEST_ASSERT_TRUE(core::routeWake(source, freshContext()).may_carry_sync_window);
   }
 }
 
 void test_motion_never_carries_a_sync_window(void) {
   // An accelerometer wake is deliberately the cheapest path in this router — no
   // clock, no panel. A wrist flick must not be able to make it the most expensive
-  // one, and not even a request riding along with it changes that.
-  WakeContext context = syncDueContext();
+  // one, and it arrives at a rate nobody budgeted a radio against.
+  WakeContext context = freshContext();
   context.accel_features_enabled = true;
-  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Accelerometer, context).need_ble);
+  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Accelerometer, context).may_carry_sync_window);
 
-  context.sync_requested = true;
-  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Accelerometer, context).need_ble);
+  context.ui_active = true;
+  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Accelerometer, context).may_carry_sync_window);
 }
 
 void test_an_unclassified_wake_never_carries_a_sync_window(void) {
@@ -299,126 +284,77 @@ void test_an_unclassified_wake_never_carries_a_sync_window(void) {
   // a panic, a brownout, an unexplained reset — and core::health has not yet had
   // the three consecutive faults it needs to escalate into Safe mode. Refusing
   // costs nothing: the next ordinary tick carries the window instead.
-  WakeContext context = syncDueContext();
-  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Unknown, context).need_ble);
-
-  context.sync_requested = true;
-  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Unknown, context).need_ble);
-}
-
-void test_a_button_press_carries_a_user_requested_window(void) {
-  // The Sync menu item. §5.1: it opens a window immediately, without waiting for
-  // the hour.
-  WakeContext context = freshContext();
-  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Button, context).need_ble);
-
-  context.sync_requested = true;
-  TEST_ASSERT_TRUE(core::routeWake(WakeSource::Button, context).need_ble);
-}
-
-void test_a_cold_boot_may_sync_because_its_clock_is_unset(void) {
-  // The persisted block is re-initialised on a cold boot, which leaves the sync
-  // timer reading "due" — this is the wake that can set a brand new watch's clock.
-  WakeContext context = freshContext();
-  context.minutes_since_sync_window = core::SyncState{}.minutes_since_window;
-  TEST_ASSERT_TRUE(core::routeWake(WakeSource::PowerOn, context).need_ble);
+  TEST_ASSERT_FALSE(core::routeWake(WakeSource::Unknown, freshContext()).may_carry_sync_window);
 }
 
 void test_degraded_modes_never_carry_a_sync_window(void) {
-  // No radio in Safe or Recovery, whatever the schedule says and whoever asked.
-  const WakeSource sources[] = {WakeSource::PowerOn, WakeSource::RtcAlarm, WakeSource::Button,
-                                WakeSource::Accelerometer, WakeSource::Timer,
-                                WakeSource::Unknown};
+  // No radio in Safe or Recovery, whatever the source. core::evaluateSyncWindow()
+  // refuses both modes as well — the radio is the one peripheral worth gating
+  // twice, and this is the half of that pair which lives here.
   const RunMode gated[] = {RunMode::Safe, RunMode::Recovery};
 
   for (const RunMode mode : gated) {
-    for (const WakeSource source : sources) {
-      WakeContext context = syncDueContext();
+    for (const WakeSource source : kAllSources) {
+      WakeContext context = freshContext();
       context.mode = mode;
-      context.sync_requested = true;
-      TEST_ASSERT_FALSE(core::routeWake(source, context).need_ble);
+      TEST_ASSERT_FALSE(core::routeWake(source, context).may_carry_sync_window);
     }
   }
 }
 
-void test_a_low_battery_never_carries_a_sync_window(void) {
-  const WakeSource sources[] = {WakeSource::PowerOn, WakeSource::RtcAlarm, WakeSource::Button,
-                                WakeSource::Accelerometer, WakeSource::Timer,
-                                WakeSource::Unknown};
-  const BatteryLevel gated[] = {BatteryLevel::Low, BatteryLevel::Critical};
-
-  for (const BatteryLevel level : gated) {
-    for (const WakeSource source : sources) {
-      WakeContext context = syncDueContext();
-      context.battery = level;
-      context.sync_requested = true;
-      TEST_ASSERT_FALSE(core::routeWake(source, context).need_ble);
-    }
-  }
-}
-
-void test_a_granted_window_never_costs_a_peripheral_of_its_own(void) {
-  // §5.3's budget assumes the window extends a wake that was already happening. If
-  // granting one also switched on the ADC or the accelerometer, the ledger's
-  // ~0.031 mAh per window would be wrong.
-  const WakePlan without = core::routeWake(WakeSource::RtcAlarm, freshContext());
-  const WakePlan with = core::routeWake(WakeSource::RtcAlarm, syncDueContext());
-
-  TEST_ASSERT_TRUE(with.need_ble);
-  TEST_ASSERT_EQUAL_INT(without.need_rtc, with.need_rtc);
-  TEST_ASSERT_EQUAL_INT(without.need_accel, with.need_accel);
-  TEST_ASSERT_EQUAL_INT(without.need_battery, with.need_battery);
-  TEST_ASSERT_EQUAL_INT(without.need_display, with.need_display);
-  TEST_ASSERT_EQUAL_INT(without.need_i2c, with.need_i2c);
-  TEST_ASSERT_EQUAL_UINT16(without.next_tick_seconds, with.next_tick_seconds);
-}
-
-void test_ble_is_granted_only_when_every_rule_agrees(void) {
-  // The radio is the largest consumer on the board, so this asserts the properties
-  // a granted window must have rather than re-deriving the answer: a future edit
-  // that loosens a gate fails here even if it also updates the test above it.
-  const WakeSource sources[] = {WakeSource::PowerOn, WakeSource::RtcAlarm, WakeSource::Button,
-                                WakeSource::Accelerometer, WakeSource::Timer,
-                                WakeSource::Unknown};
-  const RunMode modes[] = {RunMode::Normal, RunMode::Safe, RunMode::Recovery};
-  const BatteryLevel levels[] = {BatteryLevel::Full, BatteryLevel::Normal, BatteryLevel::Low,
-                                 BatteryLevel::Critical};
-  const uint16_t elapsed_minutes[] = {
-      0, static_cast<uint16_t>(core::kSyncWindowIntervalMinutes - 1),
-      core::kSyncWindowIntervalMinutes, UINT16_MAX};
-
-  bool granted_at_least_once = false;
-
-  for (const WakeSource source : sources) {
+void test_eligibility_depends_on_the_source_and_the_mode_and_nothing_else(void) {
+  // The property that keeps the split honest. This flag used to be the full §5.1
+  // grant, evaluated here from top-of-wake state; it is now eligibility alone, and
+  // an edit that quietly reintroduces a schedule input — the battery, a request,
+  // anything — fails here rather than being discovered as a window that opened on
+  // a stale reading.
+  for (const WakeSource source : kAllSources) {
+    const RunMode modes[] = {RunMode::Normal, RunMode::Safe, RunMode::Recovery};
     for (const RunMode mode : modes) {
+      WakeContext baseline = freshContext();
+      baseline.mode = mode;
+      const bool expected = core::routeWake(source, baseline).may_carry_sync_window;
+
+      const BatteryLevel levels[] = {BatteryLevel::Full, BatteryLevel::Normal,
+                                     BatteryLevel::Low, BatteryLevel::Critical};
       for (const BatteryLevel level : levels) {
-        for (const uint16_t elapsed : elapsed_minutes) {
-          for (int requested = 0; requested < 2; ++requested) {
-            WakeContext context = freshContext();
-            context.mode = mode;
-            context.battery = level;
-            context.minutes_since_sync_window = elapsed;
-            context.sync_requested = (requested != 0);
-
-            const WakePlan plan = core::routeWake(source, context);
-            if (!plan.need_ble) {
-              continue;
+        for (int accel = 0; accel < 2; ++accel) {
+          for (int ui = 0; ui < 2; ++ui) {
+            for (uint32_t sample = 0; sample < 2; ++sample) {
+              WakeContext context = freshContext();
+              context.mode = mode;
+              context.battery = level;
+              context.accel_features_enabled = (accel != 0);
+              context.ui_active = (ui != 0);
+              context.minutes_since_battery_sample =
+                  sample * core::kBatterySampleIntervalMinutes;
+              TEST_ASSERT_EQUAL_INT(
+                  expected, core::routeWake(source, context).may_carry_sync_window);
             }
-            granted_at_least_once = true;
-
-            TEST_ASSERT_EQUAL_INT(static_cast<int>(RunMode::Normal), static_cast<int>(mode));
-            TEST_ASSERT_TRUE(core::radioPermitted(level));
-            TEST_ASSERT_TRUE(context.sync_requested ||
-                             elapsed >= core::kSyncWindowIntervalMinutes);
-            TEST_ASSERT_TRUE(source != WakeSource::Accelerometer);
-            TEST_ASSERT_TRUE(source != WakeSource::Unknown);
           }
         }
       }
     }
   }
+}
 
-  TEST_ASSERT_TRUE(granted_at_least_once);
+void test_eligibility_never_costs_a_peripheral_of_its_own(void) {
+  // §5.3's budget assumes the window extends a wake that was already happening, so
+  // a wake that may carry one has to look exactly like the same wake in a build
+  // with no radio at all: no extra ADC, no extra sensor.
+  //
+  // PowerOn is excluded and it is not an exception to the rule — it powers up the
+  // ADC and the sensor because a cold boot has no baseline, not because a window
+  // may ride on it, and it happens once against the 24 windows a day that ride on
+  // the tick. The three below are the ones the ledger is about.
+  const WakeSource carriers[] = {WakeSource::RtcAlarm, WakeSource::Timer, WakeSource::Button};
+  for (const WakeSource source : carriers) {
+    const WakePlan plan = core::routeWake(source, freshContext());
+    TEST_ASSERT_TRUE(plan.may_carry_sync_window);
+    TEST_ASSERT_EQUAL_INT(plan.need_rtc || plan.need_accel, plan.need_i2c);
+    TEST_ASSERT_FALSE(plan.need_battery);  // not due in freshContext()
+    TEST_ASSERT_FALSE(plan.need_accel);    // motion features off
+  }
 }
 
 // ── the invariant that keeps the I2C bus honest ───────────────────────────────
@@ -426,14 +362,11 @@ void test_ble_is_granted_only_when_every_rule_agrees(void) {
 void test_i2c_is_powered_exactly_when_a_bus_device_is_needed(void) {
   // If this drifts, either the bus is powered for nothing (wasted energy) or a
   // device is accessed on a dead bus (a timeout, and a wasted wake).
-  const WakeSource sources[] = {WakeSource::PowerOn, WakeSource::RtcAlarm, WakeSource::Button,
-                                WakeSource::Accelerometer, WakeSource::Timer,
-                                WakeSource::Unknown};
   const RunMode modes[] = {RunMode::Normal, RunMode::Safe, RunMode::Recovery};
   const BatteryLevel levels[] = {BatteryLevel::Full, BatteryLevel::Normal, BatteryLevel::Low,
                                  BatteryLevel::Critical};
 
-  for (const WakeSource source : sources) {
+  for (const WakeSource source : kAllSources) {
     for (const RunMode mode : modes) {
       for (const BatteryLevel level : levels) {
         for (int accel = 0; accel < 2; ++accel) {
@@ -455,12 +388,9 @@ void test_i2c_is_powered_exactly_when_a_bus_device_is_needed(void) {
 
 void test_a_tick_is_never_scheduled_at_zero(void) {
   // A zero interval means "wake immediately", which never reaches deep sleep.
-  const WakeSource sources[] = {WakeSource::PowerOn, WakeSource::RtcAlarm, WakeSource::Button,
-                                WakeSource::Accelerometer, WakeSource::Timer,
-                                WakeSource::Unknown};
   const RunMode modes[] = {RunMode::Normal, RunMode::Safe, RunMode::Recovery};
 
-  for (const WakeSource source : sources) {
+  for (const WakeSource source : kAllSources) {
     for (const RunMode mode : modes) {
       WakeContext context = freshContext();
       context.mode = mode;
@@ -493,16 +423,12 @@ int main(void) {
   RUN_TEST(test_recovery_mode_overrides_every_wake_source);
   RUN_TEST(test_tick_interval_precedence);
 
-  RUN_TEST(test_no_wake_carries_a_sync_window_before_the_hour);
-  RUN_TEST(test_a_due_window_rides_on_the_tick_it_was_budgeted_to_extend);
+  RUN_TEST(test_a_wake_the_watch_was_taking_anyway_may_carry_a_window);
   RUN_TEST(test_motion_never_carries_a_sync_window);
   RUN_TEST(test_an_unclassified_wake_never_carries_a_sync_window);
-  RUN_TEST(test_a_button_press_carries_a_user_requested_window);
-  RUN_TEST(test_a_cold_boot_may_sync_because_its_clock_is_unset);
   RUN_TEST(test_degraded_modes_never_carry_a_sync_window);
-  RUN_TEST(test_a_low_battery_never_carries_a_sync_window);
-  RUN_TEST(test_a_granted_window_never_costs_a_peripheral_of_its_own);
-  RUN_TEST(test_ble_is_granted_only_when_every_rule_agrees);
+  RUN_TEST(test_eligibility_depends_on_the_source_and_the_mode_and_nothing_else);
+  RUN_TEST(test_eligibility_never_costs_a_peripheral_of_its_own);
 
   RUN_TEST(test_i2c_is_powered_exactly_when_a_bus_device_is_needed);
   RUN_TEST(test_a_tick_is_never_scheduled_at_zero);

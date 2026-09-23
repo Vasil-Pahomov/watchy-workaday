@@ -67,7 +67,42 @@ uint8_t secondsToNextMinute(const DateTime& dt);
 
 uint16_t minuteOfDay(const DateTime& dt);
 
+// Whole hours since 2000-01-01T00:00, the same origin daysSinceEpoch() uses.
+//
+// This exists for one caller and it is worth saying which, because a bare hour
+// number would have been the obvious thing and is wrong: PROTOCOL.md §5.1 puts the
+// sync window on the hour boundary, and "the hour changed" has to stay true across
+// midnight and across a watch that spent a day in a drawer. `dt.hour != last_hour`
+// is false at exactly the two moments it matters most — 23:xx to 23:xx a day
+// later, and any 24-hour absence — so the comparison is made on a monotonic count
+// instead. Valid input required, like daysSinceEpoch().
+uint32_t hoursSinceEpoch(const DateTime& dt);
+
 int32_t minutesBetween(const DateTime& from, const DateTime& to);
+
+// How many minutes to arm the PCF8563's countdown for, so that the wake it
+// produces lands on a wall-clock minute divisible by the tick interval.
+//
+// **This is the difference between a face that reads 14:35 and one that reads
+// 14:33.** At a one-minute tick there is nothing to decide — every minute is on
+// the grid — but the five-minute saving tick free-runs from whenever the level
+// last changed, so without this the wearer gets an arbitrary phase and a clock
+// that is stale by an amount they cannot predict. On the grid they can: the
+// displayed minute is always a multiple of five, so "somewhere in the next five
+// minutes" is readable off the face itself.
+//
+// It is also what keeps §5.1's window reachable in saving mode. The window is due
+// on the hour, the hour is minute 0, and 60 is divisible by all three intervals
+// this firmware uses — 1, 5 and 15 minutes — so there is always a tick at the top
+// of the hour to carry it. An interval that did not divide 60 would still get a
+// bounded count from here, just not an hour-aligned one; none is used, and adding
+// one would need this paragraph re-derived rather than this function changed.
+//
+// Returns 1..min(tick_seconds/60, 255), never 0 — an auto-reloading timer loaded
+// with 0 is a wake that never sleeps. An untrustworthy clock gives the plain
+// interval: there is nothing to align to, and a clock the firmware cannot read
+// must never be able to stop the wakes.
+uint8_t alignedTickMinutes(const DateTime& now, bool now_valid, uint16_t tick_seconds);
 
 // Beyond a month a delta stops being evidence of anything: the watch was off, the
 // clock jumped, or the persisted reading is from another era. The measurement is
@@ -82,7 +117,7 @@ constexpr uint32_t kMaxTrustedElapsedMinutes = 60u * 24u * 30u;
 // main.cpp: it decides what to believe about elapsed time when the PCF8563 cannot
 // be trusted, and nearly every accumulating counter in the firmware is driven by
 // its answer — the battery sample schedule, the ghosting timer, the step count's
-// staleness clock, the UI idle timeout, and the BLE sync window's hourly timer.
+// staleness clock, the UI idle timeout, and the BLE sync window's fallback timer.
 //
 // Both failure directions are live, and the fallback is what handles them:
 //

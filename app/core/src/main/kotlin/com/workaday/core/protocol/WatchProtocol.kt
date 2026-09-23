@@ -159,13 +159,17 @@ object WatchProtocol {
     const val BACKOFF_JITTER_FRACTION: Double = 0.20
 
     /**
-     * §5.1's sync window interval — the **watch's** cadence, not the phone's, and
-     * the only number from that table the phone has any use for.
+     * §5.1's sync window cadence — the **watch's**, not the phone's, and the only
+     * number from that table the phone has any use for.
      *
-     * The phone cannot observe the watch's schedule and must never try to predict
-     * it: §5.1 says a window that opens resets the hourly timer *when it opens*,
-     * and the phone only ever waits on a pending `autoConnect`. Nothing here
-     * schedules against this value.
+     * The watch schedules its window on the **hour boundary**: the wake at which
+     * its wall clock's hour differs from the hour the last window opened in. That
+     * is 24 windows a day, so an hour is still the right scale here — but it is
+     * the scale of the cadence, never a prediction of *when*. The phone cannot
+     * observe the watch's schedule and must never try to: a user press opens a
+     * window off the boundary, a watch with an unreadable clock falls back to a
+     * free-running hour, and the phone only ever waits on a pending `autoConnect`.
+     * Nothing here schedules against this value.
      *
      * What it is for is the diagnostic screen, which has to turn "last synced
      * 4 hours ago" into "that looks wrong" — and the only honest scale for

@@ -181,11 +181,13 @@ started the search bounces into the same interrupt.
 Two things about it are worth knowing before touching it:
 
 - **It is the one path that stays awake for minutes**, at radio current, and it is
-  affordable only because it is user-initiated, bounded by the cap, and refused on
-  a low battery or in a degraded mode by the same gates as a sync window. The
-  worst case — phone found at once and the search left to run out — is ~1.3 mAh,
-  about 14 % of a day; `docs/power-budget.md` has the row. A search also spends the
-  hourly sync timer, since it performs the sync if a phone turns up.
+  affordable only because it is user-initiated, bounded by the cap, and refused in
+  a degraded mode by the same gate a user-requested sync window is. A low battery
+  does *not* refuse it — §5.1's battery gate stops the schedule, and a wearer
+  looking for their phone is not the schedule. The worst case — phone found at
+  once and the search left to run out — is ~1.3 mAh, about 14 % of a day;
+  `docs/power-budget.md` has the row. A search also records the hour, since it
+  performs the sync if a phone turns up.
 - **The Back button is read by a GPIO interrupt during the search**
   (`board::buttons::attachPressInterrupt()`), the only place in the firmware a pin
   is read by anything other than an ext1 wake. `pinMode()` first, because ext1

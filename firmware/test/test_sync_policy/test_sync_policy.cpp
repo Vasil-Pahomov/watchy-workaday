@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "core/sync_policy.h"
+#include "core/time_model.h"
 
 using core::BatteryLevel;
 using core::RunMode;
@@ -19,14 +20,69 @@ void tearDown(void) {}
 // checked against PROTOCOL.md §7.2 byte for byte.
 static const uint32_t kGoldenEpoch = 1786970096u;
 
+// An hour-aligned instant, so a window opened at wake zero sits exactly on a
+// boundary and the next one is 60 minutes away rather than however far the golden
+// vector happens to be from the top of its hour.
+static const uint32_t kHourAlignedEpoch = kGoldenEpoch - (kGoldenEpoch % 3600u);
+
 // A watch, and the radio traffic it caused. `windows` is the number that decides
 // whether this feature costs ~0.75 mAh/day or ~26.
+//
+// **Its clock is unreadable, and that is the point of this one.** §5.1 schedules
+// the window on the hour boundary and falls back to the elapsed counter when there
+// is no clock to find a boundary in — and that fallback is not an exotic path, it
+// is every watch that has never synced. ClockedWatch below drives the primary
+// schedule; this one drives what happens when there isn't one.
 struct Watch {
   SyncState state;
   RunMode mode = RunMode::Normal;
   BatteryLevel battery = BatteryLevel::Normal;
   int windows = 0;
 };
+
+// The same watch with a PCF8563 that works. Time is carried as an epoch and turned
+// into a DateTime through core::localFromUnixEpoch(), so the arithmetic that
+// advances it is the tested kind rather than a second implementation of calendars
+// written inside a test.
+struct ClockedWatch {
+  SyncState state;
+  RunMode mode = RunMode::Normal;
+  BatteryLevel battery = BatteryLevel::Normal;
+  uint32_t epoch_s = kHourAlignedEpoch;
+  bool clock_valid = true;
+  int windows = 0;
+};
+
+static core::DateTime clockOf(const ClockedWatch& watch) {
+  return core::localFromUnixEpoch(watch.epoch_s, 0);
+}
+
+// One wake of a watch that knows what time it is. Time advances whether or not the
+// clock can be *read* this wake, because time does.
+static bool clockedWake(ClockedWatch& watch, uint32_t elapsed_minutes, bool user_requested) {
+  watch.epoch_s += elapsed_minutes * 60u;
+  core::advanceSyncTimer(watch.state, elapsed_minutes);
+
+  SyncContext context;
+  context.mode = watch.mode;
+  context.battery = watch.battery;
+  context.minutes_since_window = watch.state.minutes_since_window;
+  context.clock_valid = watch.clock_valid;
+  context.hour = core::hoursSinceEpoch(clockOf(watch));
+  context.last_window = watch.state.last_window;
+  context.user_requested = user_requested;
+
+  const SyncDecision decision = core::evaluateSyncWindow(context);
+  if (!decision.open) {
+    return false;
+  }
+  ++watch.windows;
+  core::noteSyncWindowOpened(watch.state, context.hour, watch.clock_valid);
+  return true;
+}
+
+// The minute of the hour this watch's clock is showing.
+static uint8_t minuteOf(const ClockedWatch& watch) { return clockOf(watch).minute; }
 
 // One wake, in the order main.cpp and the radio path run it: advance the timer,
 // ask the policy, and — when a window is granted — spend the hour **before** the
@@ -52,18 +108,22 @@ static bool wake(Watch& watch, uint32_t elapsed_minutes, bool user_requested,
   }
 
   ++watch.windows;
-  core::noteSyncWindowOpened(watch.state);
+  core::noteSyncWindowOpened(watch.state, /*hour=*/0, /*clock_valid=*/false);
   if (phone_present) {
     core::noteSyncResult(watch.state, SyncResult::Ok, kGoldenEpoch);
   }
   return true;
 }
 
+// A context with no usable clock, so the elapsed counter is what decides. Every
+// test written against this one is a test of §5.1's fallback; the hour boundary
+// has its own section below.
 static SyncContext contextAt(uint16_t minutes_since_window) {
   SyncContext context;
   context.mode = RunMode::Normal;
   context.battery = BatteryLevel::Normal;
   context.minutes_since_window = minutes_since_window;
+  context.clock_valid = false;
   context.user_requested = false;
   return context;
 }
@@ -153,8 +213,12 @@ void test_reset_returns_the_state_to_a_fresh_watch(void) {
   core::noteSyncResult(state, SyncResult::RtcWriteFailed, 0);
   state.last_applied_epoch_s = kGoldenEpoch;
 
+  state.last_window.hour = 12345;
+  state.last_window.known = true;
+
   core::resetSyncState(state);
   TEST_ASSERT_TRUE(core::evaluateSyncWindow(contextAt(state.minutes_since_window)).open);
+  TEST_ASSERT_FALSE(state.last_window.known);
   TEST_ASSERT_EQUAL_INT(static_cast<int>(SyncResult::Busy), static_cast<int>(state.last_result));
   TEST_ASSERT_EQUAL_UINT32(0, state.last_applied_epoch_s);
 }
@@ -175,7 +239,7 @@ void test_a_degraded_mode_never_opens_a_window(void) {
   }
 }
 
-void test_a_low_battery_never_opens_a_window(void) {
+void test_a_low_battery_never_opens_a_SCHEDULED_window(void) {
   const BatteryLevel gated[] = {BatteryLevel::Low, BatteryLevel::Critical};
   for (const BatteryLevel level : gated) {
     SyncContext context = contextAt(core::kSyncWindowIntervalMinutes * 100);
@@ -209,11 +273,11 @@ void test_the_gate_names_the_first_rule_that_closed(void) {
                         static_cast<int>(core::evaluateSyncWindow(context).gate));
 
   context.mode = RunMode::Normal;
+  context.user_requested = false;
   TEST_ASSERT_EQUAL_INT(static_cast<int>(SyncGate::BatteryTooLow),
                         static_cast<int>(core::evaluateSyncWindow(context).gate));
 
   context.battery = BatteryLevel::Normal;
-  context.user_requested = false;
   TEST_ASSERT_EQUAL_INT(static_cast<int>(SyncGate::IntervalNotElapsed),
                         static_cast<int>(core::evaluateSyncWindow(context).gate));
 
@@ -259,32 +323,68 @@ void test_a_user_request_does_not_override_a_degraded_mode(void) {
   }
 }
 
-void test_a_user_request_does_not_override_a_low_battery(void) {
-  // core::radioPermitted() already states this in one line: at these levels the
-  // radio stays off "regardless of what the user asked for".
+void test_a_user_request_overrides_a_low_battery(void) {
+  // The battery gate stops the firmware spending ~0.9 mAh/day of radio on a
+  // standing guess that a phone is nearby. It was never a claim that the radio is
+  // unsafe below 10 %, and a wearer pressing Sync or Find phone is not a guess —
+  // refusing them saves ~0.03 mAh and loses the one moment the feature exists for.
   const BatteryLevel gated[] = {BatteryLevel::Low, BatteryLevel::Critical};
   for (const BatteryLevel level : gated) {
-    SyncContext context = contextAt(core::kSyncWindowIntervalMinutes);
+    // Not due on the schedule either, so nothing but the request can be opening it.
+    SyncContext context = contextAt(0);
     context.battery = level;
+    TEST_ASSERT_FALSE(core::evaluateSyncWindow(context).open);
+
     context.user_requested = true;
     const SyncDecision decision = core::evaluateSyncWindow(context);
-    TEST_ASSERT_FALSE(decision.open);
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(SyncGate::BatteryTooLow),
-                          static_cast<int>(decision.gate));
+    TEST_ASSERT_TRUE(decision.open);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(SyncGate::Open), static_cast<int>(decision.gate));
+  }
+}
+
+void test_only_the_mode_can_refuse_a_request(void) {
+  // The property the Find phone screen depends on: a press has exactly one refusal
+  // left to render, so core::findOutcomeForGate()'s BatteryTooLow arm is now
+  // unreachable from a press. Swept rather than asserted case by case, because the
+  // thing being checked is that no *other* gate can close on a request.
+  const RunMode modes[] = {RunMode::Normal, RunMode::Safe, RunMode::Recovery};
+  const BatteryLevel levels[] = {BatteryLevel::Full, BatteryLevel::Normal, BatteryLevel::Low,
+                                 BatteryLevel::Critical};
+  const uint16_t elapsed[] = {0, core::kSyncWindowIntervalMinutes, UINT16_MAX};
+
+  for (const RunMode mode : modes) {
+    for (const BatteryLevel level : levels) {
+      for (const uint16_t minutes : elapsed) {
+        SyncContext context = contextAt(minutes);
+        context.mode = mode;
+        context.battery = level;
+        context.user_requested = true;
+
+        const SyncDecision decision = core::evaluateSyncWindow(context);
+        const bool degraded = mode != RunMode::Normal;
+        TEST_ASSERT_EQUAL_INT(!degraded, decision.open);
+        TEST_ASSERT_EQUAL_INT(
+            static_cast<int>(degraded ? SyncGate::DegradedMode : SyncGate::Open),
+            static_cast<int>(decision.gate));
+      }
+    }
   }
 }
 
 void test_a_refused_request_is_not_queued_for_later(void) {
   // A request lives on the wake it arrived on. A queued one would fire hours later
-  // when the battery recovered, powering the radio up at a moment the wearer has
+  // when the fault cleared, powering the radio up at a moment the wearer has
   // forgotten about and has no phone ready for — and a request that is never
   // cleared is an unbounded retry wearing a different hat.
+  //
+  // Driven through the degraded-mode gate, which is the only one left that can
+  // refuse a press: the battery gate now stops the schedule and not the wearer.
   Watch watch;
-  watch.battery = BatteryLevel::Low;
+  watch.mode = RunMode::Safe;
   watch.state.minutes_since_window = 0;
   TEST_ASSERT_FALSE(wake(watch, 1, /*user_requested=*/true, /*phone_present=*/false));
 
-  watch.battery = BatteryLevel::Normal;
+  watch.mode = RunMode::Normal;
   for (int minute = 0; minute < 58; ++minute) {
     TEST_ASSERT_FALSE(wake(watch, 1, false, false));
   }
@@ -405,6 +505,177 @@ void test_a_saturated_counter_still_opens_and_then_resets(void) {
   TEST_ASSERT_EQUAL_INT(5000, watch.windows);
 }
 
+// ── the hour boundary (§5.1's primary schedule) ─────────────────────────
+
+void test_a_clocked_watch_opens_a_window_on_each_hour(void) {
+  // Same cadence as the counter fallback — 24 a day, ~0.75 mAh — but at times
+  // anybody can predict instead of at whatever minute the watch happened to boot.
+  ClockedWatch watch;
+  // The boot window first, and on the hour, so what is counted below is the
+  // schedule and not the fresh block's "due now".
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, /*user_requested=*/false));
+  watch.windows = 0;
+
+  for (int minute = 0; minute < 1440; ++minute) {
+    clockedWake(watch, 1, /*user_requested=*/false);
+  }
+  TEST_ASSERT_EQUAL_INT(24, watch.windows);
+}
+
+void test_the_window_moves_onto_the_hour_whatever_minute_the_watch_booted_on(void) {
+  // The defect the boundary replaces: a free-running hourly timer met the phone at
+  // :23 past every hour for the rest of the charge, because that is when the watch
+  // was first switched on. The first window is still immediate — a fresh block has
+  // never synced and the fallback says so — and the *second* is what moves.
+  ClockedWatch watch;
+  watch.epoch_s += 23u * 60u;
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, false));
+  TEST_ASSERT_EQUAL_UINT8(23, minuteOf(watch));
+
+  // 36 minutes of silence, then the top of the hour.
+  for (int minute = 0; minute < 36; ++minute) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  }
+  TEST_ASSERT_TRUE(clockedWake(watch, 1, false));
+  TEST_ASSERT_EQUAL_UINT8(0, minuteOf(watch));
+
+  // And it stays there.
+  for (int minute = 0; minute < 59; ++minute) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  }
+  TEST_ASSERT_TRUE(clockedWake(watch, 1, false));
+  TEST_ASSERT_EQUAL_UINT8(0, minuteOf(watch));
+  TEST_ASSERT_EQUAL_INT(3, watch.windows);
+}
+
+void test_the_boundary_is_found_at_a_five_minute_tick_too(void) {
+  // Saving mode ticks every five minutes and core::alignedTickMinutes() puts those
+  // ticks on minutes divisible by five. Minute 0 is one of them, so the window is
+  // still reachable — which is the whole reason the alignment and the boundary
+  // have to agree on 60 being divisible by both.
+  ClockedWatch watch;
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, false));  // the boot window, on the hour
+
+  for (int tick = 0; tick < 11; ++tick) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 5, false));
+  }
+  TEST_ASSERT_TRUE(clockedWake(watch, 5, false));
+  TEST_ASSERT_EQUAL_UINT8(0, minuteOf(watch));
+  TEST_ASSERT_EQUAL_INT(2, watch.windows);
+}
+
+void test_the_boundary_survives_midnight(void) {
+  // dt.hour alone would compare 23 against 23 a day later and call it the same
+  // hour. hoursSinceEpoch() is monotonic, which is the entire reason it exists.
+  ClockedWatch watch;
+  watch.epoch_s = kGoldenEpoch - (kGoldenEpoch % 86400u) + 23u * 3600u;  // 23:00 UTC
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, false));
+  TEST_ASSERT_EQUAL_UINT8(23, clockOf(watch).hour);
+
+  for (int minute = 0; minute < 59; ++minute) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  }
+  TEST_ASSERT_TRUE(clockedWake(watch, 1, false));
+  TEST_ASSERT_EQUAL_UINT8(0, clockOf(watch).hour);
+}
+
+void test_a_day_in_a_drawer_is_one_window_and_not_none(void) {
+  // The other half of the same property: 23:xx to 23:xx the next day is a
+  // different hour, so the watch syncs when it comes back rather than waiting for
+  // the clock to pass an hour number it is already sitting on.
+  ClockedWatch watch;
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, false));
+
+  TEST_ASSERT_TRUE(clockedWake(watch, 60u * 24u, false));
+  TEST_ASSERT_EQUAL_INT(2, watch.windows);
+  TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  TEST_ASSERT_EQUAL_INT(2, watch.windows);
+}
+
+void test_a_request_at_59_past_does_not_swallow_the_window_on_the_hour(void) {
+  // A press records the hour it happened in, so the boundary a minute later is
+  // still a different hour and still opens. Two windows a minute apart is the
+  // intended reading of "the wearer asked" — and it is bounded at one extra
+  // window per press, which is what keeps the schedule's 24 a day a ceiling.
+  ClockedWatch watch;
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, false));  // the boot window, on the hour
+
+  TEST_ASSERT_TRUE(clockedWake(watch, 59, /*user_requested=*/true));
+  TEST_ASSERT_EQUAL_UINT8(59, minuteOf(watch));
+
+  TEST_ASSERT_TRUE(clockedWake(watch, 1, false));
+  TEST_ASSERT_EQUAL_UINT8(0, minuteOf(watch));
+  TEST_ASSERT_EQUAL_INT(3, watch.windows);
+
+  // And the press did not earn a third one inside the new hour.
+  for (int minute = 0; minute < 59; ++minute) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  }
+  TEST_ASSERT_EQUAL_INT(3, watch.windows);
+}
+
+void test_pressing_sync_all_hour_cannot_beat_the_schedule_to_the_radio(void) {
+  // A user request opens a window every time it is made — that is §5.1 — but each
+  // one spends the hour, so the *scheduled* windows are not multiplied by it.
+  ClockedWatch watch;
+  for (int minute = 0; minute < 60; ++minute) {
+    clockedWake(watch, 1, /*user_requested=*/true);
+  }
+  TEST_ASSERT_EQUAL_INT(60, watch.windows);
+
+  // The hour recorded is the one the last press happened in, so the next scheduled
+  // window is the next boundary and not a 61st press-shaped one.
+  TEST_ASSERT_FALSE(clockedWake(watch, 0, false));
+}
+
+void test_a_clock_that_dies_falls_back_to_the_counter(void) {
+  ClockedWatch watch;
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, false));
+
+  watch.clock_valid = false;
+  for (int minute = 0; minute < 59; ++minute) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  }
+  TEST_ASSERT_TRUE(clockedWake(watch, 1, false));
+  TEST_ASSERT_EQUAL_INT(2, watch.windows);
+}
+
+void test_a_clock_that_comes_back_returns_to_the_boundary(void) {
+  // The recorded hour is left alone while the clock is unreadable rather than
+  // cleared, so the watch does not drop onto the counter for an hour on every bad
+  // read — and when the clock returns, the hour has genuinely turned.
+  ClockedWatch watch;
+  TEST_ASSERT_TRUE(clockedWake(watch, 0, false));
+
+  watch.clock_valid = false;
+  for (int minute = 0; minute < 30; ++minute) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  }
+
+  watch.clock_valid = true;
+  for (int minute = 0; minute < 29; ++minute) {
+    TEST_ASSERT_FALSE(clockedWake(watch, 1, false));
+  }
+  TEST_ASSERT_TRUE(clockedWake(watch, 1, false));
+  TEST_ASSERT_EQUAL_UINT8(0, minuteOf(watch));
+  TEST_ASSERT_EQUAL_INT(2, watch.windows);
+}
+
+void test_a_window_opened_with_a_dead_clock_records_no_hour(void) {
+  // An hour taken from a clock that cannot be read would schedule the next window
+  // against fiction. The elapsed counter is reset either way, so the window still
+  // costs the full interval.
+  SyncState state;
+  state.minutes_since_window = 42;
+  core::noteSyncWindowOpened(state, /*hour=*/999u, /*clock_valid=*/false);
+  TEST_ASSERT_EQUAL_UINT16(0, state.minutes_since_window);
+  TEST_ASSERT_FALSE(state.last_window.known);
+
+  core::noteSyncWindowOpened(state, /*hour=*/999u, /*clock_valid=*/true);
+  TEST_ASSERT_TRUE(state.last_window.known);
+  TEST_ASSERT_EQUAL_UINT32(999u, state.last_window.hour);
+}
+
 // ── what a read of Status reports (§3.2) ─────────────────────────────────────
 
 void test_status_is_answered_from_rtc_backed_state_alone(void) {
@@ -505,8 +776,10 @@ void test_open_and_the_gate_never_disagree(void) {
 
           if (decision.open) {
             granted_at_least_once = true;
+            // The mode gate binds everything. The battery and the schedule bind
+            // only what the wearer did not ask for.
             TEST_ASSERT_EQUAL_INT(static_cast<int>(RunMode::Normal), static_cast<int>(mode));
-            TEST_ASSERT_TRUE(core::radioPermitted(level));
+            TEST_ASSERT_TRUE(context.user_requested || core::radioPermitted(level));
             TEST_ASSERT_TRUE(context.user_requested ||
                              elapsed >= core::kSyncWindowIntervalMinutes);
           }
@@ -532,14 +805,26 @@ int main(void) {
   RUN_TEST(test_reset_returns_the_state_to_a_fresh_watch);
 
   RUN_TEST(test_a_degraded_mode_never_opens_a_window);
-  RUN_TEST(test_a_low_battery_never_opens_a_window);
+  RUN_TEST(test_a_low_battery_never_opens_a_SCHEDULED_window);
   RUN_TEST(test_a_healthy_battery_does_open_a_window);
   RUN_TEST(test_the_gate_names_the_first_rule_that_closed);
 
   RUN_TEST(test_a_user_request_overrides_the_interval);
   RUN_TEST(test_a_user_window_spends_the_hour_too);
   RUN_TEST(test_a_user_request_does_not_override_a_degraded_mode);
-  RUN_TEST(test_a_user_request_does_not_override_a_low_battery);
+  RUN_TEST(test_a_user_request_overrides_a_low_battery);
+  RUN_TEST(test_only_the_mode_can_refuse_a_request);
+
+  RUN_TEST(test_a_clocked_watch_opens_a_window_on_each_hour);
+  RUN_TEST(test_the_window_moves_onto_the_hour_whatever_minute_the_watch_booted_on);
+  RUN_TEST(test_the_boundary_is_found_at_a_five_minute_tick_too);
+  RUN_TEST(test_the_boundary_survives_midnight);
+  RUN_TEST(test_a_day_in_a_drawer_is_one_window_and_not_none);
+  RUN_TEST(test_a_request_at_59_past_does_not_swallow_the_window_on_the_hour);
+  RUN_TEST(test_pressing_sync_all_hour_cannot_beat_the_schedule_to_the_radio);
+  RUN_TEST(test_a_clock_that_dies_falls_back_to_the_counter);
+  RUN_TEST(test_a_clock_that_comes_back_returns_to_the_boundary);
+  RUN_TEST(test_a_window_opened_with_a_dead_clock_records_no_hour);
   RUN_TEST(test_a_refused_request_is_not_queued_for_later);
 
   RUN_TEST(test_an_unreadable_clock_neither_stalls_nor_storms_the_window);

@@ -4,14 +4,20 @@ Battery stats (sync with phone and cloud)
 Steps stats (sync with phone and cloud)
 Multilanguage dates
 Alarm clock
+Low power mode: display explicitly
+Browse phone notifications from the watch
+Battery full charge autocalibration (when voltage doesn't increase for an hour, consider it 100%)
+Battery full charge indication
 Watch screen last connection time indication
 Phone lost on watch and watch lost on phone indication (when time to sync has elapsed)
-Sync off at night
-Bind sync to the beginning of the hour
+Sync off at night to save energy
 Adjustable watch sync period (15/30/60 mins)
+Buttons configuration (bind short-long press of right buttons to menu items)
 
 +Phone search
 +Battery watch horizontal icon
 +Time since last sync indication
 +Android app tray icon
 +Remove leading zero
++Bind sync to the beginning of the hour
++Low power mode: explicit sync from menu seems not working

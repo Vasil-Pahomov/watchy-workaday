@@ -183,6 +183,11 @@ FindOutcome findOutcomeForGate(SyncGate gate) {
     case SyncGate::DegradedMode:
       return FindOutcome::NotAvailable;
     case SyncGate::BatteryTooLow:
+      // Unreachable from a press since §5.1's battery gate became a gate on the
+      // *schedule*: core::evaluateSyncWindow() skips it when user_requested, and a
+      // find session is always a user request. Mapped anyway, because a switch
+      // that stopped being total would turn the next new gate into a silent
+      // "interrupted" on the wearer's screen.
       return FindOutcome::BatteryTooLow;
     case SyncGate::Open:
     case SyncGate::IntervalNotElapsed:

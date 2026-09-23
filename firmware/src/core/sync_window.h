@@ -177,6 +177,13 @@ class SyncWindow {
 
   bool ended() const { return ended_; }
 
+  // Whether §4's exchange finished inside this window — a Time write answered with
+  // `result == 0`. Read by the caller after the loop to settle the Sync screen's
+  // last line; the window's own ending does not say it, because §6.1 makes
+  // Disconnected the normal ending of both a successful exchange and a phone that
+  // connected and said nothing.
+  bool exchangeComplete() const { return exchange_complete_; }
+
  private:
   uint32_t phaseDeadlineMs() const;
   SyncWindowEvent finish(SyncWindowEvent event);
@@ -193,5 +200,53 @@ class SyncWindow {
   // it.
   uint32_t phase_started_ms_ = 0;
 };
+
+// ── what the wearer watches while the window runs ───────────────────────────
+//
+// The Sync menu item used to open a window and paint the *previous* window's
+// result — the screen was drawn before the radio came up, so it could not do
+// anything else, and a wearer who pressed Sync to find out whether syncing works
+// was answered with an hour-old sentence. The window is the thing they asked
+// about; this is that window, narrated.
+//
+// It is a separate value from SyncWindowEvent because the two answer different
+// questions. The event says what the radio did and which §5.1 deadline applies;
+// this says what to put on a 200×200 panel, and it deliberately collapses four
+// endings into one: TimedOut, Capped and a Disconnected with nothing exchanged are
+// all `NoPhone` to a wearer, who cannot act on the difference and to whom "capped"
+// is not a word about their watch.
+enum class SyncPhase : uint8_t {
+  // No window has run since this watch booted, so the screen falls back to §3.2's
+  // last-sync line — which is RTC-backed and survives, where a phase does not need
+  // to. First, so a zeroed or freshly initialised persisted block reads as it.
+  Idle,
+  Searching,  // advertising; nobody on the link yet
+  Connected,  // a central is on the link and has not written the time yet
+  Synced,     // §4's completion: a Time write answered with result == 0
+  Failed,     // a Time write was answered with something else — §3.2 names which
+  NoPhone,    // the window ended without an exchange
+  // §6.1's "a radio that will not start must never cost a tick", with a word for
+  // it. Distinct from NoPhone because the wearer can act on the difference: a
+  // phone that was not there is worth another press, a stack that would not come
+  // up is not.
+  RadioFailed,
+};
+
+// The phase after a central connects.
+SyncPhase syncPhaseOnConnect(SyncPhase phase);
+
+// The phase after a Time write has been answered with `result`.
+//
+// Latched on success, for the same reason core::SyncWindow latches
+// exchange_complete_: §4 licenses a second push in one connection **only if the
+// first failed**, so a later write cannot turn a finished exchange back into a
+// failure. Without the latch a phone that pushes twice would leave the wearer
+// looking at an error for a sync that worked.
+SyncPhase syncPhaseOnResult(SyncPhase phase, SyncResult result);
+
+// The phase once the window has closed. Searching and Connected become NoPhone —
+// nothing was exchanged, whatever the §5.1 deadline that ended it. A phase that
+// already carries an outcome keeps it.
+SyncPhase syncPhaseOnEnd(SyncPhase phase);
 
 }  // namespace core

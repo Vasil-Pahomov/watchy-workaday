@@ -118,6 +118,47 @@ uint16_t minuteOfDay(const DateTime& dt) {
   return static_cast<uint16_t>(dt.hour * 60 + dt.minute);
 }
 
+uint32_t hoursSinceEpoch(const DateTime& dt) {
+  const int32_t days = daysSinceEpoch(dt);
+  if (days < 0) {
+    // Only reachable from a DateTime that never passed isValid() — kMinYear is
+    // 2020 and the origin is 2000-01-01. Zero rather than a wrapped u32, so a
+    // caller that skipped the check gets a value that compares equal to its
+    // neighbours instead of one that looks like a fresh hour every wake.
+    return 0;
+  }
+  return static_cast<uint32_t>(days) * 24u + dt.hour;
+}
+
+uint8_t alignedTickMinutes(const DateTime& now, bool now_valid, uint16_t tick_seconds) {
+  const uint32_t whole = tick_seconds / 60u;
+  const uint8_t interval =
+      whole == 0 ? 1u : (whole > 255u ? 255u : static_cast<uint8_t>(whole));
+
+  // Every minute is already on the grid, so there is nothing to align and nothing
+  // to correct. This is the overwhelmingly common case and it is one comparison.
+  if (interval == 1) {
+    return 1;
+  }
+  // Nothing to align *to*. The watch still ticks at its interval — a clock the
+  // firmware cannot read must never be allowed to stop the wakes, which is the
+  // same rule elapsedMinutes() applies one function down.
+  if (!now_valid) {
+    return interval;
+  }
+
+  // 1..interval, never 0: a zero count would ask the PCF8563 for "now", and on an
+  // auto-reloading timer that is a wake that never sleeps.
+  //
+  // Self-correcting by construction, which matters more than it looks: the count
+  // is recomputed from the wall clock on every wake, so the PCF8563's countdown
+  // drifting a few seconds against its own seconds register cannot accumulate.
+  // A tick that fires a minute early lands off the grid once and the next count
+  // pulls it back, rather than the phase walking away over a day.
+  const uint8_t into = static_cast<uint8_t>(now.minute % interval);
+  return static_cast<uint8_t>(interval - into);
+}
+
 int32_t minutesBetween(const DateTime& from, const DateTime& to) {
   const int32_t day_delta = daysSinceEpoch(to) - daysSinceEpoch(from);
   const int32_t minute_delta =

@@ -110,7 +110,16 @@ SMALL_LINES = ["yesterday " + DIGIT * 5, "clock write fail", "sync unfinished",
                "phone vibrating",
                "phone found", "no phone found", "battery too low", "radio failed",
                "not available", "interrupted", "stopped",
-               "2:00  try 255"]
+               "2:00  try 255",
+               # The Sync screen (PROTOCOL.md section 5.1), which narrates the
+               # window the wearer just opened rather than reporting the previous
+               # one. It shares "searching", "connected", "no phone found" and
+               # "radio failed" with the list above - the same words for the same
+               # thing, which is the point of them being shared - and adds its own
+               # endings plus section 3.2's result codes. None sets the size; the
+               # widest, "clock write fail", is already listed at the top.
+               "Sync", "synchronized", "watch busy", "sync failed",
+               "last sync ok", "bad message", "app mismatch", "bad time sent"]
 SMALL_BUDGET = 180
 
 

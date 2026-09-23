@@ -136,13 +136,17 @@ const char* findOutcomeLabel(core::FindOutcome outcome) {
   return "";
 }
 
-// PROTOCOL.md §3.2's result codes, in the wearer's words rather than the wire's.
+// PROTOCOL.md §3.2's *failure* codes, in the wearer's words rather than the wire's.
+//
+// One table, two readers — the line the Sync screen shows the instant a write is
+// rejected, and the line it shows an hour later for the same code. They have to
+// be the same words: a wearer who saw "app mismatch" and came back to find "bad
+// message" would reasonably conclude something else had gone wrong since.
+//
 // Presentation, so it lives here beside modeTag() rather than in core/ — nothing
 // downstream branches on the string.
-const char* syncLabel(core::SyncResult result, bool applied) {
+const char* syncFailureLabel(core::SyncResult result) {
   switch (result) {
-    case core::SyncResult::Ok:
-      return "last sync ok";
     case core::SyncResult::BadLength:
     case core::SyncResult::BadType:
       return "bad message";
@@ -154,13 +158,68 @@ const char* syncLabel(core::SyncResult result, bool applied) {
       return "bad time sent";
     case core::SyncResult::RtcWriteFailed:
       return "clock write fail";
+    case core::SyncResult::Ok:
     case core::SyncResult::Busy:
-      // The starting value as well as a real code, and the two need different
-      // words. A watch that has committed an epoch and then reports Busy had a
-      // window end early; one that never has, never synced.
+      // Not failures. Both callers below word these two themselves, because what
+      // they mean depends on what else is known.
       break;
   }
-  return applied ? "sync unfinished" : "never synced";
+  return "sync failed";
+}
+
+// What the *last* window achieved, for a watch with no window running.
+const char* syncLabel(core::SyncResult result, bool applied) {
+  if (result == core::SyncResult::Ok) {
+    return "last sync ok";
+  }
+  if (result == core::SyncResult::Busy) {
+    // The starting value as well as a real code, and the two need different
+    // words. A watch that has committed an epoch and then reports Busy had a
+    // window end early; one that never has, never synced.
+    return applied ? "sync unfinished" : "never synced";
+  }
+  return syncFailureLabel(result);
+}
+
+// What the window the wearer just opened is doing, or how it ended.
+//
+// Idle is the one value that defers to the line above: no window has run since
+// this watch booted, so there is nothing to narrate and the §3.2 answer is the
+// honest thing to show. Every other value replaces it — after a search that found
+// nothing, "last sync ok" from an hour ago is true and useless.
+const char* syncPhaseLabel(core::SyncPhase phase, bool live, core::SyncResult result,
+                           bool applied) {
+  switch (phase) {
+    case core::SyncPhase::Idle:
+      return syncLabel(result, applied);
+    case core::SyncPhase::Searching:
+    case core::SyncPhase::Connected:
+      // Only reachable off a live window by a wake that died inside one — a panic,
+      // a brownout, the watchdog. The phase is in RTC memory and the window is
+      // not, so without this the screen would sit on "searching" until the next
+      // press, describing a radio that has been off for an hour.
+      if (!live) {
+        return "interrupted";
+      }
+      return phase == core::SyncPhase::Searching ? "searching" : "connected";
+    case core::SyncPhase::Synced:
+      return "synchronized";
+    case core::SyncPhase::Failed:
+      // Busy here is §3.2's "the watch is closing the window; try the next one",
+      // which is a thing that just happened rather than a history — so it gets
+      // its own words instead of syncLabel()'s "never synced".
+      return result == core::SyncResult::Busy ? "watch busy" : syncFailureLabel(result);
+    case core::SyncPhase::NoPhone:
+      // Four §5.1 endings — advertised to nobody, connected and said nothing, the
+      // phase timed out, the cap expired — and the wearer can act on none of the
+      // distinctions. The phone was not there.
+      return "no phone found";
+    case core::SyncPhase::RadioFailed:
+      // §6.1's "a radio that will not start must never cost a tick". Same words the
+      // Find phone screen uses for the same fault, because it is the same fault.
+      return "radio failed";
+  }
+  return "";
 }
 
 // Standalone now that it is not glued to the end of a percentage, so no leading
@@ -230,7 +289,8 @@ uint32_t compose(const Snapshot& snapshot) {
   }
 
   snprintf(g_composed.sync, sizeof(g_composed.sync), "%s",
-           syncLabel(snapshot.sync_result, snapshot.sync_applied));
+           syncPhaseLabel(snapshot.sync_phase, snapshot.sync_live, snapshot.sync_result,
+                          snapshot.sync_applied));
 
   if (snapshot.find_live) {
     snprintf(g_composed.find_status, sizeof(g_composed.find_status), "%s",
@@ -328,13 +388,17 @@ void draw() {
                                    g_composed.find_progress[0] != '\0' ? g_composed.find_progress
                                                                        : nullptr);
       } else if (index == core::kSyncMenuIndex) {
-        // What the *previous* window achieved. This screen is painted before the
-        // window this press opened has run — the radio comes up after the panel
-        // is done with, so the wearer sees something immediately instead of
-        // waiting six seconds for a refresh. The new outcome is on the screen the
-        // next time it is opened; re-rendering it here would cost a second panel
-        // refresh per sync, which is ~0.26 mAh/day at the hourly cadence and is
-        // not in the budget.
+        // The window this press opened, as it runs: "searching" before the radio
+        // is up, then "connected", then "synchronized" or what went wrong.
+        // runSyncWindow() redraws through here on each §5.1 progress point, the
+        // same way the find session does — three or four partial refreshes for a
+        // press the wearer made deliberately, and none at all for the scheduled
+        // windows, which never reach this screen because it is not up.
+        //
+        // It used to show the *previous* window's result and nothing else, because
+        // the frame was painted before the radio came up and there was no second
+        // frame. That answered a wearer asking "is syncing working?" with a
+        // sentence about an hour ago.
         board::display::drawBanner(menuLabel(index, g_composed.inverted), g_composed.sync);
       } else {
         // kStepsMenuIndex, the only other item that opens a screen. An empty

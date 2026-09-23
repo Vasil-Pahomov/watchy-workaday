@@ -111,4 +111,43 @@ SyncWindowEvent SyncWindow::classify(uint32_t elapsed_ms, const SyncWindowSignal
   return SyncWindowEvent::StillWaiting;
 }
 
+SyncPhase syncPhaseOnConnect(SyncPhase phase) {
+  switch (phase) {
+    case SyncPhase::Idle:
+    case SyncPhase::Searching:
+      return SyncPhase::Connected;
+    case SyncPhase::Connected:
+    case SyncPhase::Synced:
+    case SyncPhase::Failed:
+    case SyncPhase::NoPhone:
+    case SyncPhase::RadioFailed:
+      break;
+  }
+  // A reconnect inside one window cannot un-say what the first connection
+  // achieved; switched rather than defaulted so a new phase is a compiler warning.
+  return phase;
+}
+
+SyncPhase syncPhaseOnResult(SyncPhase phase, SyncResult result) {
+  if (phase == SyncPhase::Synced) {
+    return phase;
+  }
+  return result == SyncResult::Ok ? SyncPhase::Synced : SyncPhase::Failed;
+}
+
+SyncPhase syncPhaseOnEnd(SyncPhase phase) {
+  switch (phase) {
+    case SyncPhase::Idle:
+    case SyncPhase::Searching:
+    case SyncPhase::Connected:
+      return SyncPhase::NoPhone;
+    case SyncPhase::Synced:
+    case SyncPhase::Failed:
+    case SyncPhase::NoPhone:
+    case SyncPhase::RadioFailed:
+      break;
+  }
+  return phase;
+}
+
 }  // namespace core

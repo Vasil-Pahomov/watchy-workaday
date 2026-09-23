@@ -1,7 +1,5 @@
 #include "core/wake_router.h"
 
-#include "core/sync_policy.h"
-
 namespace core {
 namespace {
 
@@ -44,19 +42,6 @@ bool sourceMayCarrySyncWindow(WakeSource source) {
       return false;
   }
   return false;
-}
-
-bool syncWindowGranted(WakeSource source, const WakeContext& context) {
-  if (!sourceMayCarrySyncWindow(source)) {
-    return false;
-  }
-
-  SyncContext sync;
-  sync.mode = context.mode;
-  sync.battery = context.battery;
-  sync.minutes_since_window = context.minutes_since_sync_window;
-  sync.user_requested = context.sync_requested;
-  return evaluateSyncWindow(sync).open;
 }
 
 }  // namespace
@@ -153,17 +138,23 @@ WakePlan routeWake(WakeSource source, const WakeContext& context) {
 
   if (context.mode == RunMode::Safe) {
     // Strip everything optional: the display and the clock stay, so the watch is
-    // still a watch, and every extra peripheral is dropped.
+    // still a watch, and every extra peripheral is dropped. The radio is stripped
+    // below rather than here, because it is stripped by not being granted.
     plan.need_accel = false;
     plan.need_battery = false;
     plan.run_ui = false;
   }
 
-  // Deliberately after the Safe-mode strip and reached only by the paths that fall
-  // through the switch — the Recovery branch returns above, so a watch in Recovery
-  // leaves this flag at its default. sync_policy refuses both modes as well; the
-  // radio is the one peripheral worth gating twice.
-  plan.need_ble = syncWindowGranted(source, context);
+  // Eligibility, not a grant — the distinction is the whole of this field's
+  // contract; see WakePlan::may_carry_sync_window.
+  //
+  // The mode is in it even though core::evaluateSyncWindow() refuses Safe and
+  // Recovery too, and the duplication is deliberate: the radio is the one
+  // peripheral worth gating twice, and a degraded watch must not depend on a
+  // caller remembering to ask. The Recovery branch returned long before this line,
+  // so that mode is refused a third time, by never reaching the assignment.
+  plan.may_carry_sync_window =
+      sourceMayCarrySyncWindow(source) && context.mode == RunMode::Normal;
 
   plan.need_i2c = plan.need_rtc || plan.need_accel;
   return plan;

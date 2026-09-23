@@ -16,7 +16,7 @@ enum class ButtonId : uint8_t { None, Menu, Back, Up, Down };
 constexpr uint8_t kMenuItemCount = 4;
 
 // The Sync item (PROTOCOL.md §5.1: "the Sync menu item opens a window immediately
-// and resets the hourly timer").
+// and records the hour, exactly as a scheduled one does").
 //
 // The index lives here rather than beside the labels in app/screens.cpp because
 // two places need it and only one of them draws: the render path needs it to know

@@ -41,16 +41,16 @@ The boundary is mechanically enforced: the `native` environment compiles only
 
 | Module | Owns | Energy/reliability role |
 |---|---|---|
-| `time_model` | calendar/clock arithmetic, validity, formatting | next-alarm computation; rejects garbage RTC time (P0) |
-| `battery_model` | mV → %, smoothing, hysteresis, level state | triggers low-battery 5-minute mode; `batterySaving()` is that mode stated on the face, so the wearer can tell it from a fault |
+| `time_model` | calendar/clock arithmetic, validity, formatting, the monotonic hour count and the aligned tick | next-alarm computation; rejects garbage RTC time (P0). `alignedTickMinutes()` is why the five-minute face reads 14:35 and never 14:33, and why there is still a tick at the top of the hour for the sync window to ride |
+| `battery_model` | mV → %, smoothing, hysteresis, level state | triggers low-battery 5-minute mode at 10 % (out at 15 %); `batterySaving()` is that mode stated on the face, so the wearer can tell it from a fault. `radioPermitted()` gates the sync *schedule*, never a press |
 | `refresh_policy` | partial vs full vs **skip** | skipping a refresh removes ~85 % of a wake's cost |
 | `wake_router` | wake reason → what to power up | the module that decides what *not* to do |
 | `health` | boots, faults, run mode across resets | crash-loop escalation to Safe/Recovery |
 | `ui_state` | screen/menu state machine, idle timeout, which item a press activated, whether a press flips the display theme | keeps UI logic out of the render path; `activatedMenuItem()` is the only way a user sync request reaches the radio, and `themeAfterButton()` is what makes a theme flip force a full refresh instead of ghosting a partial one |
 | `step_counter` | daily totals from the sensor's raw counter, and whether they are current enough to show | rejects garbage reads; no wake cost of its own |
 | `accel_policy` | whether to configure the BMA423, and when to stop | caps the ~0.85 s config upload at 3 attempts per power cycle |
-| `sync_policy` | whether a BLE sync window opens on this wake, and the state a window leaves behind | the gate on the most expensive thing the firmware can do; the hourly timer is spent when a window *opens*, so a phone that is never there costs 24 windows a day and not 1440 |
-| `sync_window` | how long the watch may wait at each step of a window that *has* opened, and what the radio's signals mean | holds the invariant the task watchdog depends on — no wait exceeds 6 s and none outlives the 12 s cap, whatever the radio reports |
+| `sync_policy` | whether a BLE sync window opens on this wake, and the state a window leaves behind | the gate on the most expensive thing the firmware can do; the hour is recorded when a window *opens*, so a phone that is never there costs 24 windows a day and not 1440. The schedule is the wall clock's hour boundary, with an elapsed counter as the fallback for a watch whose RTC cannot be read |
+| `sync_window` | how long the watch may wait at each step of a window that *has* opened, what the radio's signals mean, and what the Sync screen shows while it runs | holds the invariant the task watchdog depends on — no wait exceeds 6 s and none outlives the 12 s cap, whatever the radio reports. `SyncPhase` is the same window narrated: searching → connected → synchronized, or what went wrong |
 | `find_session` | the same for a find-phone search (`PROTOCOL.md` §4.1): rounds, the attempt counter, the three early endings, where the wearer lands afterwards | the one path that stays awake for minutes; every wait it hands out is still under the 6 s bound, and the 120 s cap ends it whatever the radio or the wearer does |
 
 `step_counter` is a good illustration of the split. `board::accel` hands over one
@@ -152,7 +152,7 @@ every boot that runs the bootloader. A deep-sleep wake skips the bootloader; **a
 panic, a watchdog reset and a brownout do not.** State placed there therefore
 survives the ordinary case and is silently erased by exactly the faults it is
 usually there to outlive — `core::health`'s consecutive-fault count, the sync
-window's hourly timer, the accelerometer's configuration budget. This was a real
+window's schedule, the accelerometer's configuration budget. This was a real
 defect in this firmware, not a hypothetical: it made Safe and Recovery mode
 unreachable by any reset-type fault, because the count never got past one.
 

@@ -94,7 +94,15 @@ enum class FindOutcome : uint8_t {
   TimedOut = 2,          // kFindPhoneTimeoutMs elapsed; back to the watchface
   DismissedByPhone = 3,  // §3.3: the phone was found from the phone's side
   RadioFailed = 4,       // the BLE stack would not come up (PROTOCOL.md §6.1)
-  BatteryTooLow = 5,     // refused by the battery gate before the radio was touched
+  // Refused by the battery gate before the radio was touched. **No longer
+  // reachable from a press**, and kept rather than deleted: §5.1's battery gate
+  // now stops the schedule and not the wearer, so a Find phone press — which is
+  // always a user request — cannot close it. The value stays because the byte
+  // lives in RTC memory across builds and a watch upgrading from an older one may
+  // still be holding it, and the switch below stays total because a gate that
+  // acquires a new way to refuse must be a compiler error here rather than a
+  // silent "interrupted".
+  BatteryTooLow = 5,
   NotAvailable = 6,      // refused by the run-mode gate (Safe / Recovery)
 };
 

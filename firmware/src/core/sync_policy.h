@@ -9,14 +9,14 @@
 // one due?".
 //
 // **The gates are PROTOCOL.md §5.1 and that document is the specification, not
-// this comment.** The interval itself lives in core/protocol.h as
+// this comment.** The fallback interval lives in core/protocol.h as
 // kSyncWindowIntervalMinutes, next to the rest of §5.1's numbers, because it is
 // half of a contract the Android app mirrors — a copy here would be a second
 // place for it to drift. Nothing in this module may relax a gate locally.
 //
 // ── The rule the whole module exists for ─────────────────────────────────────
 //
-// **The hourly timer resets when a window OPENS, not when one succeeds.**
+// **The schedule is spent when a window OPENS, not when one succeeds.**
 //
 // Resetting on success sounds like the helpful thing and is the failure mode Law 2
 // exists to prevent: a watch whose phone is out of range, switched off, or simply
@@ -35,19 +35,41 @@
 // the unbounded retry above. The same argument core::accel_policy makes for
 // counting a configuration attempt before the upload runs, for the same reason.
 //
-// ── §5.1's third gate, and the clock it is measured with ─────────────────────
+// ── §5.1's third gate: the hour boundary, and its fallback ───────────────────
 //
-// §5.1 words the interval gate as "the RTC is readable and the last sync is under
-// 60 minutes old". What this module measures is `minutes_since_window`, a counter
-// the caller advances with core::elapsedMinutes() — which uses the clock when it is
-// trustworthy and falls back to the tick interval it asked for when it is not. That
-// keeps the gate meaningful on both sides of §5.1's sentence:
+// §5.1 schedules the window **on the hour** — the wake at which the wall clock's
+// hour differs from the hour the last window opened in. Not "60 minutes since the
+// last one", which is what this used to be and which free-runs: a watch whose
+// first window happened to land at 07:23 met its phone at :23 past every hour for
+// the rest of the charge, for no reason anybody chose. On the boundary the cadence
+// is the same 24 windows a day, but *when* is a fact about the clock rather than a
+// fact about when the watch happened to boot — which is what makes it predictable
+// from the outside, on both sides of the link and to the wearer.
 //
-//   * clock readable   — the counter is real elapsed time and hourly means hourly;
+// Two properties the boundary has to hold, and both come from hoursSinceEpoch()
+// being a monotonic count rather than dt.hour:
+//
+//   * it survives midnight — 23:xx to 00:xx is a different hour, and so is 23:xx
+//     to 23:xx the next day, which a bare hour number would call the same one;
+//   * it cannot open twice in an hour. The hour is recorded when the window opens,
+//     so a user-requested window at 10:59 sets the hour to 10 and the scheduled
+//     one at 11:00 still opens — two windows a minute apart, which is the intended
+//     reading of "the wearer asked" and is bounded at one extra window per press.
+//
+// A clock that cannot be read has no hour boundary to sit on, so the gate falls
+// back to `minutes_since_window`, a counter the caller advances with
+// core::elapsedMinutes() — which uses the clock when it is trustworthy and falls
+// back to the tick interval it asked for when it is not:
+//
+//   * clock readable   — the boundary decides, and the counter rides along unused;
 //   * clock unreadable — the counter still advances, at the rate the watch is
 //     actually ticking, so the cadence stays hourly instead of the gate
 //     evaporating and the watch advertising on every wake. That is the same
 //     unbounded retry the paragraph above §5.1's gate list forbids.
+//
+// The fallback is not a rare path. It is the path a **brand new watch** takes:
+// nothing has ever set its clock, so nothing can be aligned to it, and the counter
+// is what lets it ask for the time at all.
 //
 // The counter must equally never *freeze*, which is the opposite failure and the
 // more tempting mistake: advance it only when the clock is valid, and a watch
@@ -79,10 +101,27 @@ namespace core {
 // refusal can be logged and shown ("not now: battery low") instead of the watch
 // appearing to ignore the user. Anything other than Open is a refusal.
 enum class SyncGate : uint8_t {
-  Open,                // §5.1's three gates all passed
-  DegradedMode,        // RunMode::Safe or RunMode::Recovery — no radio in degraded modes
-  BatteryTooLow,       // BatteryLevel::Low or Critical
-  IntervalNotElapsed,  // under kSyncWindowIntervalMinutes since a window last opened
+  Open,           // §5.1's three gates all passed
+  DegradedMode,   // RunMode::Safe or RunMode::Recovery — no radio in degraded modes
+  BatteryTooLow,  // BatteryLevel::Low or Critical, and nobody asked for this window
+  // The hour has not turned since the last window opened — or, on a watch whose
+  // clock cannot be read, fewer than kSyncWindowIntervalMinutes have passed. Kept
+  // under its original name because the five enumerators are logged as integers
+  // and read against a running watch during bring-up.
+  IntervalNotElapsed,
+};
+
+// When a window last opened, on the clock. Carried in SyncState because it is what
+// the next window is scheduled against, and copied into SyncContext because that
+// is where every other input to the decision lives.
+//
+// `known` is false until a window has opened on a wake whose clock could be
+// trusted — which is the normal state of a watch that has never synced, since a
+// watch that has never synced usually has no clock either. The gate falls back to
+// the elapsed-minutes counter until then; see evaluateSyncWindow().
+struct SyncWindowHour {
+  uint32_t hour = 0;  // core::hoursSinceEpoch()
+  bool known = false;
 };
 
 // The part of the sync state that must survive deep sleep. Lives inside the
@@ -99,6 +138,11 @@ struct SyncState {
   // mean a newly flashed watch shows `--:--` for that hour with a phone sitting
   // next to it.
   uint16_t minutes_since_window = kSyncWindowIntervalMinutes;
+
+  // The hour the last window opened in — §5.1's primary schedule, with the counter
+  // above as its fallback. Defaults to "none recorded", which leaves a freshly
+  // flashed watch on the counter, which defaults to "due now".
+  SyncWindowHour last_window;
 
   // PROTOCOL.md §3.2, last paragraph: a plain read of Status, before any write has
   // happened in this connection, reports the result of the *previous* sync from
@@ -127,6 +171,14 @@ struct SyncContext {
   BatteryLevel battery = BatteryLevel::Normal;
   uint16_t minutes_since_window = 0;
 
+  // The wall clock on this wake, and whether it can be believed — core::
+  // hoursSinceEpoch(now) and board::rtc::ReadResult::valid. Together with
+  // `last_window` they are §5.1's hour boundary; without a trustworthy clock they
+  // are ignored and `minutes_since_window` decides instead.
+  uint32_t hour = 0;
+  bool clock_valid = false;
+  SyncWindowHour last_window;
+
   // The user picked the Sync menu item on **this** wake.
   //
   // Deliberately not part of SyncState, and that is a decision worth stating: a
@@ -152,12 +204,18 @@ struct SyncDecision {
 // What a user request does and does not do:
 //
 //   * it overrides the **interval** — that is exactly what "opens a window
-//     immediately and resets the hourly timer" means;
-//   * it does **not** override the mode or battery gates. core::radioPermitted()
-//     already says why in one line: those levels mean the radio stays off
-//     "regardless of what the user asked for". Safe and Recovery exist to stop a
-//     faulting watch from draining itself, and the largest consumer on the board
-//     is the last thing that should be exempt from them.
+//     immediately" means;
+//   * it overrides the **battery** gate. That gate exists to stop the firmware
+//     spending ~0.9 mAh/day of radio on a standing guess that a phone is nearby;
+//     it was never a statement that the radio is unsafe below 10 %. A wearer
+//     pressing Sync or Find phone is not a guess, and a watch that refuses to help
+//     find the phone it is paired to — at the one moment that is the whole point
+//     of the feature — has saved 0.03 mAh and lost the feature. See
+//     core::radioPermitted();
+//   * it does **not** override the mode gate. Safe and Recovery are faults rather
+//     than a low cell: the watch is already failing, the wearer cannot consent
+//     their way out of that, and the largest consumer on the board is the last
+//     thing to exempt from a degraded mode.
 //
 // Pure and const: opening a window is a state change and it belongs to
 // noteSyncWindowOpened(), which the caller makes separately and *before* the radio
@@ -167,7 +225,10 @@ SyncDecision evaluateSyncWindow(const SyncContext& context);
 // First-boot defaults: due now, nothing synced yet.
 void resetSyncState(SyncState& state);
 
-// Advance the hourly timer by however long has passed since the previous wake.
+// Advance the fallback timer by however long has passed since the previous wake.
+// Called on every wake even while the hour boundary is the thing deciding: a clock
+// can stop being readable between two wakes, and this counter has to already be
+// right when it does.
 // Call once per wake with the same elapsed value the rest of main.cpp uses, so
 // that an untrustworthy clock degrades this counter the same way it degrades every
 // other one rather than in some way of its own.
@@ -180,7 +241,12 @@ void advanceSyncTimer(SyncState& state, uint32_t elapsed_minutes);
 // **Call this before the radio comes up, not after the window closes.** See the
 // header comment: this is the single rule the module exists to enforce, and a
 // caller that defers it to a success path has reintroduced the unbounded retry.
-void noteSyncWindowOpened(SyncState& state);
+//
+// `hour` is core::hoursSinceEpoch() of the wake's clock reading and is recorded
+// only when `clock_valid` — an hour taken from a clock that cannot be read would
+// schedule the next window against fiction. The elapsed counter is reset either
+// way, so a window opened with a dead clock still costs the full interval.
+void noteSyncWindowOpened(SyncState& state, uint32_t hour, bool clock_valid);
 
 // Record what a window achieved, for §3.2's read path. `applied_utc_epoch_s` is
 // only stored when `result` is Ok — a rejected or failed write committed nothing,

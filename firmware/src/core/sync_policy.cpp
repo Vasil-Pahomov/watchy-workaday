@@ -3,10 +3,22 @@
 namespace core {
 namespace {
 
-// PROTOCOL.md §5.1: "the last sync is under 60 minutes old" closes the gate, so
-// exactly 60 opens it. Same >= convention as the battery sample schedule.
-bool intervalElapsed(uint16_t minutes_since_window) {
-  return minutes_since_window >= kSyncWindowIntervalMinutes;
+// PROTOCOL.md §5.1's third gate: the hour has turned since the last window opened.
+//
+// The boundary needs two things to be true at once — a clock worth reading now,
+// and an hour recorded from a clock that was worth reading then. Either missing
+// and there is no boundary to compare against, so the elapsed counter decides:
+// "the last sync is under 60 minutes old" closes the gate, exactly 60 opens it,
+// the same >= convention as the battery sample schedule.
+//
+// Note which way round the fallback is written. It is not "if the clock is bad,
+// refuse" — that is the failure §5.1 spends three paragraphs on, a watch with a
+// dead clock locked out of the one window that could fix it.
+bool windowDue(const SyncContext& context) {
+  if (context.clock_valid && context.last_window.known) {
+    return context.hour != context.last_window.hour;
+  }
+  return context.minutes_since_window >= kSyncWindowIntervalMinutes;
 }
 
 // §5.1: no radio in a degraded mode. Safe and Recovery exist to keep a faulting
@@ -52,23 +64,25 @@ SyncDecision evaluateSyncWindow(const SyncContext& context) {
 
   // Order matters: §5.1 lists the gates mode, battery, interval, and reporting the
   // first one that closed is what lets the UI say something true about why a
-  // request was refused.
+  // request was refused. For a user request only the first can close, so the
+  // Find phone screen has exactly one refusal left to render — see
+  // core::findOutcomeForGate().
   if (!radioPermitted(context.mode)) {
     decision.gate = SyncGate::DegradedMode;
     return decision;
   }
 
-  // core::radioPermitted(BatteryLevel) already carries the rule this needs — "the
-  // radio must stay off regardless of what the user asked for" — so the user
-  // request is checked after it, never before.
-  if (!radioPermitted(context.battery)) {
+  // core::radioPermitted(BatteryLevel) gates the **schedule**, not the radio, so
+  // the user request is checked first here rather than after it. Below 10 % the
+  // watch stops reaching for the phone on its own; it does not stop being able to.
+  if (!context.user_requested && !radioPermitted(context.battery)) {
     decision.gate = SyncGate::BatteryTooLow;
     return decision;
   }
 
-  // The only gate a user request overrides. "Opens a window immediately" (§5.1) is
-  // precisely this line.
-  if (!context.user_requested && !intervalElapsed(context.minutes_since_window)) {
+  // The other gate a user request overrides. "Opens a window immediately" (§5.1)
+  // is precisely this line.
+  if (!context.user_requested && !windowDue(context)) {
     decision.gate = SyncGate::IntervalNotElapsed;
     return decision;
   }
@@ -96,11 +110,19 @@ void advanceSyncTimer(SyncState& state, uint32_t elapsed_minutes) {
       static_cast<uint16_t>(state.minutes_since_window + elapsed_minutes);
 }
 
-void noteSyncWindowOpened(SyncState& state) {
-  // The whole module in one line. It runs when the window is *granted*, so a
+void noteSyncWindowOpened(SyncState& state, uint32_t hour, bool clock_valid) {
+  // The whole module in two lines. They run when the window is *granted*, so a
   // window that reaches nobody — or one that dies to a watchdog reset halfway
   // through — still costs the full hour before the next attempt.
   state.minutes_since_window = 0;
+  if (clock_valid) {
+    state.last_window.hour = hour;
+    state.last_window.known = true;
+  }
+  // An untrustworthy clock leaves the recorded hour alone rather than clearing it.
+  // Clearing would drop the watch onto the counter for an hour on every bad read;
+  // keeping a stale hour is harmless, because the gate ignores it until the clock
+  // is readable again and by then the hour has genuinely turned.
 }
 
 void noteSyncResult(SyncState& state, SyncResult result, uint32_t applied_utc_epoch_s) {
